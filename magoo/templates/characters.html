@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}ESI{% endblock %}
+{% block content %}
+<h1>ESI</h1>
+
+<h2>Authed Corporations</h2>
+<p class="muted">What each corporation feeds into planning — and whose
+token pulls it.</p>
+
+{% macro fam_via(via_name, via_id, rows, enabled, unit) -%}
+  {%- if via_id -%}{{ via_name or via_id }}{% if rows is not none %} <span class="muted">({{ '{:,}'.format(rows) }} {{ unit }})</span>{% endif %}
+  {%- elif not enabled -%}<span class="muted">off</span>
+  {%- else -%}<span class="badge warn">no role</span>{%- endif -%}
+{%- endmacro %}
+
+{% if corps %}
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Corporation</th><th>Count assets</th><th>Count wallet</th>
+      <th>Count job slots</th><th>Last refresh</th><th>Corp auth</th></tr></thead>
+  {% for k in corps %}
+  <tr>
+    <td>{{ k.corporation_name or '?' }} <span class="muted">({{ k.corporation_id }})</span></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('corp_toggle', corporation_id=k.corporation_id, flag='count_assets') }}">
+          <button>{{ '✓ yes' if k.count_assets else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('corp_toggle', corporation_id=k.corporation_id, flag='count_wallet') }}">
+          <button>{{ '✓ yes' if k.count_wallet else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('corp_toggle', corporation_id=k.corporation_id, flag='count_jobs') }}">
+          <button>{{ '✓ yes' if k.count_jobs else '— no' }}</button></form></td>
+    <td class="muted">{{ k.refreshed_at }}</td>
+    <td>
+      {% if k.assets_via and k.assets_via == k.jobs_via and k.jobs_via == k.wallet_via %}
+        via {{ k.assets_via_name or k.assets_via }}
+        <span class="muted">· {{ '{:,}'.format(k.asset_rows) }} asset rows
+          · {{ '{:,}'.format(k.job_rows) }} jobs</span>
+      {% else %}
+        assets: {{ fam_via(k.assets_via_name, k.assets_via, k.asset_rows, k.count_assets, 'rows') }}
+        · jobs: {{ fam_via(k.jobs_via_name, k.jobs_via, k.job_rows, k.count_jobs, 'jobs') }}
+        · wallet: {{ fam_via(k.wallet_via_name, k.wallet_via, none, k.count_wallet, '') }}
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No corporations recorded yet — they appear after
+the next ESI refresh (Dashboard → “⟳ Update from ESI”).</p>{% endif %}
+
+<h2>Authed Characters</h2>
+<p class="muted">What each character adds of their own — personal hangars,
+ISK, and job slots.<br>If all jobs run from corporation hangars, it is
+recommended to leave the character-level assets, wallet, and job slots
+off — the corporation table above already covers them.</p>
+
+<div class="panel">
+  <a class="btn primary" href="{{ url_for('sso_login') }}">＋ Add character via EVE SSO</a>
+</div>
+
+{% if characters %}
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Character</th><th>Count assets</th><th>Count wallet</th>
+      <th>Count job slots</th><th>Token expires</th>
+      <th><span class="vh">Actions</span></th></tr></thead>
+  {% for c in characters %}
+  <tr>
+    <td>{{ c.character_name }} <span class="muted">({{ c.character_id }})</span></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('character_toggle', character_id=c.character_id, flag='count_assets') }}">
+          <button>{{ '✓ yes' if c.count_assets else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('character_toggle', character_id=c.character_id, flag='include_assets') }}">
+          <button>{{ '✓ yes' if c.include_assets else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('character_toggle', character_id=c.character_id, flag='include_job_slots') }}">
+          <button>{{ '✓ yes' if c.include_job_slots else '— no' }}</button></form></td>
+    <td class="muted">{{ c.expires_at or 'no token' }}</td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('character_delete', character_id=c.character_id) }}"
+          onsubmit="return confirm('Remove {{ c.character_name }} from Magoo? Its saved login is deleted and it stops contributing to plans. You can add it back by logging in again.')">
+          <button class="mini danger"
+            title="delete this character's saved login and remove it from the pool">remove</button></form></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No characters yet — the button above logs one in
+through EVE SSO.</p>{% endif %}
+{% endblock %}

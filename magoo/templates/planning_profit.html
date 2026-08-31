@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Planning{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <h1>Planning</h1>
+  <span class="cap">Margins if you bought, built and sold at today's prices,
+    after sell fees. Quotes are {{ prices_at|age }} old{% if settings.structure_buy_enabled %} ·
+    inputs priced from Jita or
+    {{ 'C-J6MT' if settings.capital_market_mode == 'cj6'
+      else 'structure ' ~ settings.capital_structure_id }}, whichever lands
+    cheaper{% if structure_prices_at %} (structure prices {{ structure_prices_at|age }} old){% else %} (structure market never pulled){% endif %}{% endif %}.</span>
+  <div class="actions">
+    <form method="post" action="{{ url_for('prices_refresh') }}">
+      <input type="hidden" name="next" value="planning">
+      <button>⟳ Refresh prices</button>
+    </form>
+  </div>
+</div>
+<div class="subnav">
+  <a href="{{ url_for('planning') }}" aria-current="page" class="active">Profit</a>
+  <a href="{{ url_for('planning', view='slots') }}">Slot Planner</a>
+</div>
+<details class="muted" style="margin-bottom:.4rem">
+  <summary>How this is computed</summary>
+  <p style="margin:.3rem 0 0; max-width:80ch">An estimate at today's prices —
+  recalculated from the active pipelines every time the page loads; nothing
+  is saved. ⟳ Refresh prices re-pulls quotes for whatever the pipelines
+  currently need (price cache from {{ prices_at or 'never' }}).
+  Sub-capital sell fees: broker {{ "%.2f"|format(broker_rate * 100) }}% ·
+  sales tax {{ "%.2f"|format(sales_tax * 100) }}% ·
+  freight {{ settings.freight_out_isk_per_m3|isk }}/m³.
+  Capital sell fees ({{ 'C-J6MT' if settings.capital_market_mode == 'cj6'
+    else 'structure ' ~ settings.capital_structure_id }}):
+  broker {{ "%.2f"|format(settings.capital_broker_rate * 100) }}% ·
+  tax {{ "%.2f"|format(settings.capital_sales_tax * 100) }}% ·
+  SCC {{ "%.2f"|format(settings.capital_scc_surcharge * 100) }}% ·
+  movement {{ settings.capital_movement_cost_isk|isk }}/hull.
+  What executed runs actually cost lives on each run's Profit tab.</p>
+</details>
+
+{% include "_cycle_totals.html" %}
+
+{% if cards %}
+{% set lagged = false %}
+{% include "_profit_cards.html" %}
+{% else %}
+<p class="muted">No active pipelines — add one on the
+<a href="{{ url_for('pipelines') }}">Pipelines</a> page.</p>
+{% endif %}
+{% endblock %}

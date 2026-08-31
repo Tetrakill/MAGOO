@@ -1,0 +1,60 @@
+{# Rendered into the user's SYSTEM browser, not the Magoo window — a stray
+   tab that must explain itself with no nav, no app chrome and no network
+   dependencies (the CDN fonts base.html uses are deliberately absent, so
+   this still renders correctly offline). #}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Magoo — {% if error %}login failed{% else %}signed in{% endif %}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<style>
+:root {
+  --bg: #0a1014; --panel: #10181e; --line: #1f2b33;
+  --text: #d2e0e6; --dim: #7d94a0; --accent: #3fc1c9;
+  --good: #4ad295; --bad: #f2655f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; display: flex;
+  align-items: center; justify-content: center; padding: 1.5rem;
+  background: var(--bg); color: var(--text);
+  font: 15px/1.5 "Segoe UI", system-ui, sans-serif;
+}
+.card {
+  max-width: 30rem; width: 100%; padding: 1.6rem 1.8rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+}
+.mark {
+  width: 20px; height: 20px; border: 2px solid var(--accent);
+  border-radius: 3px; position: relative; margin-bottom: 1rem;
+}
+.mark::after { content: ""; position: absolute; inset: 4px; background: var(--accent); }
+h1 { font-size: 1.05rem; margin: 0 0 .5rem; }
+h1.ok { color: var(--good); }
+h1.bad { color: var(--bad); }
+p { margin: .5rem 0; }
+.muted { color: var(--dim); font-size: .85rem; }
+code {
+  font-family: Consolas, ui-monospace, monospace;
+  background: rgba(255,255,255,.05); padding: .1em .35em; border-radius: 3px;
+}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="mark" aria-hidden="true"></div>
+  {% if error %}
+    <h1 class="bad">Login failed</h1>
+    <p>{{ error }}</p>
+    <p class="muted">Close this tab and try again from the Magoo window.</p>
+  {% else %}
+    <h1 class="ok">Signed in as {{ character }}</h1>
+    <p>Magoo has the access it needs for this character.</p>
+    <p class="muted">You can close this tab — the Magoo window has already
+      picked it up.</p>
+  {% endif %}
+</div>
+</body>
+</html>

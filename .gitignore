@@ -1,0 +1,14 @@
+# User data: database, SDE zip cache, session secret, logs. Never commit —
+# magoo.sqlite holds live ESI refresh tokens.
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Build output
+build/
+dist/
+*.egg-info/

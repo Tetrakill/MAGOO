@@ -1,0 +1,43 @@
+{# Whole-cycle roll-up strip: expects `totals` (costing.CycleTotals) and
+   `cards`. Abbreviated ISK with the full figure on hover. #}
+{% if cards %}
+<div class="totals">
+  <div class="stat">
+    <span class="label">Profit / cycle</span>
+    <span class="value {% if totals.profit < 0 %}bad{% elif totals.profit > 0 %}good{% endif %}"
+          title="{{ totals.profit|isk }} ISK">{{ totals.profit|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Margin</span>
+    <span class="value {% if totals.margin_pct is not none and totals.margin_pct < 0 %}bad{% elif totals.margin_pct %}good{% endif %}"
+          title="profit ÷ cost">
+      {% if totals.margin_pct is not none %}{{ "%.1f"|format(totals.margin_pct) }}%{% else %}—{% endif %}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Cost / cycle</span>
+    <span class="value" title="{{ totals.cost|isk }} ISK">{{ totals.cost|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Net proceeds / cycle</span>
+    <span class="value" title="{{ totals.proceeds|isk }} ISK">{{ totals.proceeds|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Units / cycle</span>
+    <span class="value">{{ totals.hulls|qty }}<span class="sub">· {{ totals.priced }}
+        pipeline{{ '' if totals.priced == 1 else 's' }}</span></span>
+  </div>
+  <div class="stat">
+    <span class="label">Null Sec Market Share</span>
+    <span class="value" title="share of this cycle's materials cost bought from the null-sec market ({{ totals.structure_materials|isk }} of {{ totals.materials|isk }} ISK) — cheaper landed there than at the high-sec hub">
+      {% if totals.structure_share_pct is not none %}{{ "%.1f"|format(totals.structure_share_pct) }}%{% else %}—{% endif %}<span class="sub">of materials</span></span>
+  </div>
+  {% if totals.unpriced %}
+  <div class="stat">
+    <span class="label">&nbsp;</span>
+    <span class="badge warn" title="These pipelines' finals have no sell
+    quote, so they are left out of every figure here — hit Refresh">
+    {{ totals.unpriced }} unquoted</span>
+  </div>
+  {% endif %}
+</div>
+{% endif %}

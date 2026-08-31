@@ -1,0 +1,10 @@
+{# The run pages' tab bar. Set `active` to 'plan' | 'chain' | 'profit'
+   before including. #}
+<div class="subnav">
+  <a href="{{ url_for('run_detail', index_run_id=run.index_run_id) }}"
+     {% if active == 'plan' %}aria-current="page" class="active"{% endif %}>Plan</a>
+  <a href="{{ url_for('run_detail', index_run_id=run.index_run_id, view='chain') }}"
+     {% if active == 'chain' %}aria-current="page" class="active"{% endif %}>Chain</a>
+  <a href="{{ url_for('run_detail', index_run_id=run.index_run_id, view='profit') }}"
+     {% if active == 'profit' %}aria-current="page" class="active"{% endif %}>Profit</a>
+</div>

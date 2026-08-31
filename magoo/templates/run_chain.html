@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}Run {{ run.run_number }} Chain{% endblock %}
+
+{% macro chain_table(group, show_category=False) %}
+<div class="tablewrap">
+<table class="sortable aligned dense">
+  <thead><tr>
+    <th>Item</th>
+    {% if show_category %}<th class="cat">Category</th>{% endif %}
+    <th class="num">Cycle need</th>
+    <th class="num">Target stock</th>
+    <th class="num">On hand</th>
+    <th class="num">In jobs</th>
+    <th class="num">Deficit</th>
+    <th class="flags">Status</th>
+  </tr></thead>
+  {% for x in group %}
+  <tr id="item-{{ x.type_id }}">
+    <td>{{ x.name }}</td>
+    {% if show_category %}<td class="cat muted">{{ x.group }}</td>{% endif %}
+    <td class="num">{{ x.cycle_need|qty }}</td>
+    <td class="num">{{ x.target|qty }}</td>
+    <td class="num">{{ x.on_hand|qty }}</td>
+    <td class="num"{% if x.alchemy_credit %}
+        title="incl. {{ x.alchemy_credit|qty }} expected from unrefined stock/jobs at the reprocess yield"{% endif %}>
+      {{ x.in_jobs|qty }}{% if x.alchemy_credit %}<span class="muted">*</span>{% endif %}</td>
+    <td class="num">{{ x.deficit|qty }}</td>
+    <td class="flags">
+      <span class="badge {% if x.status == 'covered' %}good{% elif x.status == 'buy' %}warn{% elif x.status == 'unmet' %}bad{% elif x.status == 'alchemy' %}accent{% endif %}"
+            title="{% if x.status == 'buy' and not x.buildable %}raw input — bought just-in-time: {{ x.buy_qty|qty }}{% elif x.status == 'buy' %}bought instead of built — the plan buys {{ x.buy_qty|qty }} (savings rule, blacklist or capacity){% elif x.status in ('build', 'react') %}{{ x.build_qty|qty }} planned in jobs{% if x.buy_qty %} + {{ x.buy_qty|qty }} bought (capacity){% endif %}{% if x.alchemy_out %} + {{ x.alchemy_out|qty }} expected from the alchemy route{% endif %}{% elif x.status == 'unmet' %}deficit with no jobs and no purchase fallback (pipeline finals are never bought; an unpriced item has no market){% elif x.status == 'covered' %}no deficit{% elif x.alchemy_out %}deficit covered by {{ x.alchemy_out|qty }} units expected from the alchemy route (see the Plan tab's Alchemy section){% else %}alchemy route{% endif %}">{{ x.status }}</span>{% if x.status in ('build', 'react') and x.buy_qty %}<span class="badge warn" title="capacity-limited: {{ x.buy_qty|qty }} of the deficit is bought">+buy</span>{% endif %}{% if x.short %}<span class="badge bad" title="capacity-limited with no purchase fallback: only {{ x.build_qty|qty }} of the {{ x.deficit|qty }} deficit is planned — listed under Unmet on the Plan tab">+unmet</span>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endmacro %}
+
+{% block content %}
+<div class="pagehead">
+  <h1>{{ m.run_title(run, superseded) }}</h1>
+  <span class="cap">Where all {{ chain_rows|length }} items stood when you
+    planned this run ({{ run.planned_start }} UTC). Deficit for intermediates
+    is target stock plus what this cycle's planned jobs will actually draw
+    (usually near one cycle's need), minus on hand and in jobs; raw
+    inputs buy just-in-time; finals always build the full cycle.</span>
+</div>
+{% set active = 'chain' %}
+{% include "_run_subnav.html" %}
+<div class="totals">
+  <div class="stat"><span class="label">Raw inputs</span><span class="value">{{ chain_raws|length }}</span></div>
+  <div class="stat"><span class="label">Manufactured</span><span class="value">{{ chain_mfg|map(attribute='1')|map('length')|sum }}</span></div>
+  {% if chain_struct %}<div class="stat"><span class="label">Structure comps</span><span class="value">{{ chain_struct|length }}</span></div>{% endif %}
+  <div class="stat"><span class="label">Reacted</span><span class="value">{{ chain_reactions|map(attribute='1')|map('length')|sum }}</span></div>
+  <div class="stat"><span class="label">Covered</span><span class="value good">{{ chain_counts.covered }}</span></div>
+  <div class="stat"><span class="label">Buy</span><span class="value {% if chain_counts.buy %}warn{% endif %}">{{ chain_counts.buy }}</span></div>
+  <div class="stat"><span class="label">Build</span><span class="value">{{ chain_counts.build }}</span></div>
+  <div class="stat"><span class="label">React</span><span class="value">{{ chain_counts.react }}</span></div>
+  {% if chain_counts.alchemy %}<div class="stat"><span class="label">Alchemy</span><span class="value">{{ chain_counts.alchemy }}</span></div>{% endif %}
+  {% if chain_counts.unmet %}<div class="stat"><span class="label">Unmet</span><span class="value bad">{{ chain_counts.unmet }}</span></div>{% endif %}
+</div>
+
+<h2>Raw inputs <span class="muted">— {{ chain_raws|length }} items</span></h2>
+{% if chain_raws %}{{ chain_table(chain_raws, show_category=True) }}
+{% else %}<p class="muted">None.</p>{% endif %}
+
+<h2>Manufacturing <span class="muted">—
+  {{ chain_mfg|map(attribute='1')|map('length')|sum }} items</span></h2>
+{% for category, group in chain_mfg %}
+<h3 class="subhead">{{ category }}
+  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }}</span></h3>
+{{ chain_table(group) }}
+{% endfor %}
+
+{% if chain_struct %}
+<h2>Structure components <span class="muted">— {{ chain_struct|length }} items</span></h2>
+{{ chain_table(chain_struct) }}
+{% endif %}
+
+<h2>Reactions <span class="muted">—
+  {{ chain_reactions|map(attribute='1')|map('length')|sum }} items</span></h2>
+{% for category, group in chain_reactions %}
+<h3 class="subhead">{{ category }}
+  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }}</span></h3>
+{{ chain_table(group) }}
+{% endfor %}
+{% endblock %}

@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Pipelines{% endblock %}
+{% block content %}
+<h1>Pipelines</h1>
+
+{% if not sde_ready %}
+<div class="panel">
+  <p class="muted" style="margin:0">Download the game data first — the paste
+  parser matches product names against blueprint data from the SDE. The
+  <a href="{{ url_for('dashboard') }}">Dashboard</a> checklist's
+  <b>↓ Download game data</b> button pulls and imports it, then come back
+  here.</p>
+</div>
+{% else %}
+<div class="panel">
+  <form method="post">
+    <p class="muted" style="margin-top:0">Paste rows from a spreadsheet, one
+    pipeline per line:
+    <b>product · quantity per run · runs per BPC · ME · TE</b>.
+    You only need product and quantity — leave runs per BPC blank for
+    uncapped copies, and blank ME/TE means 0 for ships or your intermediate
+    defaults for everything else. Re-pasting a product updates it. Final products can be sub-capital and
+    capital ships, Upwell structures, and Standup rigs and modules.</p>
+    <textarea name="products" rows="6" style="width:100%"
+      aria-label="Pipelines to add or update, one per row"
+      placeholder="Ishtar&#9;40&#9;10&#9;4&#9;8&#10;Golem&#9;16&#9;10&#9;2&#9;4&#10;Astrahus&#9;1" required></textarea>
+    <p><button class="primary">Add / update pipelines</button></p>
+  </form>
+</div>
+{% endif %}
+
+{% if pipelines %}
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Product</th><th class="num">Qty / run</th>
+      <th class="num">Runs / BPC</th>
+      <th class="num">ME</th><th class="num">TE</th>
+      <th class="num">BPC cost (ISK)</th><th>Status</th>
+      <th>Created</th><th></th></tr></thead>
+  {% for p in pipelines %}
+  <tr>
+    <td>{{ p.product_name }}</td>
+    <td class="num">
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_qty', pipeline_id=p.pipeline_id) }}">
+        <input name="qty" type="number" min="1" value="{{ p.output_qty_per_run }}"
+               aria-label="Quantity per run — {{ p.product_name }}"
+               onchange="inlineSave(this)">
+      </form>
+    </td>
+    <td class="num">{{ p.runs_per_bpc if p.runs_per_bpc else '—' }}</td>
+    <td class="num">{{ p.me_level if p.me_level is not none else '—' }}</td>
+    <td class="num">{{ p.te_level if p.te_level is not none else '—' }}</td>
+    <td class="num">
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_bpc_cost', pipeline_id=p.pipeline_id) }}">
+        <input name="bpc_cost" type="number" min="0" step="1000"
+               value="{{ p.bpc_cost_isk or 0 }}"
+               aria-label="BPC cost — {{ p.product_name }}"
+               title="All-in ISK to obtain
+               one BPC (copy or invention); amortized per unit on the profit
+               page" onchange="inlineSave(this)">
+      </form>
+    </td>
+    <td>{% if p.is_active %}<span class="badge good">active</span>
+        {% else %}<span class="badge">inactive</span>{% endif %}</td>
+    <td class="muted">{{ p.created_at }}</td>
+    <td>
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_toggle', pipeline_id=p.pipeline_id) }}">
+        <button>{{ 'deactivate' if p.is_active else 'activate' }}</button>
+      </form>
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_delete', pipeline_id=p.pipeline_id) }}"
+            onsubmit="return confirm('Delete the {{ p.product_name }} pipeline? Its profit history goes with it.')">
+        <button class="danger">delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+
+<details style="margin-top:1rem">
+  <summary class="muted">Clear all pipelines…</summary>
+  <form method="post" action="{{ url_for('pipelines_clear') }}"
+        style="margin-top:.5rem"
+        onsubmit="return confirm('Delete all {{ pipelines|length }} pipelines and their entire profit history? This cannot be undone.')">
+    <button class="danger">Yes — delete all {{ pipelines|length }} pipelines
+    (and their profit history)</button>
+  </form>
+</details>
+{% elif sde_ready %}<p class="muted">No pipelines yet — paste your first
+above; product and quantity is enough.</p>{% endif %}
+{% endblock %}

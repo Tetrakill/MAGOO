@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magoo"
+description = "EVE Online industry planner: plans each index run of a pipelined production system and tracks realized cost."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+dynamic = ["version"]
+
+dependencies = [
+    "flask>=3.1,<4",
+    "httpx>=0.28,<1",
+    # The [crypto] extra is load-bearing, not optional: EVE SSO access
+    # tokens are RS256/ES256 JWTs and esi._decode_token verifies them
+    # against CCP's JWKS. Without cryptography installed, login fails.
+    "pyjwt[crypto]>=2.10,<3",
+    "numpy>=2.1,<3",
+    # Pinned to a minor series on purpose. Freezing locks every user to
+    # whatever ships, engine.py's MILP allocation is the core of the app,
+    # and scipy#22812 (milp returning a bounds-violating solution while
+    # reporting success) is open — so the solver version is a deliberate
+    # release decision, not something to float.
+    "scipy>=1.18,<1.19",
+    # Production WSGI server for the packaged build; the Werkzeug dev
+    # server is not meant to be shipped.
+    "waitress>=3.0,<4",
+    # Native window (Edge WebView2 on Windows).
+    "pywebview>=6.0,<7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.dynamic]
+version = { attr = "magoo.__version__" }
+
+[tool.setuptools]
+packages = ["magoo"]
+
+[tool.setuptools.package-data]
+magoo = ["templates/*.html"]

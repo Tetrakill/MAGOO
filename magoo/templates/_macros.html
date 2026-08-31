@@ -1,0 +1,70 @@
+{# Shared table macros for the run Plan tab (execution=true: persisted
+   plan-time snapshot) and the Planning Slot Planner (execution=false:
+   recomputed live, nothing saved). Import with context —
+   {% import "_macros.html" as m with context %} — the macros read
+   structure_buys / shallow / settings / final_ids / final_net_margin
+   from the calling template's context. plan_time=false switches the
+   ledger phrasing for the live view. #}
+
+{% macro run_title(run, superseded) -%}
+  Index Run {{ run.run_number }}
+    <span class="badge {% if run.status == 'complete' %}good{% else %}accent{% endif %}">{{ run.status }}</span>{% if superseded %}
+    <span class="badge" title="a newer run exists — this plan is out of date">superseded</span>{% endif %}
+{%- endmacro %}
+
+{% macro venue_cell(i, plan_time=true) -%}
+    <td class="cat">{% if i.type_id in structure_buys %}<span class="badge accent" title="cheaper landed (price + freight-in) at the structure market than at Jita{{ ' at plan time' if plan_time }}">{{ settings.structure_market_label() }}</span>{% elif i.price_snapshot is not none %}<span class="muted">Jita</span>{% endif %}</td>
+{%- endmacro %}
+
+{% macro shallow_badge(i, plan_time=true) -%}
+    {% if i.type_id in shallow %}<span class="badge warn" title="only {{ i.structure_units_cheaper|qty }} of {{ i.recommended_buy_qty|qty }} units on the structure's sell ladder land at or below the Jita landed price (every listed unit counts when Jita has no order){{ ' at plan time' if plan_time }} — the rest must come from elsewhere">shallow</span>{% endif %}
+{%- endmacro %}
+
+{% macro item_cell(i) -%}
+    <td><button type="button" class="itemlink"
+        title="why this quantity — target, stock and jobs at plan time"
+        data-name="{{ i.name }}" data-type="{{ i.type_id }}"
+        data-kind="{{ 'final' if i.type_id in final_ids
+                      else ('build' if i.blueprint_id else 'raw') }}"
+        data-target="{{ i.target_stock_qty }}"
+        data-need="{{ i.merged_min_qty }}"
+        data-onhand="{{ i.on_hand_qty }}"
+        data-injobs="{{ i.in_progress_qty }}"
+        data-deficit="{{ i.deficit_qty }}"
+        data-buy="{{ i.recommended_buy_qty or 0 }}"
+        data-build="{{ i.recommended_build_qty or 0 }}"
+        onclick="openDeficit(this)">{{ i.name }}</button></td>
+{%- endmacro %}
+
+{% macro job_table(group, execution=true) %}
+<div class="tablewrap">
+<table class="sortable aligned">
+  <thead><tr><th>Item</th>
+      <th class="num">Runs/job</th><th class="num">Jobs</th>
+      <th class="num">Build qty</th>
+      <th class="num">Time/job</th><th class="flags"></th></tr></thead>
+  {% for i in group %}
+  <tr>
+{% if execution %}{{ item_cell(i) }}{% else %}    <td>{{ i.name }}</td>{% endif %}
+    {% set per_job = ((i.runs_allocated + i.jobs_allocated - 1) // i.jobs_allocated)
+                     if i.jobs_allocated else 0 %}
+    <td class="num" data-sort="{{ per_job }}"
+        title="{{ i.runs_allocated|qty }} runs across {{ i.jobs_allocated }} job(s); max {{ i.max_runs_per_job|qty }}/job">
+      {{ per_job|qty if i.jobs_allocated else '—' }}</td>
+    <td class="num">{{ i.jobs_allocated }}</td>
+    <td class="num">{{ i.recommended_build_qty|qty }}</td>
+    <td class="num">{{ (i.time_per_run * per_job)|hours }}</td>
+    <td class="flags">{% if i.capacity_limited %}<span class="badge warn"
+        title="the slot pool can't fit this item's full demand ({{ i.jobs_needed_unconstrained }} job(s) needed)">capacity</span>{% endif %}
+        {% if execution and i.low_stock %}<span class="badge warn"
+          title="current stock and in-flight jobs won't sustain the next run">low stock</span>{% endif %}
+        {% if execution and i.savings_unpriced_inputs %}<span class="badge warn"
+          title="chain-cost figure understates: this many raw inputs have no price on record">{{ i.savings_unpriced_inputs }} unpriced</span>{% endif %}
+        {% if execution and final_net_margin.get(i.type_id) is not none and final_net_margin[i.type_id] < 0 %}
+          <span class="badge fill bad" title="net proceeds (after sell fees) minus integrated chain cost at today's prices: {{ final_net_margin[i.type_id]|isk }} ISK/unit">negative margin</span>
+        {% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endmacro %}

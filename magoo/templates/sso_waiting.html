@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Logging in{% endblock %}
+{% block content %}
+{# Shown in the Magoo window while the login happens in the user's own
+   browser. The two are separate cookie jars, so the window cannot learn the
+   outcome from a session — it polls /sso/status, which reads the
+   server-side LoginBroker. #}
+<div class="panel" style="max-width:44rem">
+  <h1>Waiting for EVE SSO</h1>
+
+  {% if opened %}
+  <p>Magoo opened <b>login.eveonline.com</b> in your browser. Sign in there
+    and approve the access Magoo asks for — this page updates by itself.</p>
+  {% else %}
+  <div class="flash">Magoo could not open your browser automatically. Use
+    the link below to continue.</div>
+  {% endif %}
+
+  <p class="muted">Logging in happens in your real browser on purpose: you
+    can check the address bar says <code>login.eveonline.com</code>, and your
+    password manager works. Magoo never sees your password — only the
+    authorisation code EVE hands back.</p>
+
+  <p><a href="{{ auth_url }}" target="_blank" rel="noopener">Open the EVE
+    login page</a></p>
+
+  <p id="sso-state" class="muted" role="status" aria-live="polite">Waiting for
+    you to finish signing in…</p>
+
+  <p><a href="{{ url_for('characters') }}">Cancel</a></p>
+</div>
+
+<script>
+// Poll until the callback lands in the other browser. Same 1s cadence as the
+// game-data download, and equally tolerant of a request failing: a dropped
+// poll must not end the wait.
+const baseline = {{ baseline }};
+const statusUrl = "{{ url_for('sso_status') }}";
+const doneUrl = "{{ url_for('characters') }}";
+const readout = document.getElementById("sso-state");
+
+async function poll() {
+  try {
+    const resp = await fetch(statusUrl, { cache: "no-store" });
+    const s = await resp.json();
+    if (s.completed > baseline) {
+      readout.textContent = s.character
+        ? "Signed in as " + s.character + " — returning to Magoo…"
+        : "Signed in — returning to Magoo…";
+      location.href = doneUrl;
+      return;
+    }
+    if (s.error) {
+      readout.textContent = s.error;
+    }
+  } catch (err) {
+    // Transient — keep waiting.
+  }
+  setTimeout(poll, 1000);
+}
+poll();
+</script>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}Run {{ run.run_number }} Profit{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <h1>{{ m.run_title(run, superseded) }}</h1>
+  {% if run.status == 'complete' %}
+  <span class="cap">What this run's products cost you to build: each input
+    priced from the run you bought it in, sold at today's quotes and fees.
+    Executed {{ run.completed_at }}.</span>
+  {% endif %}
+</div>
+{% set active = 'profit' %}
+{% include "_run_subnav.html" %}
+
+{% if run.status != 'complete' %}
+<p class="muted">This tab activates when the run is marked executed
+(<b>Mark executed…</b> on the <a
+href="{{ url_for('run_detail', index_run_id=run.index_run_id) }}">Plan</a>
+tab). Executed runs are costed from the prices of the runs their inputs
+were actually bought at; for a what-if at today's prices see
+<a href="{{ url_for('planning') }}">Planning → Profit</a>.</p>
+{% else %}
+<details class="muted" style="margin-bottom:.4rem">
+  <summary>How this is computed</summary>
+  <p style="margin:.3rem 0 0; max-width:80ch">Each input is priced from the
+  snapshot of the executed run it was actually bought at (its chain depth
+  lags behind this run) — {{ completed_history }} executed
+  run{{ '' if completed_history == 1 else 's' }} of history so far. Sell side
+  uses the current quote and current rates:
+  broker {{ "%.2f"|format(broker_rate * 100) }}% ·
+  sales tax {{ "%.2f"|format(sales_tax * 100) }}% ·
+  freight {{ settings.freight_out_isk_per_m3|isk }}/m³. A
+  <span class="badge warn">spin-up</span> badge means history is
+  shallower than the chain and some inputs are costed off the priming run.</p>
+</details>
+
+{% include "_cycle_totals.html" %}
+
+{% if cards %}
+{% set lagged = true %}
+{% include "_profit_cards.html" %}
+{% else %}
+<p class="muted">No active pipeline is attributable to this run.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,311 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{# ✓/— glyphs carry hidden yes/no text so the state isn't glyph-only. #}
+{% macro yn(v) %}{{ '✓' if v else '—' }}<span class="vh">{{ 'yes' if v else 'no' }}</span>{% endmacro %}
+{% block content %}
+<div class="pagehead">
+  <h1>Dashboard</h1>
+  <div class="statpills" style="margin:0">
+    {% if esi_state %}
+      <span class="pill {% if esi_state.fetched_at|stale %}stale{% endif %}"
+            title="ESI snapshot {{ esi_state.fetched_at }} UTC"><span class="dot"></span>ESI <b>{{ esi_state.fetched_at|age }}</b></span>
+    {% else %}
+      <span class="pill off"><span class="dot"></span>ESI <b>never</b></span>
+    {% endif %}
+    {% if price_state and price_state[0] %}
+      <span class="pill {% if price_state[1]|stale %}stale{% endif %}"
+            title="{{ price_state[0] }} types cached, refreshed {{ price_state[1][:16].replace('T', ' ') }} UTC"><span class="dot"></span>Prices <b>{{ price_state[1]|age }}</b></span>
+    {% else %}
+      <span class="pill off"><span class="dot"></span>Prices <b>none</b></span>
+    {% endif %}
+    {% if structure_price_state and structure_price_state[0] %}
+      <span class="pill {% if structure_price_state[1]|stale %}stale{% endif %}"
+            title="structure market ({{ structure_label }}): {{ structure_price_state[0] }} types cached, refreshed {{ structure_price_state[1][:16].replace('T', ' ') }} UTC"><span class="dot"></span>{{ structure_label }} <b>{{ structure_price_state[1]|age }}</b></span>
+    {% else %}
+      <span class="pill off" title="structure market ({{ structure_label }}) never pulled — needs a character with the structure-markets scope"><span class="dot"></span>{{ structure_label }} <b>none</b></span>
+    {% endif %}
+    <span class="pill {% if not sde_build %}off{% endif %}"><span class="dot"></span>SDE <b>{{ sde_build or 'not imported' }}</b></span>
+  </div>
+  <div class="actions">
+    <form method="post" action="{{ url_for('esi_refresh') }}">
+      <button {% if not characters or not sde_build %}disabled
+        title="{% if not sde_build %}download the game data first — step 1 of setup{% else %}log in a character first — the ESI tab has the SSO button{% endif %}"{% endif %}>⟳ Update from ESI</button>
+    </form>
+    <form method="post" action="{{ url_for('prices_refresh') }}">
+      <button {% if not pipelines %}disabled
+        title="add a pipeline first — prices are pulled for what your pipelines need"{% endif %}>⟳ Refresh prices</button>
+    </form>
+    <form method="post" action="{{ url_for('run_plan') }}">
+      <button class="primary" {% if not pipelines or not esi_state %}disabled
+        title="{% if not pipelines and not esi_state %}needs pipelines and an ESI update first{% elif not pipelines %}add a pipeline first{% else %}run an ESI update first{% endif %}"{% endif %}>
+        ▶ Plan index run</button>
+    </form>
+  </div>
+</div>
+
+{% if not runs or show_setup %}
+{% set ns = namespace(marked=false) %}
+{% macro stepattrs(done) -%}
+  {%- if done %}class="done"{% elif not ns.marked %}{% set ns.marked = true %}class="next" aria-current="step"{% endif -%}
+{%- endmacro %}
+{% macro donebadge(done) -%}
+  {%- if done %} <span class="badge good">done</span>{% endif -%}
+{%- endmacro %}
+<div class="panel" id="setup">
+  <div class="dialog-head">
+    <h2>First-run setup</h2>
+    <button type="button" class="mini" onclick="dismissSetup()"
+            title="hide this panel — the Settings page's First-run setup button brings it back">close</button>
+  </div>
+  <p class="muted" style="margin:.2rem 0 .6rem">Five steps from a fresh
+    install to your first planned run.{% if not runs %} This panel
+    disappears once a run exists.{% endif %}</p>
+  <ol class="setup">
+    <li {{ stepattrs(sde_build) }} id="sde-step"><b>Download the game
+      data</b> — blueprints, items and solar systems, straight from CCP
+      (~100&nbsp;MB; importing takes a few minutes, and the page reloads
+      itself when it lands).{{ donebadge(sde_build) }}
+      <div class="sde-fetch">
+        <form method="post" action="{{ url_for('sde_import_start') }}"
+              onsubmit="return sdeStart(this)">
+          <button {% if sde_job.state == 'running' %}disabled
+            title="a game data download is already running"{% endif %}>
+            {%- if sde_build %}⟳ Check for updates{% else %}↓ Download game data{% endif %}</button>
+        </form>
+        <div class="progress" id="sde-progress"
+             data-state="{{ sde_job.state }}"
+             {% if sde_job.state == 'idle' %}hidden{% endif %}>
+          <div class="bar"><div class="fill" id="sde-bar"
+            style="width:{% if sde_job.state == 'done' %}100%{% else %}0%{% endif %}"></div></div>
+          <span class="readout" id="sde-text">{{ sde_job.message }}</span>
+        </div>
+      </div></li>
+    <li {{ stepattrs(characters) }}><b><a
+      href="{{ url_for('sso_login') }}">Log in with EVE</a></b> — opens
+      login.eveonline.com in your own browser and grants the ESI scopes that
+      read your assets, jobs and wallets.{{ donebadge(characters) }}</li>
+    <li {{ stepattrs(esi_state) }}><b>Update from ESI</b> — the
+      ⟳ button above. Takes a minute or two and snapshots your stock,
+      jobs and wallets.{{ donebadge(esi_state) }}</li>
+    <li {{ stepattrs(pipelines) }}><b><a
+      href="{{ url_for('pipelines') }}">Add your pipelines</a></b> — what
+      you build and how many per cycle. Product and quantity is enough to
+      start.{{ donebadge(pipelines) }}</li>
+    <li {{ stepattrs(price_state and price_state[0]) }}><b>Refresh
+      prices</b> — the ⟳ button above pulls Jita quotes for everything
+      your pipelines need.{{ donebadge(price_state and price_state[0]) }}</li>
+  </ol>
+  <p class="muted" style="margin:.6rem 0 0">Then look over
+    <a href="{{ url_for('settings') }}">Settings</a> — job slots, skills
+    and build structures — and hit <b>▶ Plan index run</b>: your shopping
+    list and job installs for the first cycle.</p>
+</div>
+<script>
+// Close hides the panel and remembers the choice; a forced view from the
+// Settings page (?setup=1) always opens, and closing it cleans the URL so
+// a reload stays closed. Reopen any time via Settings → First-run setup.
+function dismissSetup() {
+  document.getElementById("setup").hidden = true;
+  try { localStorage.setItem("magoo-setup-dismissed", "1"); } catch (e) {}
+  if (location.search.indexOf("setup=1") !== -1) {
+    history.replaceState(null, "", location.pathname);
+  }
+}
+(function () {
+  try {
+    // Pre-SDE the app is unusable and every gate's guidance points at
+    // this panel's download button, so a stored dismissal is ignored
+    // until the game data exists.
+    if ({{ 'true' if sde_build else 'false' }}
+        && localStorage.getItem("magoo-setup-dismissed") === "1"
+        && location.search.indexOf("setup=1") === -1) {
+      document.getElementById("setup").hidden = true;
+    }
+  } catch (e) {}
+})();
+
+// Step 1: start the game-data download over fetch, then poll /sde/status
+// once a second. The endpoint is DB-free, so polling stays responsive
+// while the import transaction holds the write lock. Milestones go
+// through announce(); per-tick progress only updates the visible text.
+// The base.html submit listener puts the spinner on the button; it stays
+// on for the whole background run and clears on done/error. A failed
+// fetch falls back to the plain form POST (flash + manual reloads).
+function sdeStart(form) {
+  const btn = form.querySelector("button");
+  if (btn.disabled) return false;
+  // Disable synchronously — Enter on the still-focused button would
+  // otherwise resubmit during the fetch round-trip — and reset the row
+  // so a retry never wears the previous run's fill or error state.
+  btn.disabled = true;
+  btn.title = "a game data download is already running";
+  const box = document.getElementById("sde-progress");
+  box.hidden = false;
+  box.dataset.state = "running";
+  document.getElementById("sde-bar").style.width = "0%";
+  document.getElementById("sde-text").textContent = "checking for a new build";
+  fetch(form.action, { method: "POST", body: new FormData(form) })
+    .then(r => {
+      if (!r.ok) throw new Error(r.status);
+      announce("game data download started");
+      sdePoll();
+    })
+    .catch(() => form.submit());
+  return false;
+}
+function sdePoll() {
+  fetch("{{ url_for('sde_status') }}")
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(s => {
+      const box = document.getElementById("sde-progress");
+      box.hidden = false;
+      box.dataset.state = s.state;
+      document.getElementById("sde-text").textContent = s.message;
+      let frac = null;
+      if (s.stage === "download" && s.total) frac = s.done / s.total;
+      else if (s.stage === "import") frac = s.step / s.steps;
+      if (s.state === "done") frac = 1;
+      if (frac !== null) {
+        document.getElementById("sde-bar").style.width =
+          (frac * 100).toFixed(1) + "%";
+      }
+      if (s.state === "running") { setTimeout(sdePoll, 1000); return; }
+      if (s.state === "done" && s.changed) {
+        // Announced after the reload (below) — a polite live region is
+        // silenced by navigation, so hand the milestone across it.
+        try { sessionStorage.setItem("magoo-sde-imported", "1"); } catch (e) {}
+        location.reload();
+        return;
+      }
+      // done-but-current, error, or idle — idle means the app restarted
+      // mid-import and lost the in-memory job: say so, never "up to date".
+      if (s.state === "idle") {
+        document.getElementById("sde-text").textContent =
+          "download stopped — the app restarted; start it again";
+        announce("game data download stopped");
+      } else {
+        announce(s.state === "error" ? "game data download failed"
+                                     : "game data already up to date");
+      }
+      const btn = document.querySelector("#sde-step form button");
+      btn.disabled = false;
+      btn.classList.remove("loading");
+      btn.removeAttribute("title");
+    })
+    .catch(() => setTimeout(sdePoll, 2000));
+}
+// A download left running in another tab (or before a reload): resume
+// watching it — the server rendered the button disabled already.
+(function () {
+  const box = document.getElementById("sde-progress");
+  if (box && box.dataset.state === "running") sdePoll();
+})();
+// The success milestone handed across the self-reload above.
+(function () {
+  try {
+    if (sessionStorage.getItem("magoo-sde-imported") === "1") {
+      sessionStorage.removeItem("magoo-sde-imported");
+      announce("game data imported");
+    }
+  } catch (e) {}
+})();
+</script>
+{% endif %}
+
+<div class="row">
+  <div class="panel">
+    <h2>Pipelines</h2>
+    {% if pipelines %}
+    <div class="tablewrap">
+    <table>
+      <thead><tr><th>Product</th><th class="num">Qty / run</th><th>Status</th></tr></thead>
+      {% for p in pipelines %}
+      <tr>
+        <td>{{ p.product_name }}</td>
+        <td class="num">{{ p.output_qty_per_run|qty }}</td>
+        <td>{% if p.is_active %}<span class="badge good">active</span>
+            {% else %}<span class="badge">inactive</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    </div>
+    {% else %}<p class="muted">No pipelines yet — <a href="{{ url_for('pipelines') }}">add one</a>.</p>{% endif %}
+    <p class="muted small" style="margin:.4rem 0 0">
+      {% if esi_state %}
+        {{ esi_state.on_hand|length }} types on hand ·
+        {{ esi_state.active_jobs.values()|sum }} active jobs ·
+        {{ esi_state.character_isk|isk_short }} char /
+        {{ esi_state.corporation_isk|isk_short }} corp ISK.
+      {% else %}
+        No ESI data yet — run an update first (takes a minute or two).
+      {% endif %}
+      Planning runs off this snapshot, not live ESI, so you can plan any
+      time. Update it after things change in game.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>Character pool</h2>
+    <p class="muted" style="margin:.2rem 0 .6rem">Which of your characters
+      count toward planning — assets, wallets and job slots. Flip the toggles
+      on the <a href="{{ url_for('characters') }}">ESI</a> tab.</p>
+    {% if characters %}
+    <div class="tablewrap">
+    <table>
+      <thead><tr><th>Character</th><th>Assets</th><th>Wallet</th><th>Slots</th></tr></thead>
+      {% for c in characters %}
+      <tr>
+        <td>{{ c.character_name }}</td>
+        <td>{{ yn(c.count_assets) }}</td>
+        <td>{{ yn(c.include_assets) }}</td>
+        <td>{{ yn(c.include_job_slots) }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    </div>
+    {% else %}<p class="muted">No characters — <a href="{{ url_for('sso_login') }}">log one in</a>.</p>{% endif %}
+
+    <h2>Corporation pool</h2>
+    <p class="muted" style="margin:.2rem 0 .6rem">Same idea for your
+      corporations — assets, wallets and job slots.</p>
+    {% if corps %}
+    <div class="tablewrap">
+    <table>
+      <thead><tr><th>Corporation</th><th>Assets</th><th>Wallet</th><th>Slots</th></tr></thead>
+      {% for k in corps %}
+      <tr>
+        <td>{{ k.corporation_name or '?' }}</td>
+        <td>{{ yn(k.count_assets) }}</td>
+        <td>{{ yn(k.count_wallet) }}</td>
+        <td>{{ yn(k.count_jobs) }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    </div>
+    {% else %}<p class="muted">No corporations yet — they appear after the
+      next ESI update.</p>{% endif %}
+  </div>
+</div>
+
+<h2>Recent index runs</h2>
+{% if runs %}
+<div class="tablewrap">
+<table>
+  <thead><tr><th class="num">#</th><th>Planned</th><th>Status</th>
+      <th class="num">Char ISK</th><th class="num">Corp ISK</th><th></th></tr></thead>
+  {% for r in runs %}
+  <tr{% if r.superseded %} class="superseded"{% endif %}>
+    <td class="num">{{ r.run_number }}</td>
+    <td>{{ r.planned_start }}</td>
+    <td>{% if r.superseded %}<span class="badge"
+          title="a newer run exists — this plan is out of date">superseded</span>
+        {% else %}<span class="badge {% if r.status == 'complete' %}good{% else %}accent{% endif %}">{{ r.status }}</span>{% endif %}</td>
+    <td class="num" title="{{ r.wallet_character_isk|isk }}">{{ r.wallet_character_isk|isk_short }}</td>
+    <td class="num" title="{{ r.wallet_corporation_isk|isk }}">{{ r.wallet_corporation_isk|isk_short }}</td>
+    <td><a href="{{ url_for('run_detail', index_run_id=r.index_run_id) }}">view</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No runs yet.</p>{% endif %}
+{% endblock %}

@@ -1,0 +1,120 @@
+{# The profit card table + breakdown dialogs, shared by Planning → Profit
+   (lagged=false: what-if at today's prices) and a run's Profit tab
+   (lagged=true: realized lag-based cost). Set `lagged` before including;
+   renders only when `cards` is non-empty (callers guard the empty state).
+   Per-card dialog content is server-rendered into inert <template>s and
+   cloned into ONE shared dialog on open, so the on-demand detail (which
+   dwarfs the visible table) never weighs the live DOM. #}
+<div class="tablewrap">
+<table class="sortable profit">
+  <thead><tr>
+    <th>Product</th>
+    <th class="num">Cost / unit</th>
+    <th class="num">Sell</th>
+    <th class="num">Units</th>
+    <th class="num">Margin / unit</th>
+    <th class="num">Margin %</th>
+    <th class="num">Margin / cycle</th>
+    <th class="tagcol"></th>
+    <th></th>
+  </tr></thead>
+  {% for card in cards %}
+  {% set pid = card.cost.pipeline_id if lagged else card.pipeline.pipeline_id %}
+  {% set neg = card.margin is not none and card.margin < 0 %}
+  {% set top = loop.index <= 3 and card.margin is not none and card.margin > 0 %}
+  <tr class="{% if neg %}neg{% elif top %}top{% endif %}">
+    <td>{{ card.name }}</td>
+    <td class="num" title="{{ card.cost.total|isk }}">{{ card.cost.total|isk_short }}</td>
+    <td class="num" title="{{ card.price|isk }}">{{ card.price|isk_short }}</td>
+    <td class="num">{{ card.cost.hulls_per_cycle|qty }}</td>
+    <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}"
+        title="{{ card.margin|isk }}">{{ card.margin|isk_short }}</td>
+    <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}">
+      {% if card.margin is not none and card.cost.total %}
+        {{ "%.1f"|format(card.margin / card.cost.total * 100) }}%
+      {% else %}—{% endif %}</td>
+    {% set cyc = (card.margin * card.cost.hulls_per_cycle) if card.margin is not none else none %}
+    <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}"
+        title="{{ cyc|isk }}">{{ cyc|isk_short }}</td>
+    <td class="tagcol"><span class="tags">
+      {% if card.capital %}
+        <span class="badge accent" title="sell quote from the capital structure
+        market; capital fees and fixed movement cost applied">capital</span>
+      {% endif %}
+      {% if lagged and card.cost.spin_up %}
+        <span class="badge warn" title="History is shallower than the chain —
+        some inputs are costed off the priming run">spin-up</span>
+      {% endif %}
+      {% if card.cost.missing_prices %}
+        <span class="badge warn" title="{{ card.cost.missing_prices }}
+        input(s) have no cached price and count as 0 — the cost
+        understates">{{ card.cost.missing_prices }} unpriced</span>
+      {% endif %}
+      {% if not lagged and card.cost.region_priced %}
+        <span class="badge" title="{{ card.cost.region_priced }} raw input(s)
+        have no hub-station order and are priced at the region-wide best
+        order from the NPC-goods region">{{ card.cost.region_priced }} region-priced</span>
+      {% endif %}
+      {% if card.price is none %}
+        <span class="badge warn" title="no sell quote cached for this product">no quote</span>
+      {% elif neg %}
+        <span class="badge fill bad" title="net proceeds after sell fees fall below the {{ 'lagged' if lagged else 'current' }} chain cost — see margin / unit">negative margin</span>
+      {% endif %}</span></td>
+    <td><button type="button" class="mini"
+        onclick="openBreakdown('{{ pid }}')">breakdown</button></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+<p class="muted footnote" style="margin:.4rem 0 0">full ISK on hover ·
+  sorted by margin / unit · green stripe = top 3 earners</p>
+
+<dialog id="bd" class="breakdown" aria-labelledby="bd-title"></dialog>
+{% for card in cards %}
+{% set pid = card.cost.pipeline_id if lagged else card.pipeline.pipeline_id %}
+<template id="bd-tpl-{{ pid }}">
+  <div class="dialog-head">
+    <h2 id="bd-title">{{ card.name }} — {{ 'lagged cost' if lagged else 'cost' }} breakdown</h2>
+    <form method="dialog"><button class="mini">close</button></form>
+  </div>
+  <p class="muted" style="margin:.4rem 0 .6rem">
+    materials {{ card.cost.subtotal('material')|isk }}{% if card.cost.structure_material_share_pct is not none %}
+    <span title="Null Sec Market Share: {{ card.cost.structure_material_cost|isk }} ISK of this unit's materials {% if lagged %}were bought{% else %}are cheaper landed{% endif %} at the null-sec market">({{ "%.1f"|format(card.cost.structure_material_share_pct) }}% null-sec market)</span>{% endif %} ·
+    job fees {{ card.cost.subtotal('install')|isk }} ·
+    freight {{ card.cost.subtotal('freight_in')|isk }} ·
+    BPC {{ card.cost.subtotal('bpc')|isk }} ·
+    total {{ card.cost.total|isk }} / unit</p>
+  <table class="sortable">
+    <thead><tr><th>Item</th><th>Kind</th><th class="num">Depth</th>
+        <th class="num">Qty/unit</th><th class="num">Unit cost</th>
+        <th class="num">Cost/unit</th>{% if lagged %}<th class="num">Lag</th>{% endif %}</tr></thead>
+    {% for line in card.cost.lines|sort(attribute='cost_per_hull', reverse=True) %}
+    <tr>
+      <td>{{ line.name }}
+        {% if line.missing_price %}<span class="badge warn" title="no price on record for this input — it counts as 0 in the total">no price</span>{% endif %}
+        {% if not lagged and line.region_price %}<span class="badge" title="no hub-station order; region-wide best order from the NPC-goods region">region price</span>{% endif %}
+        {% if line.kind == 'material' and line.venue == 'structure' %}<span class="badge accent" title="{% if lagged %}bought at the structure market (cheaper landed than Jita at that run's plan time){% else %}cheaper landed at the structure market than at Jita{% endif %}">{{ settings.structure_market_label() }}</span>{% endif %}</td>
+      <td class="muted">{{ line.kind }}</td>
+      <td class="num">{{ line.depth }}</td>
+      <td class="num">{{ "%.2f"|format(line.qty_per_hull) }}</td>
+      <td class="num">{{ line.unit_cost|isk }}</td>
+      <td class="num">{{ line.cost_per_hull|isk }}</td>
+      {% if lagged %}<td class="num">{{ line.lag_runs }}
+        {% if line.clamped %}<span class="badge warn" title="this input's chain depth lags deeper than the executed history — costed off the earliest (priming) run">clamped</span>{% endif %}</td>{% endif %}
+    </tr>
+    {% endfor %}
+  </table>
+</template>
+{% endfor %}
+<script>
+// One live dialog; the clicked card's server-rendered content is cloned in
+// on open, then made sortable and its ledger tooltips converted.
+function openBreakdown(pid) {
+  const d = document.getElementById("bd");
+  const tpl = document.getElementById("bd-tpl-" + pid);
+  d.replaceChildren(tpl.content.cloneNode(true));
+  initSortable(d);
+  convertTips(d);
+  d.showModal();
+}
+</script>

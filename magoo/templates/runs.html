@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Index Runs{% endblock %}
+{% block content %}
+<h1>Index Runs</h1>
+{% if superseded_count %}
+<p class="muted" style="margin:.2rem 0 .6rem">
+  {% if show_all %}
+    Showing {{ superseded_count }} superseded
+    run{{ '' if superseded_count == 1 else 's' }} —
+    <a href="{{ url_for('runs') }}">hide them</a>.
+  {% else %}
+    <a href="{{ url_for('runs', all=1) }}">Show {{ superseded_count }}
+    superseded run{{ '' if superseded_count == 1 else 's' }}</a>
+    — older plans replaced by a newer one.
+  {% endif %}
+</p>
+{% endif %}
+{% if runs %}
+<div class="tablewrap">
+<table>
+  <thead><tr><th class="num">#</th><th>Planned</th><th>Status</th>
+      <th class="num">Items</th><th class="num">Buy total</th><th></th></tr></thead>
+  {% for r in runs %}
+  <tr{% if r.superseded %} class="superseded"{% endif %}>
+    <td class="num">{{ r.run_number }}</td>
+    <td>{{ r.planned_start }}</td>
+    <td>{% if r.superseded %}<span class="badge"
+          title="a newer run exists — this plan is out of date">superseded</span>
+        {% else %}<span class="badge {% if r.status == 'complete' %}good{% else %}accent{% endif %}">{{ r.status }}</span>{% endif %}</td>
+    <td class="num">{{ r['items']|qty }}</td>
+    <td class="num" title="{{ r.buy_total|isk }}">{{ r.buy_total|isk_short }}{% if r.buys_unpriced %}
+      <span class="badge warn" title="unpriced buy items count as 0 ISK here">{{ r.buys_unpriced }} unpriced</span>{% endif %}</td>
+    <td><a href="{{ url_for('run_detail', index_run_id=r.index_run_id) }}">view</a>
+      {% if r.status != 'complete' %}
+      <form class="inline" method="post"
+            action="{{ url_for('run_delete', index_run_id=r.index_run_id) }}"
+            onsubmit="return confirm('Discard run {{ r.run_number }}? It was never executed — its plan is deleted permanently.')">
+        <button class="mini danger">discard</button>
+      </form>
+      {% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No index runs yet — plan one from the
+<a href="{{ url_for('dashboard') }}">dashboard</a>.</p>{% endif %}
+{% endblock %}

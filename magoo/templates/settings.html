@@ -1,0 +1,332 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <h1>Settings</h1>
+  <span class="cap">The planner's assumptions about your operation — buffers,
+    fees, skills, structures and rigs. Changes kick in the next time you plan
+    a run.</span>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('dashboard', setup=1) }}"
+       title="the six-step checklist from a fresh install to the first planned run, with each step's current state">First-run setup</a>
+  </div>
+</div>
+
+<div class="settings">
+<aside class="sidenav">
+  <a href="#global">Global</a>
+  <a href="#alchemy">Alchemy</a>
+  <a href="#skills">Skills</a>
+  <a href="#subcap">High Sec Trade Hub Pricing</a>
+  <a href="#capital">Null Sec Trade Hub Pricing</a>
+  <a href="#classes">Build settings</a>
+  <a href="#blacklist">Blacklist</a>
+  <a href="#tracked">Tracked systems</a>
+</aside>
+
+<div class="settings-main">
+<form method="post" id="settings-form">
+<div class="panel" id="global">
+  <h2>Global</h2>
+  <div class="fields">
+    <label for="buffer_pct">Stockpile buffer
+      <small>0.1–10%; buildable intermediates only — final product counts are exact, raw inputs are just-in-time</small></label>
+    <span class="withunit"><input id="buffer_pct" name="buffer_pct" type="number" step="0.1" min="0.1" max="10"
+           value="{{ settings.stockpile_buffer|pct }}">%</span>
+    <label for="purchase_margin_pct">Input purchase margin
+      <small>extra raw materials bought vs. what this cycle's planned jobs consume</small></label>
+    <span class="withunit"><input id="purchase_margin_pct" name="purchase_margin_pct" type="number" step="0.1" min="0" max="50"
+           value="{{ settings.input_purchase_margin|pct }}">%</span>
+    <label for="duration">Max run duration <small>hours — the index-run cycle window</small></label>
+    <input id="duration" name="duration" type="number" step="0.5" min="1"
+           value="{{ settings.max_run_duration_hours }}">
+    <label for="batch">Ship batch multiple <small>ship builds round up to a multiple of this</small></label>
+    <input id="batch" name="batch" type="number" min="1" value="{{ settings.ship_batch_multiple }}">
+    <label for="extra_runs">Composite reaction extra runs <small>extra buffer for composite reaction inputs</small></label>
+    <input id="extra_runs" name="extra_runs" type="number" min="0"
+           value="{{ settings.composite_reaction_extra_runs }}">
+    <label for="mfg_slots">Manufacturing slots <small>total pool; multi-cycle active jobs (from ESI) subtract from this</small></label>
+    <input id="mfg_slots" name="mfg_slots" type="number" min="0" value="{{ settings.manufacturing_slots }}">
+    <label for="reaction_slots">Reaction slots <small>total pool</small></label>
+    <input id="reaction_slots" name="reaction_slots" type="number" min="0" value="{{ settings.reaction_slots }}">
+    <label for="count_fitted_stock">Count fitted &amp; deployed items as stock
+      <small>when off, items fitted to or loaded in ships and structures (module, rig, subsystem, service, fuel, core, drone and fighter slots/bays) and anything deployed in space — anchored structures, sov hubs, POCOs — are left out of ESI on-hand stock; items stored inside them still count; applies at the next ESI update</small></label>
+    <input id="count_fitted_stock" name="count_fitted_stock" type="checkbox" {{ 'checked' if settings.count_fitted_stock }}>
+    <label for="intermediate_me">Intermediate component ME
+      <small>every blueprint without an explicit setting; a final product's ME/TE comes from the pipeline paste</small></label>
+    <input id="intermediate_me" name="intermediate_me" type="number" min="0" max="10"
+           value="{{ settings.default_intermediate_me }}">
+    <label for="intermediate_te">Intermediate component TE</label>
+    <input id="intermediate_te" name="intermediate_te" type="number" min="0" max="20"
+           value="{{ settings.default_intermediate_te }}">
+    <label for="industry_scc_pct">Industry SCC surcharge
+      <small>flat SCC tax on every job installation fee; server-side rate (not in the SDE), 4% per EVE University; verify against a live install quote</small></label>
+    <span class="withunit"><input id="industry_scc_pct" name="industry_scc_pct" type="number" step="0.01" min="0" max="20"
+           value="{{ settings.industry_scc_surcharge|pct }}">%</span>
+  </div>
+</div>
+
+<div class="panel" id="alchemy">
+  <h2>Alchemy</h2>
+  <details class="muted help">
+    <summary>How alchemy is planned</summary>
+    <p>When reaction slots are left over, cheaper Unrefined reaction routes
+    substitute for direct composite reactions — you run the unrefined
+    formula, then manually reprocess its output into the composite plus
+    recovered inputs. A contended reaction pool disables alchemy (direct
+    reactions are far more slot-efficient).</p>
+  </details>
+  <div class="fields">
+    <label for="alchemy_enabled">Enable alchemy</label>
+    <input id="alchemy_enabled" name="alchemy_enabled" type="checkbox" {{ 'checked' if settings.alchemy_enabled }}>
+    <label for="alchemy_yield_pct">Reprocess yield
+      <small>unrefined items reprocess under scrapmetal rules: flat yield, max 55% (50% structure base × Scrap Metal Processing V, no rig bonuses); fold any reprocessing tax in here</small></label>
+    <span class="withunit"><input id="alchemy_yield_pct" name="alchemy_yield_pct" type="number" step="0.5" min="0" max="100"
+           value="{{ settings.alchemy_reprocess_yield|pct }}">%</span>
+    <label for="max_alchemy_jobs">Max alchemy jobs per type <small>per unrefined formula per cycle; 0 disables</small></label>
+    <input id="max_alchemy_jobs" name="max_alchemy_jobs" type="number" min="0"
+           value="{{ settings.max_alchemy_jobs_per_type }}">
+  </div>
+</div>
+
+<div class="panel" id="skills">
+  <h2>Skills <span class="muted">— how fast your jobs run</span></h2>
+  <details class="muted help">
+    <summary>How skills apply</summary>
+    <p>Entered here, not read from ESI. Industry −4%/level and Advanced
+    Industry −3%/level apply to all manufacturing; Reactions −4%/level to
+    reactions; the last four apply −1%/level only on blueprints that
+    require them — Outpost Construction on Upwell structures, Standup
+    modules, Skyhooks and structure fighters. Tech I structure rigs and
+    structure components need only Industry; Tech II Standup rigs also take
+    the Tech 2 Science level.</p>
+  </details>
+  <div class="fields cols2">
+    <label for="skill_industry">Industry</label>
+    <input id="skill_industry" name="skill_industry" type="number" min="0" max="5" value="{{ settings.skill_industry }}">
+    <label for="skill_advanced_industry">Advanced Industry</label>
+    <input id="skill_advanced_industry" name="skill_advanced_industry" type="number" min="0" max="5" value="{{ settings.skill_advanced_industry }}">
+    <label for="skill_reactions">Reactions</label>
+    <input id="skill_reactions" name="skill_reactions" type="number" min="0" max="5" value="{{ settings.skill_reactions }}">
+    <label for="skill_adv_ship_construction">Advanced Ship Construction</label>
+    <input id="skill_adv_ship_construction" name="skill_adv_ship_construction" type="number" min="0" max="5" value="{{ settings.skill_adv_ship_construction }}">
+    <label for="skill_starship_engineering">Racial Starship Engineering</label>
+    <input id="skill_starship_engineering" name="skill_starship_engineering" type="number" min="0" max="5" value="{{ settings.skill_starship_engineering }}">
+    <label for="skill_science">Tech 2 Science / Engineering</label>
+    <input id="skill_science" name="skill_science" type="number" min="0" max="5" value="{{ settings.skill_science }}">
+    <label for="skill_outpost_construction">Outpost Construction</label>
+    <input id="skill_outpost_construction" name="skill_outpost_construction" type="number" min="0" max="5" value="{{ settings.skill_outpost_construction }}">
+  </div>
+</div>
+
+<div class="panel" id="subcap">
+  <h2>High Sec Trade Hub Pricing</h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">The high-sec hub (Jita 4-4 in
+    the price region): sub-capital hulls, Upwell structures, structure
+    rigs/modules and structure components sell-quote here and list at its NPC
+    station with these fees; bought inputs default to its quote. Effective
+    with current values:
+    <b>broker fee {{ "%.2f"|format(broker_rate * 100) }}%</b> ·
+    <b>sales tax {{ "%.2f"|format(sales_tax * 100) }}%</b> —
+    verify against a sell-order window in the client.</p>
+  <div class="fields cols2">
+    <label for="region">Price region
+      <small>10000002 = The Forge; quotes come from its hub station (Jita 4-4), and raw inputs with no hub-station order (NPC-seeded goods such as Marines or Janitors) take this region's region-wide best price</small></label>
+    <input id="region" name="region" type="number" min="1" required value="{{ settings.price_region_id }}">
+    <label for="source">Price source <small>min sell or max buy</small></label>
+    <select id="source" name="source">
+      <option value="sell" {{ 'selected' if settings.price_source == 'sell' }}>sell</option>
+      <option value="buy" {{ 'selected' if settings.price_source == 'buy' }}>buy</option>
+    </select>
+    <label for="skill_accounting">Accounting</label>
+    <input id="skill_accounting" name="skill_accounting" type="number" min="0" max="5" value="{{ settings.skill_accounting }}">
+    <label for="skill_broker_relations">Broker Relations</label>
+    <input id="skill_broker_relations" name="skill_broker_relations" type="number" min="0" max="5" value="{{ settings.skill_broker_relations }}">
+    <label for="standing_faction">Faction standing <small>station owner</small></label>
+    <input id="standing_faction" name="standing_faction" type="number" step="0.01" min="-10" max="10"
+           value="{{ settings.standing_broker_faction }}">
+    <label for="standing_corp">Corp standing <small>station owner</small></label>
+    <input id="standing_corp" name="standing_corp" type="number" step="0.01" min="-10" max="10"
+           value="{{ settings.standing_broker_corp }}">
+    <label for="freight_in">Courier Highsec Market → Industry Hub <small>ISK/m³, bought materials hauled in from this hub (the null-sec leg is set in the panel below)</small></label>
+    <input id="freight_in" name="freight_in" type="number" step="1" min="0" value="{{ settings.freight_in_isk_per_m3 }}">
+    <label for="freight_out">Courier Industry Hub → High Sec Market <small>ISK/m³ on packaged volume — finished subcap hulls, structures, rigs, components hauled out to sell; Keepstar, Palatine Keepstar and Sotiyo are exempt</small></label>
+    <input id="freight_out" name="freight_out" type="number" step="1" min="0" value="{{ settings.freight_out_isk_per_m3 }}">
+  </div>
+</div>
+
+<div class="panel" id="capital">
+  <h2>Null Sec Trade Hub Pricing</h2>
+  <details class="muted help">
+    <summary>What the null-sec hub (structure market) is used for</summary>
+    <p>One null-sec structure market (the C-J6MT Keepstar by default) serves
+    two jobs. <b>Buying:</b> every input the plan buys is priced at whichever
+    is cheaper <i>landed</i> — Jita price + Jita freight-in, or this
+    market's best sell price + the C-J6 freight-in below; the Buy list
+    badges C-J6 buys and flags <i>shallow</i> ones whose sell ladder has
+    fewer units beating the Jita landed price than the plan buys (the best
+    price is still used; buy the rest in Jita). Pipeline finals are never
+    compared. <b>Selling:</b> capitals, freighters, jump freighters, and
+    Orcas sell-quote here instead of the price region, with the fee pair
+    below and the fixed movement cost in place of ISK/m³ freight-out.
+    Needs a character logged in with the structure-markets scope and
+    docking access. Upwell structures are NOT priced here — they use the
+    high-sec panel above.</p>
+  </details>
+  <div class="fields cols2">
+    <label for="capital_market_mode">Market</label>
+    <select id="capital_market_mode" name="capital_market_mode">
+      <option value="cj6" {% if settings.capital_market_mode == 'cj6' %}selected{% endif %}>C-J6MT Keepstar</option>
+      <option value="custom" {% if settings.capital_market_mode == 'custom' %}selected{% endif %}>Custom structure ID</option>
+    </select>
+    <label for="capital_structure_id">Custom structure ID <small>only used with Custom</small></label>
+    <input id="capital_structure_id" name="capital_structure_id" type="number" min="0" style="width:11rem"
+           value="{{ settings.capital_structure_id or '' }}" placeholder="structure id">
+    <label for="structure_buy_enabled">Buy inputs here when cheaper landed <small>off = every input is priced from Jita, as before</small></label>
+    <input id="structure_buy_enabled" name="structure_buy_enabled" type="checkbox" {{ 'checked' if settings.structure_buy_enabled }}>
+    <label for="structure_freight_in">Courier Null Sec Market → Industry Hub <small>ISK/m³, bought materials hauled in from this market</small></label>
+    <input id="structure_freight_in" name="structure_freight_in" type="number" step="1" min="0" value="{{ settings.structure_freight_in_isk_per_m3 }}">
+    <label for="capital_sales_tax_pct">Sales tax <small>capital-class hulls</small></label>
+    <span class="withunit"><input id="capital_sales_tax_pct" name="capital_sales_tax_pct" type="number" step="0.01" min="0" max="20"
+           value="{{ settings.capital_sales_tax|pct }}">%</span>
+    <label for="capital_broker_pct">Broker fee</label>
+    <span class="withunit"><input id="capital_broker_pct" name="capital_broker_pct" type="number" step="0.01" min="0" max="20"
+           value="{{ settings.capital_broker_rate|pct }}">%</span>
+    <label for="capital_movement_cost">Movement cost <small>ISK per hull</small></label>
+    <input id="capital_movement_cost" name="capital_movement_cost" type="number" step="100000" min="0"
+           value="{{ settings.capital_movement_cost_isk }}">
+    <label for="capital_scc_pct">SCC surcharge</label>
+    <span class="withunit"><input id="capital_scc_pct" name="capital_scc_pct" type="number" step="0.01" min="0" max="20"
+           value="{{ settings.capital_scc_surcharge|pct }}">%</span>
+  </div>
+</div>
+
+<div class="panel" id="classes">
+  <h2>Build settings <span class="muted">— where you build each class of item</span></h2>
+  <details class="muted help">
+    <summary>How rig bonuses are applied</summary>
+    <p>Where each class of items is built, and what rigs the structure
+    carries. Rig bonuses: ME T1 −2.0% / T2 −2.4%, TE T1 −20% / T2 −24%,
+    scaled by the rig family's security band — engineering rigs ×1.0
+    highsec / ×1.9 lowsec / ×2.1 nullsec, reaction rigs ×1.0 lowsec / ×1.1
+    nullsec (reactions cannot run in highsec). Thukker rigs (component
+    classes and the structures class) are lowsec specialists: ME −3.7% on
+    capital components / −2.0% on other components and on structures,
+    TE −20%, all scaled ×1.9 in lowsec but only ×0.1 anywhere else.</p>
+  </details>
+  <div class="tablewrap">
+  <table class="classes">
+    <thead><tr><th>Class</th><th>Structure</th><th>Security</th><th>ME rig</th>
+        <th>TE rig</th><th class="num">Cost index %</th><th class="num">Tax %</th></tr></thead>
+    {% for cls in item_classes %}
+    {% set cs = class_settings[cls] %}
+    <tr>
+      <td>{{ CLASS_LABELS[cls] }}</td>
+      <td><select name="{{ cls }}_structure" aria-label="{{ CLASS_LABELS[cls] }} — structure">
+        {% for value, label in structures %}
+          <option value="{{ value if value is not none else '' }}"
+            {{ 'selected' if cs.structure_type_id == value }}>{{ label }}</option>
+        {% endfor %}
+      </select></td>
+      {% set band = 'high' if cs.security >= 0.45 else ('low' if cs.security > 0 else 'null') %}
+      <td><select name="{{ cls }}_security_band" aria-label="{{ CLASS_LABELS[cls] }} — security band"
+            title="security band of the build system">
+        {% if cls != 'reactions' %}
+          <option value="high" {{ 'selected' if band == 'high' }}>highsec</option>
+        {% endif %}
+          <option value="low" {{ 'selected' if band == 'low' }}>lowsec</option>
+          <option value="null" {{ 'selected' if band == 'null' }}>null/WH</option>
+      </select></td>
+      {% set tiers = ('none','t1','t2','thukker') if cls in thukker_classes else ('none','t1','t2') %}
+      <td><select name="{{ cls }}_me_rig" aria-label="{{ CLASS_LABELS[cls] }} — ME rig">
+        {% for tier in tiers %}
+          <option value="{{ tier }}" {{ 'selected' if cs.me_rig == tier }}>{{ tier }}</option>
+        {% endfor %}
+      </select></td>
+      <td><select name="{{ cls }}_te_rig" aria-label="{{ CLASS_LABELS[cls] }} — TE rig">
+        {% for tier in tiers %}
+          <option value="{{ tier }}" {{ 'selected' if cs.te_rig == tier }}>{{ tier }}</option>
+        {% endfor %}
+      </select></td>
+      <td class="num"><input name="{{ cls }}_index_pct" type="number" step="0.01" min="0"
+                 aria-label="{{ CLASS_LABELS[cls] }} — system cost index %"
+                 value="{{ cs.system_cost_index|pct }}" title="system cost index as shown in the industry window, e.g. 5.21"></td>
+      <td class="num"><input name="{{ cls }}_tax_pct" type="number" step="0.01" min="0"
+                 aria-label="{{ CLASS_LABELS[cls] }} — facility tax %"
+                 value="{{ cs.tax_rate|pct }}" title="facility tax as a percentage, e.g. 0.25"></td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+</div>
+
+</form>
+
+<div class="panel" id="blacklist">
+  <h2>Production blacklist</h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">Items you check or list here
+  get <b>bought instead of built</b>, and their sub-chains drop out of the
+  plan. Your final products are always built.</p>
+  <form method="post" action="{{ url_for('blacklist_categories_save') }}">
+    <div class="checks">
+      {% for key, label, groups in blacklist_categories %}
+      <label><input type="checkbox" name="bl_{{ key }}"
+               {{ 'checked' if key in blacklist_checked }}> {{ label }}</label>
+      {% endfor %}
+    </div>
+    <p style="margin:.6rem 0 0"><button>Save blacklist categories</button></p>
+  </form>
+
+  <h3 class="subhead">Do-not-build items</h3>
+  <form method="post" action="{{ url_for('blacklist_item_add') }}" class="addrow">
+    <input name="item" aria-label="Item to blacklist" placeholder="Item name (e.g. Fernite Carbide)" size="34">
+    <button>Add</button>
+  </form>
+  {% if blacklist_items %}
+  <div class="tablewrap">
+  <table style="max-width: 34rem">
+    {% for i in blacklist_items %}
+    <tr>
+      <td>{{ i.name }}</td>
+      <td class="end"><form class="inline" method="post"
+            action="{{ url_for('blacklist_item_delete', type_id=i.type_id) }}">
+            <button class="mini danger">remove</button></form></td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}<p class="muted">No individual items blacklisted.</p>{% endif %}
+</div>
+
+<div class="panel" id="tracked">
+  <h2>Tracked solar systems</h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">Only assets in these systems
+  count as stock. Leave the list empty to count everything, everywhere.</p>
+  <form method="post" action="{{ url_for('tracked_add') }}" class="addrow">
+    <input name="system" aria-label="Solar system to track" placeholder="System name (e.g. Jita)" required>
+    <button>Track</button>
+  </form>
+  {% if tracked %}
+  <div class="tablewrap">
+  <table style="max-width: 34rem">
+    {% for s in tracked %}
+    <tr>
+      <td>{{ s.name or s.solar_system_id }}</td>
+      <td class="end"><form class="inline" method="post"
+                action="{{ url_for('tracked_delete', system_id=s.solar_system_id) }}">
+            <button class="mini danger">untrack</button></form></td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% endif %}
+</div>
+
+<div class="savebar">
+  <span class="muted">Saves everything above except the blacklist and tracked
+    systems, which have their own buttons.</span>
+  <button class="primary" form="settings-form">Save settings</button>
+</div>
+</div>
+</div>
+{% endblock %}

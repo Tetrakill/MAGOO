@@ -1,0 +1,13 @@
+# Normalise to LF in the repository regardless of who commits. Without this
+# the result depends on each contributor's core.autocrlf, which is how a
+# repository ends up with mixed line endings and diffs that touch every line.
+* text=auto eol=lf
+
+# PowerShell is happiest with CRLF on disk.
+*.ps1 text eol=crlf
+
+# Never transform these.
+*.ico binary
+*.png binary
+*.zip binary
+*.sqlite binary

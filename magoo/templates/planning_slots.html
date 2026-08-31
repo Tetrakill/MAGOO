@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}Planning{% endblock %}
+
+{% block content %}
+<div class="pagehead">
+  <h1>Planning</h1>
+  <span class="cap">Your line at cruising speed: every stockpile at target,
+    each cycle rebuilding what it consumed. This is a what-if — it ignores
+    your current stock and jobs, assumes alchemy off, and saves nothing.</span>
+</div>
+<div class="subnav">
+  <a href="{{ url_for('planning') }}">Profit</a>
+  <a href="{{ url_for('planning', view='slots') }}" aria-current="page" class="active">Slot Planner</a>
+</div>
+
+{% if rows is none %}
+<div class="panel">
+  <p class="muted" style="margin:0">{{ reason }}.</p>
+</div>
+{% else %}
+
+{% set mfg_over = mfg_demand > settings.manufacturing_slots %}
+{% set reaction_over = reaction_demand > settings.reaction_slots %}
+<div class="totals">
+  <div class="stat">
+    <span class="label">Mfg slots</span>
+    <span class="value {% if mfg_over %}bad{% endif %}"
+          title="uncapped steady-state job demand / manufacturing pool">{{ mfg_demand }}<span class="sub">/ {{ settings.manufacturing_slots }}</span></span>
+  </div>
+  <div class="stat">
+    <span class="label">Reaction slots</span>
+    <span class="value {% if reaction_over %}bad{% endif %}"
+          title="uncapped steady-state reaction job demand (direct reactions — alchemy assumed off) / reaction pool">{{ reaction_demand }}<span class="sub">/ {{ settings.reaction_slots }}</span></span>
+  </div>
+  <div class="stat">
+    <span class="label">Materials / cycle</span>
+    <span class="value" title="{{ buy_total|isk }} ISK · {{ buys|length }} items each cycle">{{ buy_total|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Chain</span>
+    <span class="value">{{ rows|length }}<span class="sub">items</span></span>
+  </div>
+  {% if struct_builds or struct_buys %}
+  <div class="stat">
+    <span class="label">Structure comps</span>
+    <span class="value" title="structure component types built / bought each cycle">{{ struct_builds|length }}<span class="sub">built · {{ struct_buys|length }} bought</span></span>
+  </div>
+  {% endif %}
+  {% if buys_unpriced or structure_buys %}
+  <div class="stat">
+    <span class="label">&nbsp;</span>
+    <span class="tags">
+      {% if buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — the materials total understates">{{ buys_unpriced }} unpriced</span>{% endif %}
+      {% if structure_buys %}<span class="badge accent" title="inputs cheaper landed (price + freight-in) at the structure market than at Jita">{{ structure_buys|length }} via {{ settings.structure_market_label() }}</span>{% endif %}
+      {% if shallow %}<span class="badge warn" title="structure-market buys whose sell ladder has fewer units beating the Jita landed price than the cycle buys">{{ shallow|length }} shallow</span>{% endif %}
+    </span>
+  </div>
+  {% endif %}
+</div>
+
+{% if capacity_rows %}
+<div class="panel alert-warn">
+  <h2><span class="badge fill warn">over pool</span> your plan wants more job
+    slots than you have. The tables show what fits; the rest gets bought
+    where the market sells it</h2>
+  <div class="tags">{% for i in capacity_rows %}<span class="badge warn"
+    title="{{ i.jobs_needed_unconstrained }} job(s) needed, {{ i.jobs_allocated }} fit">{{ i.name }}</span>{% endfor %}</div>
+</div>
+{% endif %}
+
+<h2>Replacement materials <span class="muted">— {{ buys|length }} items each cycle,
+  <span title="{{ buy_total|isk }} ISK">{{ buy_total|isk_short }}</span></span></h2>
+{% if buys %}
+<div class="tablewrap">
+<table class="sortable aligned">
+  <thead><tr><th>Item</th><th class="cat">Category</th><th class="num">Qty / cycle</th>
+      <th class="num">Unit price</th><th class="num">Total</th>
+      <th class="cat">Venue</th>
+      <th class="flags"></th></tr></thead>
+  {% for i in buys %}
+  <tr>
+    <td>{{ i.name }}</td>
+    <td class="cat muted">{{ i.category }}</td>
+    <td class="num">{{ i.recommended_buy_qty|qty }}</td>
+    <td class="num">{{ i.price_snapshot|isk }}</td>
+    {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
+    <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
+{{ m.venue_cell(i, plan_time=false) }}
+    <td class="flags">{% if i.capacity_limited %}<span class="badge warn"
+        title="bought because the slot pool can't fit the jobs">capacity</span>{% endif %}
+        {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
+        {{ m.shallow_badge(i, plan_time=false) }}
+        {% if i.type_id in region_wide %}<span class="badge" title="priced from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">Nothing to buy.</p>{% endif %}
+
+<h2>Manufacturing jobs <span class="muted">— each cycle</span></h2>
+{% if builds_grouped %}
+{% for category, group in builds_grouped %}
+<h3 class="subhead">{{ category }}
+  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
+  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+{{ m.job_table(group, execution=false) }}
+{% endfor %}
+{% else %}<p class="muted">No manufacturing jobs.</p>{% endif %}
+
+{% if struct_builds %}
+<h2>Structure components <span class="muted">— {{ struct_builds|length }} built
+  each cycle ({{ struct_slots }} slots); bought ones are in the materials
+  list above</span></h2>
+{{ m.job_table(struct_builds, execution=false) }}
+{% endif %}
+
+<h2>Reaction jobs <span class="muted">— each cycle</span></h2>
+{% if reactions_grouped %}
+{% for category, group in reactions_grouped %}
+<h3 class="subhead">{{ category }}
+  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
+  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+{{ m.job_table(group, execution=false) }}
+{% endfor %}
+{% else %}<p class="muted">No reaction jobs.</p>{% endif %}
+
+{% endif %}
+{% endblock %}

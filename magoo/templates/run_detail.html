@@ -1,0 +1,356 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}Run {{ run.run_number }}{% endblock %}
+
+{% block content %}
+{# Null-aware, not truthiness: 0.0 corp ISK (NPC corp / no Accountant role)
+   is a real value — only legacy runs with NULL wallets skip the check. #}
+{% set wallets = (run.wallet_character_isk or 0) + (run.wallet_corporation_isk or 0) %}
+{% set exceeds = run.wallet_character_isk is not none and buy_total > wallets %}
+<div class="pagehead">
+  <h1>{{ m.run_title(run, superseded) }}</h1>
+  <span class="cap">planned {{ run.planned_start }} ·
+    {{ items|length }} items in chain ·
+    wallet at plan time <span title="{{ run.wallet_character_isk|isk }} char / {{ run.wallet_corporation_isk|isk }} corp">{{ run.wallet_character_isk|isk_short }} char /
+    {{ run.wallet_corporation_isk|isk_short }} corp</span>
+    {% if run.completed_at %}· executed {{ run.completed_at }}{% endif %}</span>
+  <div class="actions">
+    {% if buys %}
+    <button type="button" class="mini"
+      onclick="const d=document.getElementById('multibuy'); d.open=true; d.scrollIntoView({behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block:'center'})">Multibuy ↓</button>
+    {% endif %}
+    {% if run.status != 'complete' %}
+    <form method="post"
+          action="{{ url_for('run_complete', index_run_id=run.index_run_id) }}"
+          onsubmit="return confirm('Mark run {{ run.run_number }} executed? The {{ buy_total|isk_short }} ISK buy list and installed jobs enter cost history.')">
+      <button class="primary">✓ Mark executed</button>
+    </form>
+    {% else %}
+    <form method="post"
+          action="{{ url_for('run_reopen', index_run_id=run.index_run_id) }}"
+          onsubmit="return confirm('Reopen run {{ run.run_number }}? It is removed from cost history.')">
+      <button class="danger">Reopen run</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% set active = 'plan' %}
+{% include "_run_subnav.html" %}
+
+<div class="totals">
+  <div class="stat">
+    <span class="label">Buy total</span>
+    <span class="value {% if exceeds %}bad{% endif %}" title="{{ buy_total|isk }} ISK · {{ buys|length }} items">{{ buy_total|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Mfg slots</span>
+    <span class="value {% if mfg_slots_used > settings.manufacturing_slots %}bad{% endif %}"
+          title="jobs allocated / manufacturing pool">{{ mfg_slots_used }}<span class="sub">/ {{ settings.manufacturing_slots }}</span></span>
+  </div>
+  <div class="stat">
+    <span class="label">Reaction slots</span>
+    <span class="value {% if reaction_slots_used + alchemy_slots_used > settings.reaction_slots %}bad{% endif %}"
+          title="reaction jobs{% if alchemy_slots_used %} + {{ alchemy_slots_used }} alchemy{% endif %} / reaction pool">{{ reaction_slots_used + alchemy_slots_used }}<span class="sub">/ {{ settings.reaction_slots }}{% if alchemy_slots_used %} · {{ alchemy_slots_used }} alchemy{% endif %}</span></span>
+  </div>
+  <div class="stat">
+    <span class="label">Unmet</span>
+    <span class="value {% if unmet %}bad{% endif %}" title="items with a deficit, no market and no capacity">{{ unmet|length }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Low stock</span>
+    <span class="value {% if low_stock %}warn{% endif %}" title="won't sustain the next run">{{ low_stock|length }}</span>
+  </div>
+  {% if struct_builds or struct_buys %}
+  <div class="stat">
+    <span class="label">Structure comps</span>
+    <span class="value" title="structure component types built / bought this cycle">{{ struct_builds|length }}<span class="sub">built · {{ struct_buys|length }} bought</span></span>
+  </div>
+  {% endif %}
+  {% if exceeds or buys_unpriced or structure_buys %}
+  <div class="stat">
+    <span class="label">&nbsp;</span>
+    <span class="tags">
+      {% if exceeds %}<span class="badge fill bad" title="buy total {{ buy_total|isk }} vs {{ wallets|isk }} in wallets at plan time">exceeds wallets</span>{% endif %}
+      {% if buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — total understates">{{ buys_unpriced }} unpriced</span>{% endif %}
+      {% if structure_buys %}<span class="badge accent" title="inputs cheaper landed (price + freight-in) at the structure market than at Jita">{{ structure_buys|length }} via {{ settings.structure_market_label() }}</span>{% endif %}
+      {% if shallow %}<span class="badge warn" title="structure-market buys whose sell ladder has fewer units beating the Jita landed price than the plan buys — the rest cost Jita money">{{ shallow|length }} shallow</span>{% endif %}
+    </span>
+  </div>
+  {% endif %}
+</div>
+
+{% if unmet %}
+<div class="panel alert-bad">
+  <h2><span class="badge fill bad">unmet demand</span> nothing on the market
+    and you're out of build slots</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Item</th><th class="num">Deficit</th></tr></thead>
+    {% for i in unmet %}
+    <tr><td>{{ i.name }}</td><td class="num">{{ i.deficit_qty|qty }}</td></tr>
+    {% endfor %}
+  </table>
+  </div>
+</div>
+{% endif %}
+
+{% if low_stock %}
+<div class="panel alert-warn">
+  <h2><span class="badge fill warn">low stock</span> won't sustain the next run</h2>
+  <div class="tags">{% for i in low_stock %}<span class="badge warn">{{ i.name }}</span>{% endfor %}</div>
+</div>
+{% endif %}
+
+<h2>Buy <span class="muted">— {{ buys|length }} items, <span title="{{ buy_total|isk }} ISK">{{ buy_total|isk_short }}</span></span></h2>
+{% if buys %}
+<div class="tablewrap">
+<table class="sortable aligned">
+  <thead><tr><th>Item</th><th class="cat">Category</th><th class="num">Qty</th>
+      <th class="num">Unit price</th><th class="num">Total</th>
+      <th class="cat">Venue</th>
+      <th class="flags"></th></tr></thead>
+  {% for i in buys %}
+  <tr>
+{{ m.item_cell(i) }}
+    <td class="cat muted">{{ i.category }}</td>
+    <td class="num">{{ i.recommended_buy_qty|qty }}</td>
+    <td class="num">{{ i.price_snapshot|isk }}</td>
+    {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
+    <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
+{{ m.venue_cell(i) }}
+    <td class="flags">{% if i.capacity_limited %}<span class="badge warn">capacity</span>{% endif %}
+        {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
+        {{ m.shallow_badge(i) }}
+        {% if i.type_id in region_wide %}<span class="badge" title="priced at plan time from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+<details id="multibuy">
+  <summary class="muted">Multibuy (paste into EVE's Multibuy window{% if multibuy_structure %} — one block per market{% endif %})</summary>
+  {% if multibuy_hub %}
+  <p class="muted">Jita</p>
+  <textarea class="multibuy" readonly onclick="this.select()"
+    aria-label="Multibuy — Jita">{{ multibuy_hub }}</textarea>
+  {% endif %}
+  {% if multibuy_structure %}
+  <p class="muted">{{ settings.structure_market_label() }} structure market</p>
+  <textarea class="multibuy" readonly onclick="this.select()"
+    aria-label="Multibuy — {{ settings.structure_market_label() }} structure market">{{ multibuy_structure }}</textarea>
+  {% endif %}
+</details>
+{% else %}<p class="muted">Nothing to buy.</p>{% endif %}
+
+<h2>Manufacturing jobs <span class="muted">— {{ builds|length }} items,
+  {{ builds|sum(attribute='jobs_allocated') }} slots</span></h2>
+{% if builds %}
+{% for category, group in builds_grouped %}
+<h3 class="subhead">{{ category }}
+  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
+  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+{{ m.job_table(group) }}
+{% endfor %}
+{% else %}<p class="muted">No manufacturing jobs.</p>{% endif %}
+
+{% if struct_builds or struct_buys %}
+<h2>Structure components <span class="muted">— {{ struct_builds|length }} built
+  ({{ struct_slots }} slots), {{ struct_buys|length }} bought</span></h2>
+{% if struct_builds %}
+{{ m.job_table(struct_builds) }}
+{% endif %}
+{% if struct_buys %}
+<h3 class="subhead">Bought this cycle <span class="muted">— cheaper to buy than
+  build, blacklisted, or out of job slots; these also appear in the Buy list
+  and Multibuy above</span></h3>
+<div class="tablewrap">
+<table class="sortable aligned">
+  <thead><tr><th>Item</th><th class="num">Qty</th>
+      <th class="num">Unit price</th><th class="num">Total</th>
+      <th class="cat">Venue</th>
+      <th class="flags"></th></tr></thead>
+  {% for i in struct_buys %}
+  <tr>
+{{ m.item_cell(i) }}
+    <td class="num">{{ i.recommended_buy_qty|qty }}</td>
+    <td class="num">{{ i.price_snapshot|isk }}</td>
+    {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
+    <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
+{{ m.venue_cell(i) }}
+    <td class="flags"><span class="badge warn">buy</span>
+        {% if i.capacity_limited %}<span class="badge warn">capacity</span>{% endif %}
+        {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
+        {{ m.shallow_badge(i) }}
+        {% if i.type_id in region_wide %}<span class="badge" title="priced at plan time from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+{% endif %}
+
+<h2>Reaction jobs <span class="muted">— {{ reactions|length }} items,
+  {{ reactions|sum(attribute='jobs_allocated') }} slots</span></h2>
+{% if reactions %}
+{% for category, group in reactions_grouped %}
+<h3 class="subhead">{{ category }}
+  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
+  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+{{ m.job_table(group) }}
+{% endfor %}
+{% else %}<p class="muted">No reaction jobs.</p>{% endif %}
+
+{% if alchemy %}
+<h2>Alchemy <span class="muted">— {{ alchemy|length }} items,
+  {{ alchemy|map(attribute='item')|sum(attribute='jobs_allocated') }} slots</span></h2>
+<p class="muted">Cheaper than the direct reaction at current landed prices
+  (venue price + courier); runs in
+  slots that would otherwise sit idle. Install the unrefined reaction jobs
+  below, then <b>reprocess the output</b> (expected at
+  {{ (alchemy_yield * 100)|round(0)|int }}% yield — scrapmetal rules, so
+  reprocessing rigs don't help).</p>
+<div class="tablewrap">
+<table class="sortable aligned">
+  <thead><tr><th>Item</th>
+      <th class="num">Runs/job</th><th class="num">Jobs</th>
+      <th class="num">Build qty</th>
+      <th class="num">Time/job</th>
+      <th class="num">Savings</th><th class="flags"></th></tr></thead>
+  {% for a in alchemy %}
+  {% set i = a.item %}
+  <tr>
+    <td>{{ i.name }}</td>
+    {% set per_job = ((i.runs_allocated + i.jobs_allocated - 1) // i.jobs_allocated)
+                     if i.jobs_allocated else 0 %}
+    <td class="num" data-sort="{{ per_job }}"
+        title="{{ i.runs_allocated|qty }} runs across {{ i.jobs_allocated }} job(s); max {{ i.max_runs_per_job|qty }}/job">
+      {{ per_job|qty if i.jobs_allocated else '—' }}</td>
+    <td class="num">{{ i.jobs_allocated }}</td>
+    <td class="num">{{ i.recommended_build_qty|qty }}</td>
+    <td class="num">{{ (i.time_per_run * per_job)|hours }}</td>
+    {% if a.direct_unit is not none and a.alchemy_unit is not none %}
+    {% set savings = (a.direct_unit - a.alchemy_unit) * a.expected_qty %}
+    <td class="num good" data-sort="{{ savings }}"
+        title="{{ a.direct_unit|isk }} direct vs {{ a.alchemy_unit|isk }} alchemy ISK per {{ a.composite_name }}, × {{ a.expected_qty|qty }} units = {{ savings|isk }}">
+      {{ savings|isk_short }}</td>
+    {% else %}<td class="num">—</td>{% endif %}
+    <td class="flags"></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+<div class="panel">
+  <h3 class="subhead" style="margin-top:0">After the jobs deliver — reprocess:</h3>
+  <ul style="margin:.4rem 0 0 1.2rem">
+    {% for a in alchemy %}
+    <li>Reprocess <b>{{ a.item.recommended_build_qty|qty }} {{ a.item.name }}</b>
+        → ~{{ a.expected_qty|qty }} {{ a.composite_name }}{% for name, qty in a.recovered %}
+        (+{{ qty|qty }} {{ name }} back){% endfor %}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<dialog id="deficit" class="breakdown" aria-labelledby="deficit-name">
+  <div class="dialog-head">
+    <h2 id="deficit-name"></h2>
+    <form method="dialog"><button class="mini">close</button></form>
+  </div>
+  <table id="deficit-math" style="max-width:24rem"></table>
+  <p class="muted" id="deficit-answer" style="margin:.6rem 0 0"></p>
+  <p style="margin:.4rem 0 0"><a id="deficit-chain">view in chain →</a></p>
+</dialog>
+<script>
+// One shared dialog, filled from the clicked row's data attributes — the
+// chain has 300+ items, so per-item dialogs would bloat the DOM. The
+// equation matches the engine's three deficit rules: intermediates end
+// the cycle back at target, raws buy just-in-time, finals always build.
+function openDeficit(btn) {
+  const d = btn.dataset;
+  const qty = n => Number(n).toLocaleString("en-US");
+  const target = Number(d.target), onhand = Number(d.onhand),
+        injobs = Number(d.injobs), deficit = Number(d.deficit);
+  let rows;
+  if (d.kind === "final") {
+    if (deficit < target) {
+      // A dual-role final: another pipeline consumes it, and the engine
+      // nets that component share against stock — so the build can be
+      // below the full cycle quantity.
+      rows = [
+        ["cycle quantity (incl. other pipelines' draw)", qty(target)],
+        ["− covered by stock / in-flight jobs", qty(target - deficit)],
+        ["= to build", qty(deficit)],
+      ];
+    } else {
+      rows = [["cycle quantity — finals always build", qty(deficit)]];
+    }
+  } else if (deficit > 0 && d.kind === "raw") {
+    rows = [
+      ["target — planned consumption + margin", qty(target)],
+      ["− on hand", qty(onhand)],
+      ["− in jobs", qty(injobs)],
+      ["= deficit", qty(deficit)],
+    ];
+    // Runs planned before the just-in-time raw rule persisted an extra
+    // cycle's draw in the deficit; recover it so the rows still sum.
+    const legacyDraw = deficit - target + onhand + injobs;
+    if (legacyDraw !== 0) rows.splice(1, 0, ["+ planned draw this cycle", qty(legacyDraw)]);
+  } else if (deficit > 0) {
+    // Buildable intermediate: the engine sizes the deficit against the
+    // allocation's actual draw (not the steady-state need), so recover
+    // that term from the identity deficit = target + draw − stock − jobs.
+    rows = [
+      ["target stock", qty(target)],
+      ["+ planned draw this cycle", qty(deficit - target + onhand + injobs)],
+      ["− on hand", qty(onhand)],
+      ["− in jobs", qty(injobs)],
+      ["= deficit", qty(deficit)],
+    ];
+  } else {
+    // Clamped to zero — stock and jobs exceed the requirement, so an
+    // operator equation would not sum. Plain facts instead.
+    rows = [
+      ["target stock", qty(target)],
+      ["steady cycle need", qty(d.need)],
+      ["on hand", qty(onhand)],
+      ["in jobs", qty(injobs)],
+      ["= deficit", "0"],
+    ];
+  }
+  const table = document.getElementById("deficit-math");
+  table.textContent = "";
+  rows.forEach(([label, value], i) => {
+    const tr = document.createElement("tr");
+    const td1 = document.createElement("td");
+    if (i === rows.length - 1 && rows.length > 1) {
+      const b = document.createElement("b");
+      b.textContent = label;
+      td1.appendChild(b);
+    } else {
+      td1.textContent = label;
+    }
+    const td2 = document.createElement("td");
+    td2.className = "num";
+    td2.textContent = value;
+    tr.append(td1, td2);
+    table.appendChild(tr);
+  });
+  document.getElementById("deficit-name").textContent = d.name;
+  const parts = [];
+  if (Number(d.buy)) parts.push("buys " + qty(d.buy));
+  if (Number(d.build)) parts.push("builds " + qty(d.build));
+  document.getElementById("deficit-answer").textContent =
+    d.kind === "final"
+      ? (deficit < target
+          ? "Finals build their requested quantity every run; the share other pipelines consume is netted against stock and in-flight jobs."
+          : "Finals build the full cycle quantity every run — stock on hand is the previous wave, bound for sale.")
+      : Number(d.deficit) > 0
+        ? (parts.length ? "The plan " + parts.join(" and ") + "."
+                        : "Unmet — no market to buy from and no slots to build in.")
+        : "No deficit — covered by stock and jobs.";
+  document.getElementById("deficit-chain").href =
+    "{{ url_for('run_detail', index_run_id=run.index_run_id, view='chain') }}#item-" + d.type;
+  document.getElementById("deficit").showModal();
+}
+</script>
+
+{% endblock %}
