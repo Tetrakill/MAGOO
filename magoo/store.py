@@ -13,7 +13,7 @@ from dataclasses import dataclass, fields
 from magoo import __version__
 
 from . import config
-from .industry import BuildSetting
+from .industry import BuildSetting, SkillLevels
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 5
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -138,6 +138,33 @@ CREATE TABLE IF NOT EXISTS index_run_item_pipeline (
     -- cross-pipeline max on index_run_item.depth is display-only).
     depth             INTEGER,
     PRIMARY KEY (index_run_item_id, pipeline_id)
+);
+
+-- v1.22: the invention economics persisted with each planned run — the
+-- VINTAGE lag costing and the run's profit view read (costing.hull_cost
+-- reads THIS, never the live pipeline config or today's prices). One row
+-- per invention-enabled pipeline that resolved at plan time — since the
+-- 2026-09-01 review INCLUDING a final that got no runs, so a starved
+-- cycle still replays the invention expectation instead of the manual
+-- bpc line. Since v1.23 the run injects NO buy rows and no production
+-- sections (sizing/purchasing/copy jobs live on the live Invention tab)
+-- and the realized replay prices from probability/runs_per_copy; the
+-- informational copies_needed/attempts columns were dropped (schema 5).
+CREATE TABLE IF NOT EXISTS index_run_invention (
+    index_run_id        INTEGER NOT NULL REFERENCES index_run,
+    pipeline_id         INTEGER NOT NULL REFERENCES pipeline,
+    t1_blueprint_id     INTEGER NOT NULL,  -- T1 source blueprint OR relic type (T3)
+    decryptor_type_id   INTEGER,           -- NULL = no decryptor
+    probability         REAL NOT NULL,     -- clamped, skills applied
+    invented_me         INTEGER NOT NULL,
+    invented_te         INTEGER NOT NULL,
+    runs_per_copy       INTEGER NOT NULL,
+    datacores           TEXT NOT NULL,     -- json [[type_id, qty_per_attempt, landed_price|null], ...]
+    decryptor_unit_price REAL,             -- landed; NULL = unpriced or no decryptor
+    invention_fee_per_attempt REAL NOT NULL,
+    copy_fee_per_attempt REAL NOT NULL,
+    cost_per_run        REAL NOT NULL,     -- attempt_cost / (P x runs_per_copy)
+    PRIMARY KEY (index_run_id, pipeline_id)
 );
 
 -- Reconciliation between plan and reality. The plan is advisory; ESI is the
@@ -438,6 +465,46 @@ _MIGRATIONS = (
     # 2026-08-27 (audit): stamp cached location resolutions so denied-403
     # NULL rows can be re-probed after a TTL instead of sticking forever.
     "ALTER TABLE location_system ADD COLUMN fetched_at TEXT",
+    # v1.22 T2 invention: per-pipeline decryptor choice. While on, the
+    # pipeline's runs_per_bpc and its final blueprint's blueprint_setting
+    # ME/TE are MATERIALIZED from the invention math at config time
+    # (POST /pipelines/<id>/invention) and bpc_cost_isk is ignored in
+    # favor of the computed invention cost. decryptor_type_id NULL with
+    # use_invention=1 means "no decryptor".
+    "ALTER TABLE pipeline ADD COLUMN use_invention INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE pipeline ADD COLUMN decryptor_type_id INTEGER",
+    # The user's own runs_per_bpc, stashed while invention OVERWRITES that
+    # column with the invented copy's run count: the manual-BPC fallback
+    # (pre-invention executed runs, stale configs) divides by THIS, so the
+    # toggle can never reprice realized history, and turning invention off
+    # restores it. NULL = was uncapped (or pipeline never toggled).
+    "ALTER TABLE pipeline ADD COLUMN manual_runs_per_bpc INTEGER",
+    # v1.22: the racial "* Encryption Methods" level for the invention
+    # chance (weighs /40). The two datacore sciences reuse
+    # skill_starship_engineering / skill_science via the name-family
+    # router — no separate columns.
+    "ALTER TABLE settings ADD COLUMN skill_encryption INTEGER NOT NULL DEFAULT 5",
+    # T3 relic invention (2026-08-31): the chosen source for a
+    # multi-source final — which relic tier, or which of several T1 BPOs.
+    # Stores a ref_invention.blueprint_id (a relic TYPE id for T3, a T1
+    # blueprint id for the seven multi-T1-source T2 targets). NULL = auto
+    # (single-source pipelines never set it).
+    "ALTER TABLE pipeline ADD COLUMN invention_source_blueprint_id INTEGER",
+    # v1.23 BPC stockpile overbuild: the live Invention tab sizes
+    # invention/copy production to ceil(one cycle's copies × multiplier),
+    # netted against tracked BPC stock and in-flight lab jobs — BPCs
+    # stocked like any other input material. Fractions 1.0-10.0 (the
+    # settings form shows 100%-1000%). T1 covers source-copy jobs, T2
+    # the invented copies.
+    "ALTER TABLE settings ADD COLUMN t1_bpc_overbuild REAL NOT NULL DEFAULT 4.0",
+    "ALTER TABLE settings ADD COLUMN t2_bpc_overbuild REAL NOT NULL DEFAULT 4.0",
+    # Schema 5 (review 2026-09-01): the informational copies_needed /
+    # attempts vintage columns had no reader once the run pages dropped
+    # their invention section (costing replays probability/runs_per_copy);
+    # SQLite >= 3.35 drops them, older builds fail harmlessly like the
+    # 2026-08-23 drops.
+    "ALTER TABLE index_run_invention DROP COLUMN copies_needed",
+    "ALTER TABLE index_run_invention DROP COLUMN attempts",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -722,26 +789,41 @@ def _seed_structure_freight_rate(
 
 def _seed_class_settings(conn: sqlite3.Connection) -> None:
     """One class_setting row per config.ITEM_CLASSES. A class that is new
-    to an EXISTING database is seeded as a copy of the user's 'other'
-    (Everything Else) row — the facility it was silently planned under
-    until the class existed — rather than the NPC-station defaults, so
-    adding a class never strips structure/rig bonuses from its items. On a
-    fresh database every class starts at the defaults."""
+    to an EXISTING database is seeded as a copy of the facility it was
+    silently planned under until the class existed — 'copying' from the
+    'invention' row it used to share (split 2026-08-31), everything else
+    from the user's 'other' (Everything Else) row — rather than the
+    NPC-station defaults, so adding a class never strips structure/rig
+    bonuses from its items. On a fresh database every class starts at the
+    defaults."""
     present = {
         row["item_class"]
         for row in conn.execute("SELECT item_class FROM class_setting")
     }
+    seed_sources = {"copying": "invention"}
     for cls in config.ITEM_CLASSES:
         if cls in present:
             continue
-        if "other" in present:
+        source = seed_sources.get(cls, "other")
+        if source not in present:
+            source = "other"
+        if source in present:
+            # Lab classes never inherit RIG tiers: the source row's rigs
+            # are manufacturing rigs, and the lab tier (a job-cost rig
+            # since 2026-08-31) is a separate in-game fitting the user
+            # must assert themselves.
+            rigs = (
+                "'none', 'none'"
+                if cls in ("invention", "copying")
+                else "me_rig, te_rig"
+            )
             conn.execute(
                 "INSERT INTO class_setting (item_class, structure_type_id, "
                 "security, me_rig, te_rig, system_cost_index, tax_rate) "
-                "SELECT ?, structure_type_id, security, me_rig, te_rig, "
+                f"SELECT ?, structure_type_id, security, {rigs}, "
                 "system_cost_index, tax_rate FROM class_setting "
-                "WHERE item_class = 'other'",
-                (cls,),
+                "WHERE item_class = ?",
+                (cls, source),
             )
         else:
             conn.execute(
@@ -805,6 +887,14 @@ class Settings:
     # inputs may be bought there at all.
     structure_freight_in_isk_per_m3: float = 0.0
     structure_buy_enabled: bool = True
+    # v1.22 invention: racial Encryption Methods level (chance weighs /40);
+    # the datacore sciences reuse skill_starship_engineering/skill_science.
+    skill_encryption: int = 5
+    # v1.23: BPC stockpile targets on the Invention tab, as fractions of
+    # one cycle's need (4.0 = 400%). T1 covers source-copy jobs, T2 the
+    # invented copies.
+    t1_bpc_overbuild: float = 4.0
+    t2_bpc_overbuild: float = 4.0
 
     def capital_structure(self) -> int:
         """The structure whose market prices capital-class hulls."""
@@ -831,6 +921,21 @@ class Settings:
         if venue == BUY_VENUE_STRUCTURE:
             return self.structure_freight_in_isk_per_m3
         return self.freight_in_isk_per_m3
+
+    def skill_levels(self) -> SkillLevels:
+        """The user-entered levels as industry.SkillLevels (v1.22: lives
+        here, not in engine, so costing's invention math can reuse it
+        without an import cycle)."""
+        return SkillLevels(
+            industry=self.skill_industry,
+            advanced_industry=self.skill_advanced_industry,
+            reactions=self.skill_reactions,
+            adv_ship_construction=self.skill_adv_ship_construction,
+            starship_engineering=self.skill_starship_engineering,
+            science=self.skill_science,
+            outpost_construction=self.skill_outpost_construction,
+            encryption=self.skill_encryption,
+        )
 
 
 # Buy venues (v1.10): where an input's price_snapshot came from.
@@ -867,6 +972,20 @@ def get_class_settings(conn: sqlite3.Connection) -> dict[str, BuildSetting]:
         )
         for row in conn.execute("SELECT * FROM class_setting")
     }
+
+
+def set_blueprint_setting(
+    conn: sqlite3.Connection, blueprint_id: int, me: int, te: int
+) -> None:
+    """Pin a blueprint's ME/TE (upsert). The one writer of blueprint_setting
+    (review 2026-09-01: the paste, the invention on/off paths and the
+    inline ME/TE edit each carried their own copy of this statement)."""
+    conn.execute(
+        "INSERT INTO blueprint_setting VALUES (?, ?, ?) "
+        "ON CONFLICT (blueprint_id) DO UPDATE SET me_level = "
+        "excluded.me_level, te_level = excluded.te_level",
+        (blueprint_id, me, te),
+    )
 
 
 def me_te_resolver(conn: sqlite3.Connection):

@@ -89,15 +89,17 @@ def _sde_message(status: dict) -> str:
 
 
 def _split_structure_components(builds_mfg_all, buys):
-    """(struct_builds, struct_buys, other_mfg_builds) — v1.9: structure
-    components get their own Plan/Chain section, built AND bought rows
-    (bought ones stay in the Buy list / Multibuy too). Slot totals must
-    keep summing over builds_mfg_all: the split is display-only."""
+    """(struct_builds, struct_buys) — v1.9 gave structure components their
+    own Plan/Chain section; since 2026-09-01 the built rows render as a
+    "Structure Components" category group INSIDE Manufacturing (via
+    _display_category) and only the bought rows keep a sub-table there
+    (they stay in the Buy list / Multibuy too), so the split feeds the
+    Mfg-slots sub-line and that sub-table. Slot totals must keep summing
+    over builds_mfg_all: the split is display-only."""
     is_comp = lambda i: i["group_id"] in config.STRUCTURE_COMPONENT_GROUPS
     return (
         [i for i in builds_mfg_all if is_comp(i)],
         [i for i in buys if is_comp(i)],
-        [i for i in builds_mfg_all if not is_comp(i)],
     )
 
 
@@ -286,7 +288,7 @@ def _buy_context(rows) -> dict:
         for i in rows
         if (i["recommended_build_qty"] or 0) > 0 and i["activity_id"] == 1
     ]
-    struct_builds, struct_buys, builds_mfg = _split_structure_components(
+    struct_builds, struct_buys = _split_structure_components(
         builds_mfg_all, buys
     )
     # v1.10: plan-time buy venue per row (NULL on pre-v1.10 rows = hub).
@@ -328,7 +330,6 @@ def _buy_context(rows) -> dict:
         struct_builds=struct_builds,
         struct_buys=struct_buys,
         struct_slots=sum(i["jobs_allocated"] or 0 for i in struct_builds),
-        builds_mfg=builds_mfg,
         builds_mfg_all=builds_mfg_all,
     )
 
@@ -355,7 +356,9 @@ def _planning_context(ref, plan, settings_) -> dict:
         structure_buys=bc["structure_buys"],
         shallow=bc["shallow"],
         region_wide=bc["region_wide"],
-        builds_grouped=_group_by_category(ref, bc["builds_mfg"]),
+        builds=bc["builds_mfg_all"],
+        reactions=builds_reaction,
+        builds_grouped=_group_by_category(ref, bc["builds_mfg_all"]),
         reactions_grouped=_group_by_category(ref, builds_reaction),
         struct_builds=bc["struct_builds"],
         struct_buys=bc["struct_buys"],
@@ -447,6 +450,12 @@ def _chain_context(ref, items) -> dict:
             "buy_qty": i["recommended_buy_qty"] or 0,
             "alchemy_out": i["alchemy_output_qty"] or 0,
             "capacity_limited": bool(i["capacity_limited"]),
+            # 2026-09-01: the section-header stats (slots, build/buy value)
+            # read the same keys the Plan tab's rows carry.
+            "jobs_allocated": i["jobs_allocated"] or 0,
+            "recommended_build_qty": i["recommended_build_qty"] or 0,
+            "recommended_buy_qty": i["recommended_buy_qty"] or 0,
+            "price_snapshot": i["price_snapshot"],
         }
         for i in items
     ]
@@ -472,26 +481,25 @@ def _chain_context(ref, items) -> dict:
     chain_counts["unmet"] = sum(
         1 for x in chain_rows if x["status"] == "unmet" or x["short"]
     )
+    chain_mfg_rows = [
+        x for x in chain_rows if x["buildable"] and x["activity_id"] == 1
+    ]
+    chain_reaction_rows = [
+        x for x in chain_rows if x["buildable"] and x["activity_id"] == 11
+    ]
     return dict(
         chain_rows=chain_rows,
         chain_raws=[x for x in chain_rows if not x["buildable"]],
+        # Totals-strip stat only: the rows themselves sit in chain_mfg's
+        # "Structure Components" group (2026-09-01).
         chain_struct=[
             x for x in chain_rows
             if x["group_id"] in config.STRUCTURE_COMPONENT_GROUPS
         ],
-        chain_mfg=group_chain(
-            [
-                x for x in chain_rows
-                if x["buildable"] and x["activity_id"] == 1
-                and x["group_id"] not in config.STRUCTURE_COMPONENT_GROUPS
-            ]
-        ),
-        chain_reactions=group_chain(
-            [
-                x for x in chain_rows
-                if x["buildable"] and x["activity_id"] == 11
-            ]
-        ),
+        chain_mfg=group_chain(chain_mfg_rows),
+        chain_mfg_rows=chain_mfg_rows,
+        chain_reactions=group_chain(chain_reaction_rows),
+        chain_reaction_rows=chain_reaction_rows,
         chain_counts=chain_counts,
     )
 
@@ -552,6 +560,8 @@ CLASS_LABELS = {
     "structures": "Structures, Rigs & Components",
     "reactions": "Reactions",
     "other": "Everything Else",
+    "invention": "Invention Lab",
+    "copying": "Copy Lab",
 }
 
 
@@ -604,7 +614,9 @@ def _settings_save(c, form):
         "industry_scc_surcharge = ?, "
         "skill_outpost_construction = ?, "
         "count_fitted_stock = ?, "
-        "structure_freight_in_isk_per_m3 = ?, structure_buy_enabled = ? "
+        "structure_freight_in_isk_per_m3 = ?, structure_buy_enabled = ?, "
+        "skill_encryption = ?, "
+        "t1_bpc_overbuild = ?, t2_bpc_overbuild = ? "
         "WHERE id = 1",
         (
             margin,
@@ -656,6 +668,9 @@ def _settings_save(c, form):
                 else 0.0
             ),
             1 if form.get("structure_buy_enabled") else 0,
+            min(5, max(0, int_field("skill_encryption"))),
+            min(10.0, max(1.0, pct_field("t1_overbuild_pct"))),
+            min(10.0, max(1.0, pct_field("t2_overbuild_pct"))),
         ),
     )
     # Security is chosen as a band (high/low/null) and stored as a
@@ -875,7 +890,25 @@ def create_app() -> Flask:
         # the server. pid is what actually helps when something is wedged.
         return jsonify(app="magoo", version=__version__, pid=os.getpid())
 
-    sde_job = sdeimport.ImportJob()
+    def _after_sde_import():
+        """Worker-thread hook (its own connection): re-derive the invention
+        pipelines' materialised runs/ME/TE from the new build (review
+        2026-09-01)."""
+        c = store.connect()
+        try:
+            n = engine.rematerialize_invention(c, Refdata(c))
+            if n:
+                log.info(
+                    "re-materialised %d invention pipeline(s) for the new "
+                    "SDE build",
+                    n,
+                )
+        except Exception:  # never let a hook wedge the import status
+            log.exception("post-import invention re-materialisation failed")
+        finally:
+            c.close()
+
+    sde_job = sdeimport.ImportJob(on_imported=_after_sde_import)
     app.extensions["sde_import"] = sde_job
 
     def sde_job_view() -> dict:
@@ -942,6 +975,36 @@ def create_app() -> Flask:
                 n = v / div
                 return f"{sign}{n:,.2f}{unit}" if n < 100 else f"{sign}{n:,.1f}{unit}"
         return f"{sign}{v:,.0f}"
+
+    # Section-header stats (2026-09-01): every job-table h2/h3 on Plan,
+    # Chain and the Slot Planner reads "N items, S slots, X ISK" via the
+    # _macros job_stats / buy_stats macros; these are their reducers.
+    @app.template_filter("slots")
+    def slots(rows):
+        """Job slots a section's rows occupy."""
+        return sum(r["jobs_allocated"] or 0 for r in rows)
+
+    @app.template_filter("build_value")
+    def build_value(rows):
+        """Σ build qty × unit price over a job-table section — the same
+        price snapshot the Buy list prices from, so the figures reconcile
+        across sections. Unpriced rows contribute 0 (the macro says so)."""
+        return sum(
+            (r["recommended_build_qty"] or 0) * (r["price_snapshot"] or 0)
+            for r in rows
+        )
+
+    @app.template_filter("buy_value")
+    def buy_value(rows):
+        """Σ buy qty × unit price — build_value's buy-side twin."""
+        return sum(
+            (r["recommended_buy_qty"] or 0) * (r["price_snapshot"] or 0)
+            for r in rows
+        )
+
+    @app.template_filter("unpriced")
+    def unpriced(rows):
+        return sum(1 for r in rows if r["price_snapshot"] is None)
 
     @app.template_filter("pct")
     def pct(fraction):
@@ -1142,6 +1205,100 @@ def create_app() -> Flask:
             raise ValueError(line)
         return name, qty, runs_bpc, me, te
 
+    def _paste_default_me_te(final_id, settings_) -> tuple[int, int]:
+        """The paste-contract ME/TE for a final with no explicit pin: ships
+        0/0; any other product — structures, rigs, components, which often
+        double as intermediates of other chains — the intermediate
+        defaults, so an ME0 pin never leaks into every chain that consumes
+        it (v1.9). The one home for the rule (review 2026-09-01: the
+        paste, invention-off and the inline ME/TE edit each restated it)."""
+        if ref().type_info(final_id).category_id == config.CATEGORY_SHIP:
+            return 0, 0
+        return (
+            settings_.default_intermediate_me,
+            settings_.default_intermediate_te,
+        )
+
+    def _pipeline_invention_context(c, rows) -> dict[int, dict]:
+        """Per-pipeline invention context for the Pipelines page (v1.22):
+        present for every invention-capable final (any source count since
+        2026-08-31 — multi-source finals get a source select for the
+        relic tier or T1 BPO). Carries just what the selects need — the
+        option lists, the current choices, and the source name for the
+        tooltip. (The nine-option economics comparison that used to
+        render below each row was removed 2026-08-31 — user request; the
+        chosen option's economics show on the save flash and the profit
+        views.)"""
+        if not rows or not sde_ready():
+            return {}
+        options = [
+            {"value": str(d.type_id), "label": d.name}
+            for d in ref().decryptors()
+        ]
+        options.insert(0, {"value": "none", "label": "No decryptor"})
+        ctx: dict[int, dict] = {}
+        for p in rows:
+            sources = ref().invention_sources_for_product(
+                p["final_product_type_id"]
+            )
+            chosen = ref().invention_source_for_product(
+                p["final_product_type_id"],
+                p["invention_source_blueprint_id"],
+            )
+            stale = bool(p["use_invention"]) and (
+                costing.resolve_invention(ref(), p) is None
+            )
+            if not sources or stale:
+                if p["use_invention"]:
+                    # Stale config (SDE drift removed the sources, the
+                    # stored source choice or the decryptor no longer
+                    # resolves — costing.resolve_invention, the one rule):
+                    # planning/costing already fall back to bpc_cost_isk,
+                    # but the Off control must stay reachable or the
+                    # materialized runs/ME/TE are stuck (v1.22 review).
+                    ctx[p["pipeline_id"]] = {
+                        "stale": True,
+                        "options": [],
+                        "sources": [],
+                        "current": (
+                            str(p["decryptor_type_id"])
+                            if p["decryptor_type_id"]
+                            else "none"
+                        ),
+                        "t1_name": None,
+                    }
+                continue
+            # Shown source: the stored choice, else the highest-probability
+            # one (Intact first) — the select's default, so a plain
+            # decryptor change always posts a valid source.
+            shown = chosen or sources[0]
+            ctx[p["pipeline_id"]] = {
+                "options": options,
+                "sources": (
+                    [
+                        {
+                            "value": str(s.t1_blueprint_id),
+                            "label": ref().type_info(s.t1_blueprint_id).name,
+                        }
+                        for s in sources
+                    ]
+                    if len(sources) > 1
+                    else []
+                ),
+                "current_source": str(shown.t1_blueprint_id),
+                "current": (
+                    (
+                        str(p["decryptor_type_id"])
+                        if p["decryptor_type_id"]
+                        else "none"
+                    )
+                    if p["use_invention"]
+                    else "off"
+                ),
+                "t1_name": ref().type_info(shown.t1_blueprint_id).name,
+            }
+        return ctx
+
     @app.route("/pipelines", methods=["GET", "POST"])
     def pipelines():
         c = conn()
@@ -1154,12 +1311,13 @@ def create_app() -> Flask:
                 return redirect(url_for("pipelines"))
             settings_ = store.get_settings(c)
             existing = {
-                row["final_product_type_id"]
+                row["final_product_type_id"]: row["use_invention"]
                 for row in c.execute(
-                    "SELECT final_product_type_id FROM pipeline"
+                    "SELECT final_product_type_id, use_invention FROM pipeline"
                 )
             }
             added, updated, errors = [], [], []
+            invention_kept = []
             for line in request.form["products"].splitlines():
                 try:
                     parsed = _parse_pipeline_line(line)
@@ -1181,19 +1339,26 @@ def create_app() -> Flask:
                 if blueprint is None:
                     errors.append(f"{name}: no blueprint — not buildable")
                     continue
-                # Omitted ME/TE: ships default to 0/0 (the paste contract);
-                # any other product — structures, rigs, components, which
-                # often double as intermediates of other chains — takes the
-                # intermediate defaults so an ME0 pin never leaks into
-                # every chain that consumes it (v1.9).
-                is_ship = (
-                    ref().type_info(type_id).category_id == config.CATEGORY_SHIP
-                )
+                # Omitted ME/TE take the paste-contract defaults.
+                default_me, default_te = _paste_default_me_te(type_id, settings_)
                 if me is None:
-                    me = 0 if is_ship else settings_.default_intermediate_me
+                    me = default_me
                 if te is None:
-                    te = 0 if is_ship else settings_.default_intermediate_te
+                    te = default_te
                 if type_id in existing:
+                    if existing[type_id]:
+                        # v1.22: an invention pipeline's runs/ME/TE are
+                        # materialized from the invention math — the paste
+                        # updates the quantity only, never the overrides.
+                        c.execute(
+                            "UPDATE pipeline SET output_qty_per_run = ?, "
+                            "modified_at = datetime('now') "
+                            "WHERE final_product_type_id = ?",
+                            (qty, type_id),
+                        )
+                        updated.append(name)
+                        invention_kept.append(name)
+                        continue
                     # Re-pasting the sheet updates the row in place.
                     c.execute(
                         "UPDATE pipeline SET output_qty_per_run = ?, "
@@ -1208,39 +1373,42 @@ def create_app() -> Flask:
                         "output_qty_per_run, runs_per_bpc) VALUES (?, ?, ?, ?)",
                         (name, type_id, qty, runs_bpc),
                     )
-                    existing.add(type_id)
+                    existing[type_id] = 0
                     added.append(name)
-                c.execute(
-                    "INSERT INTO blueprint_setting VALUES (?, ?, ?) "
-                    "ON CONFLICT (blueprint_id) DO UPDATE SET me_level = "
-                    "excluded.me_level, te_level = excluded.te_level",
-                    (blueprint.blueprint_id, me, te),
-                )
+                store.set_blueprint_setting(c, blueprint.blueprint_id, me, te)
             c.commit()
             if added:
                 flash(f"added {len(added)} pipeline(s): {', '.join(added)}")
             if updated:
                 flash(f"updated {len(updated)}: {', '.join(updated)}")
+            if invention_kept:
+                flash(
+                    f"{len(invention_kept)} invention pipeline(s) kept their "
+                    f"computed runs/ME/TE (pasted values ignored): "
+                    f"{', '.join(invention_kept)}"
+                )
             for error in errors:
                 flash(error)
             return redirect(url_for("pipelines"))
+        rows = (
+            c.execute(
+                "SELECT p.*, t.name AS product_name, "
+                "bs.me_level, bs.te_level FROM pipeline p "
+                "JOIN ref_type t ON t.type_id = p.final_product_type_id "
+                "LEFT JOIN ref_blueprint b ON b.product_id = "
+                "  p.final_product_type_id AND b.activity_id = 1 "
+                "LEFT JOIN blueprint_setting bs ON bs.blueprint_id = "
+                "  b.blueprint_id "
+                "ORDER BY p.pipeline_id"
+            ).fetchall()
+            if sde_ready()
+            else []
+        )
         return render_template(
             "pipelines.html",
             sde_ready=sde_ready(),
-            pipelines=(
-                c.execute(
-                    "SELECT p.*, t.name AS product_name, "
-                    "bs.me_level, bs.te_level FROM pipeline p "
-                    "JOIN ref_type t ON t.type_id = p.final_product_type_id "
-                    "LEFT JOIN ref_blueprint b ON b.product_id = "
-                    "  p.final_product_type_id AND b.activity_id = 1 "
-                    "LEFT JOIN blueprint_setting bs ON bs.blueprint_id = "
-                    "  b.blueprint_id "
-                    "ORDER BY p.pipeline_id"
-                ).fetchall()
-                if sde_ready()
-                else []
-            ),
+            pipelines=rows,
+            invention=_pipeline_invention_context(c, rows),
         )
 
     @app.post("/pipelines/<int:pipeline_id>/toggle")
@@ -1271,6 +1439,10 @@ def create_app() -> Flask:
                 )
         c.execute(
             "DELETE FROM index_run_item_pipeline WHERE pipeline_id = ?",
+            (pipeline_id,),
+        )
+        c.execute(
+            "DELETE FROM index_run_invention WHERE pipeline_id = ?",
             (pipeline_id,),
         )
         c.execute(
@@ -1311,6 +1483,204 @@ def create_app() -> Flask:
             "modified_at = datetime('now') WHERE pipeline_id = ?",
             (bpc_cost, pipeline_id),
         )
+        c.commit()
+        return redirect(url_for("pipelines"))
+
+    @app.post("/pipelines/<int:pipeline_id>/invention")
+    def pipeline_invention(pipeline_id):
+        """v1.22: set (or clear) a pipeline's invention choice. Enabling
+        MATERIALIZES the derived values — runs_per_bpc on the pipeline and
+        the invented ME/TE on the T2 manufacturing blueprint's
+        blueprint_setting — so the planning path is untouched; disabling
+        restores the paste-contract defaults (a custom researched ME/TE
+        needs a re-paste — leftovers like ME 4 / TE 14 would silently
+        misprice a bought-BPC pipeline)."""
+        c = conn()
+        pipeline = c.execute(
+            "SELECT * FROM pipeline WHERE pipeline_id = ?", (pipeline_id,)
+        ).fetchone()
+        if pipeline is None:
+            abort(404)
+        choice = (request.form.get("decryptor") or "off").strip()
+        final_id = pipeline["final_product_type_id"]
+        if choice == "off":
+            if not pipeline["use_invention"]:
+                # Reachable since the source select exists (changing it
+                # posts decryptor=off): running the restore UPDATE here
+                # would NULL the user's manual runs_per_bpc (the stash is
+                # empty while off).
+                flash(
+                    "invention is already off — pick a decryptor option "
+                    "to enable it"
+                )
+                return redirect(url_for("pipelines"))
+            # SET right-hand sides read the OLD row: runs_per_bpc gets the
+            # stashed manual value back in the same statement.
+            c.execute(
+                "UPDATE pipeline SET runs_per_bpc = manual_runs_per_bpc, "
+                "manual_runs_per_bpc = NULL, use_invention = 0, "
+                "decryptor_type_id = NULL, "
+                "invention_source_blueprint_id = NULL, "
+                "modified_at = datetime('now') WHERE pipeline_id = ?",
+                (pipeline_id,),
+            )
+            blueprint = ref().blueprint_for_product(final_id)
+            if blueprint is not None:
+                me, te = _paste_default_me_te(final_id, store.get_settings(c))
+                store.set_blueprint_setting(c, blueprint.blueprint_id, me, te)
+            c.commit()
+            flash(
+                "invention off — runs/BPC restored; ME/TE reset to paste "
+                "defaults (re-paste the row to restore custom values)"
+            )
+            return redirect(url_for("pipelines"))
+        sources = ref().invention_sources_for_product(final_id)
+        if not sources:
+            flash(
+                f"{pipeline['name']} is not invention-capable — "
+                "nothing was saved"
+            )
+            return redirect(url_for("pipelines"))
+        if len(sources) == 1:
+            source, chosen_id = sources[0], None  # column stays NULL = auto
+        else:
+            # Multi-source (T3 relic tiers, or several T1 BPOs): the form
+            # must name a valid source. The select defaults to the
+            # highest-probability one, so a plain decryptor change always
+            # posts one.
+            try:
+                chosen_id = int((request.form.get("source") or "").strip())
+            except ValueError:
+                chosen_id = None
+            source = next(
+                (s for s in sources if s.t1_blueprint_id == chosen_id), None
+            )
+            if source is None:
+                flash("pick an invention source — nothing was saved")
+                return redirect(url_for("pipelines"))
+        decryptor = None
+        if choice != "none":
+            try:
+                decryptor = ref().decryptor(int(choice))
+            except ValueError:
+                decryptor = None
+            if decryptor is None:
+                flash("unknown decryptor — nothing was saved")
+                return redirect(url_for("pipelines"))
+        # Materialise the choice (runs/BPC, ME/TE pin, the runs stash) —
+        # the same write the post-import re-derivation uses.
+        me, te, runs = engine.materialize_invention(
+            c, ref(), pipeline_id, source, decryptor, chosen_id
+        )
+        c.commit()
+        chance = costing.invention_chance(
+            ref(), store.get_settings(c), source, decryptor
+        )
+        info = ref().type_info(final_id)
+        # Batch wording only where _size_jobs batches: exact-quantity ship
+        # groups (capitals, freighters, jump freighters) never round up to
+        # the copy's runs (review 2026-09-01).
+        batches = (
+            info.category_id == config.CATEGORY_SHIP
+            and info.group_id not in config.EXACT_QTY_SHIP_GROUPS
+        )
+        flash(
+            f"{pipeline['name']}: "
+            + (
+                f"{ref().type_info(source.t1_blueprint_id).name}, "
+                if len(sources) > 1
+                else ""
+            )
+            + f"{decryptor.name if decryptor else 'no decryptor'} — "
+            f"{chance:.1%} chance, {runs}-run ME{me}/TE{te} copies"
+            + (
+                f" (a ship final builds in whole {runs}-hull batches)"
+                if batches and runs > 1
+                else ""
+            )
+        )
+        return redirect(url_for("pipelines"))
+
+    def _pipeline_or_422(c, pipeline_id):
+        """The pipeline row for an inline edit of a value invention
+        materializes (runs/BPC, ME, TE): 404 when missing, a 422 message
+        while invention is on — those cells are derived from the choice
+        and editing them would be silently overwritten."""
+        pipeline = c.execute(
+            "SELECT * FROM pipeline WHERE pipeline_id = ?", (pipeline_id,)
+        ).fetchone()
+        if pipeline is None:
+            abort(404)
+        if pipeline["use_invention"]:
+            return pipeline, (
+                "controlled by the invention choice — turn invention off "
+                "to edit this",
+                422,
+            )
+        return pipeline, None
+
+    @app.post("/pipelines/<int:pipeline_id>/runs_per_bpc")
+    def pipeline_runs_per_bpc(pipeline_id):
+        """Inline edit (2026-09-01): runs on the final's blueprint copy.
+        Blank = uncapped (NULL), else >= 1 — the paste column's contract."""
+        c = conn()
+        _pipeline, refusal = _pipeline_or_422(c, pipeline_id)
+        if refusal:
+            return refusal
+        raw = (request.form.get("runs_per_bpc") or "").strip()
+        try:
+            runs = None if not raw else _form_number(request.form, "runs_per_bpc", int)
+        except ValueError as exc:
+            return (f"invalid number in {exc} — nothing was saved", 422)
+        if runs is not None and runs < 1:
+            return ("runs per BPC must be at least 1 — nothing was saved", 422)
+        c.execute(
+            "UPDATE pipeline SET runs_per_bpc = ?, "
+            "modified_at = datetime('now') WHERE pipeline_id = ?",
+            (runs, pipeline_id),
+        )
+        c.commit()
+        return redirect(url_for("pipelines"))
+
+    @app.post("/pipelines/<int:pipeline_id>/me_te")
+    def pipeline_me_te(pipeline_id):
+        """Inline edit (2026-09-01): the final's blueprint ME and/or TE
+        (each input posts alone). Writes the same blueprint_setting pin the
+        paste does, keeping whichever level was not posted; a missing pin
+        starts from the paste-contract defaults (ships 0/0, else the
+        intermediate defaults). Same clamps as the paste: ME 0-10, TE 0-20."""
+        c = conn()
+        pipeline, refusal = _pipeline_or_422(c, pipeline_id)
+        if refusal:
+            return refusal
+        final_id = pipeline["final_product_type_id"]
+        blueprint = ref().blueprint_for_product(final_id)
+        if blueprint is None:
+            return ("no blueprint for this product — nothing was saved", 422)
+        default_me, default_te = _paste_default_me_te(
+            final_id, store.get_settings(c)
+        )
+        current = c.execute(
+            "SELECT me_level, te_level FROM blueprint_setting "
+            "WHERE blueprint_id = ?",
+            (blueprint.blueprint_id,),
+        ).fetchone()
+        me = current["me_level"] if current else default_me
+        te = current["te_level"] if current else default_te
+        try:
+            if (request.form.get("me") or "").strip():
+                me = _form_number(request.form, "me", int)
+                if not 0 <= me <= 10:
+                    return ("ME must be 0-10 — nothing was saved", 422)
+            elif (request.form.get("te") or "").strip():
+                te = _form_number(request.form, "te", int)
+                if not 0 <= te <= 20:
+                    return ("TE must be 0-20 — nothing was saved", 422)
+            else:
+                return ("empty value — nothing was saved", 422)
+        except ValueError as exc:
+            return (f"invalid number in {exc} — nothing was saved", 422)
+        store.set_blueprint_setting(c, blueprint.blueprint_id, me, te)
         c.commit()
         return redirect(url_for("pipelines"))
 
@@ -1360,7 +1730,10 @@ def create_app() -> Flask:
                 row["item_class"]: row
                 for row in c.execute("SELECT * FROM class_setting")
             },
-            item_classes=config.ITEM_CLASSES,
+            # Display order: alphabetical by label (user request
+            # 2026-08-31). config.ITEM_CLASSES itself stays append-only —
+            # seeding and the save loop key by name, not position.
+            item_classes=sorted(config.ITEM_CLASSES, key=CLASS_LABELS.get),
             thukker_classes=config.THUKKER_CLASSES,
             structures=STRUCTURE_CHOICES,
             tracked=(
@@ -1673,21 +2046,29 @@ def create_app() -> Flask:
             return redirect(url_for("dashboard"))
         c = conn()
         r = ref()
+        # Two id sets (review 2026-09-01): the per-type order-book pull
+        # takes the MARKET set; the adjusted-price store also takes the
+        # invention EIV bases, which only CCP's bulk adjusted feed prices.
+        # Capable INACTIVE pipelines contribute invention ids by design, so
+        # an empty market set means there is nothing at all to price.
         type_ids = engine.demand_type_ids(c, r)
-        if not type_ids:
-            flash("no active pipelines — add one first")
+        market_ids = engine.market_type_ids(c, r)
+        if not market_ids:
+            flash("nothing to price — add or activate a pipeline first")
             return redirect(url_for("pipelines"))
         settings_ = store.get_settings(c)
         t0 = _time.monotonic()
         # v1.9: raw leaves (no blueprint) with no hub-station order fall
         # back to the region-wide best order — in the price region itself
         # (one region setting since 2026-08-23; same pull, no extra call).
-        raw_leaves = {t for t in type_ids if r.blueprint_for_product(t) is None}
+        raw_leaves = {
+            t for t in market_ids if r.blueprint_for_product(t) is None
+        }
         try:
             fetched, skipped, fresh = market.refresh_prices(
                 c,
                 settings_.price_region_id,
-                type_ids,
+                market_ids,
                 settings_.price_source,
                 fallback_type_ids=raw_leaves,
                 fallback_region_id=settings_.price_region_id,
@@ -1783,6 +2164,84 @@ def create_app() -> Flask:
             return redirect(url_for("planning"))
         return redirect(url_for("dashboard"))
 
+    def _price_maps(c, r, settings_, type_ids):
+        """The cached price maps for one id set — (prices, buy_venue,
+        structure_units_cheaper, region_wide, adjusted): the block /run,
+        Planning and Invention share (review 2026-09-01)."""
+        prices, buy_venue, structure_units_cheaper, region_wide = (
+            market.quote_maps(market.buy_quotes(c, r, settings_, type_ids))
+        )
+        adjusted = market.cached_adjusted_prices(c, type_ids)
+        return prices, buy_venue, structure_units_cheaper, region_wide, adjusted
+
+    @app.route("/invention")
+    def invention():
+        """Invention — the live BPC stockpile workbench (v1.23): what to
+        invent, copy and buy, from CURRENT stock, in-flight lab jobs and
+        today's cached prices. Never persisted; index runs keep only the
+        amortized invention cost vintage."""
+        c = conn()
+        settings_ = store.get_settings(c) if sde_ready() else None
+
+        def empty(reason):
+            return render_template(
+                "invention.html", data=None, settings=settings_, reason=reason
+            )
+
+        if not sde_ready():
+            return empty(
+                "Download the game data first — the Dashboard checklist "
+                "has the button"
+            )
+        r = ref()
+        # Empty states first — no pricing for a tab with nothing to show,
+        # and "enabled but inactive/stale" named as such (review 2026-09-01).
+        if not engine._invention_configs(c, r):
+            enabled = c.execute(
+                "SELECT SUM(is_active = 0) AS inactive, "
+                "SUM(is_active = 1) AS active FROM pipeline "
+                "WHERE use_invention = 1"
+            ).fetchone()
+            if enabled["inactive"]:
+                return empty(
+                    f"invention is enabled on {enabled['inactive']} inactive "
+                    "pipeline(s) — activate them on the Pipelines page"
+                )
+            if enabled["active"]:
+                return empty(
+                    f"{enabled['active']} invention pipeline(s) no longer "
+                    "resolve (source or decryptor gone since the SDE "
+                    "changed) — pick the choice again or turn invention "
+                    "Off on the Pipelines page"
+                )
+            return empty(
+                "no invention-enabled pipelines — enable invention on "
+                "the Pipelines page"
+            )
+        # Only the invention inputs and their EIV bases need pricing here.
+        type_ids = engine.invention_type_ids(c, r)
+        prices, buy_venue, structure_units_cheaper, region_wide, adjusted = (
+            _price_maps(c, r, settings_, type_ids)
+        )
+        if not prices:
+            return empty("no price data yet — run a price refresh first")
+        snapshot = engine.snapshot_from_state(
+            c,
+            prices=prices,
+            adjusted=adjusted,
+            region_wide=region_wide,
+            buy_venue=buy_venue,
+            structure_units_cheaper=structure_units_cheaper,
+        )
+        if snapshot is None:
+            return empty("no ESI data yet — run an ESI update first")
+        return render_template(
+            "invention.html",
+            data=engine.invention_stockpile(c, r, snapshot),
+            settings=settings_,
+            reason=None,
+        )
+
     @app.route("/planning")
     def planning():
         """Planning — today's estimates, nothing persisted. Two views:
@@ -1808,11 +2267,10 @@ def create_app() -> Flask:
             type_ids = engine.demand_type_ids(c, r)
             # v1.10: inputs at the cheaper landed venue (finals keep the
             # hub quote — their sell side is sell_quote's business).
-            prices, venues, _units, region_wide = market.quote_maps(
-                market.buy_quotes(c, r, settings_, type_ids)
+            prices, venues, _units, region_wide, adjusted = _price_maps(
+                c, r, settings_, type_ids
             )
             region_wide = frozenset(region_wide)
-            adjusted = market.cached_adjusted_prices(c, type_ids)
             cards = []
             for p in store.active_pipelines(c):
                 cost = costing.current_hull_cost(
@@ -1858,8 +2316,10 @@ def create_app() -> Flask:
                 sales_tax=costing.sales_tax_rate(settings_),
                 settings=settings_,
             )
+        # Explicit active check: demand_type_ids is no longer a proxy for
+        # it — a capable INACTIVE pipeline contributes invention price ids.
         type_ids = engine.demand_type_ids(c, r)
-        if not type_ids:
+        if not store.active_pipelines(c):
             return render_template(
                 "planning_slots.html",
                 rows=None,
@@ -1867,8 +2327,8 @@ def create_app() -> Flask:
                 reason="no active pipelines — add one and this page shows "
                 "its steady-state cycle",
             )
-        prices, buy_venue, structure_units_cheaper, region_wide = (
-            market.quote_maps(market.buy_quotes(c, r, settings_, type_ids))
+        prices, buy_venue, structure_units_cheaper, region_wide, adjusted = (
+            _price_maps(c, r, settings_, type_ids)
         )
         if not prices:
             return render_template(
@@ -1877,7 +2337,6 @@ def create_app() -> Flask:
                 settings=settings_,
                 reason="no price data yet — run a price refresh first",
             )
-        adjusted = market.cached_adjusted_prices(c, type_ids)
         # Raw settings pools, not snapshot_from_state's overhang-netted
         # ones: steady state assumes the pools are free each cycle.
         snapshot = engine.Snapshot(
@@ -1908,20 +2367,23 @@ def create_app() -> Flask:
         )
             return redirect(url_for("dashboard"))
         r = ref()
+        # Explicit active check: demand_type_ids is no longer a proxy for
+        # it — a capable INACTIVE pipeline contributes invention price ids,
+        # and planning a run against zero active pipelines would persist an
+        # empty run.
         type_ids = engine.demand_type_ids(c, r)
-        if not type_ids:
+        if not store.active_pipelines(c):
             flash("no active pipelines — add one first")
             return redirect(url_for("pipelines"))
         settings_ = store.get_settings(c)
         # v1.10: per type, the cheaper LANDED of the hub quote and the
         # structure market's sell ladder (finals always keep the hub quote).
-        prices, buy_venue, structure_units_cheaper, region_wide = (
-            market.quote_maps(market.buy_quotes(c, r, settings_, type_ids))
+        prices, buy_venue, structure_units_cheaper, region_wide, adjusted = (
+            _price_maps(c, r, settings_, type_ids)
         )
         if not prices:
             flash("no price data yet — run a price refresh first")
             return redirect(url_for("dashboard"))
-        adjusted = market.cached_adjusted_prices(c, type_ids)
         snapshot = engine.snapshot_from_state(
             c,
             prices=prices,
@@ -2016,6 +2478,10 @@ def create_app() -> Flask:
         )
         c.execute(
             "DELETE FROM index_run_item WHERE index_run_id = ?",
+            (index_run_id,),
+        )
+        c.execute(
+            "DELETE FROM index_run_invention WHERE index_run_id = ?",
             (index_run_id,),
         )
         c.execute(
@@ -2145,9 +2611,9 @@ def create_app() -> Flask:
             items=items,
             final_net_margin=final_net_margin,
             buys=bc["buys"],
-            builds=bc["builds_mfg"],
+            builds=bc["builds_mfg_all"],
             reactions=builds_reaction,
-            builds_grouped=_group_by_category(ref(), bc["builds_mfg"]),
+            builds_grouped=_group_by_category(ref(), bc["builds_mfg_all"]),
             reactions_grouped=_group_by_category(ref(), builds_reaction),
             struct_builds=bc["struct_builds"],
             struct_buys=bc["struct_buys"],

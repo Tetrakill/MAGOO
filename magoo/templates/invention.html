@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Invention{% endblock %}
+
+{% block content %}
+<div class="pagehead">
+  <h1>Invention</h1>
+  <span class="cap">Your BPC stockpile at target: what to invent, copy and
+    buy from current stock, in-flight lab jobs and today's cached prices.
+    Recomputed on every load and saves nothing — index runs carry only the
+    amortized invention cost.</span>
+</div>
+
+{% if reason %}
+<div class="panel">
+  <p class="muted" style="margin:0">{{ reason }}.</p>
+</div>
+{% endif %}
+
+{% if data and data.sections %}
+{% set t2_pct = (settings.t2_bpc_overbuild * 100)|round|int %}
+{% set t1_pct = (settings.t1_bpc_overbuild * 100)|round|int %}
+{% set attempts_total = data.sections|sum(attribute='attempts') %}
+{% set jobs_total = (data.sections|rejectattr('is_relic')|sum(attribute='jobs')) + (data.sections|selectattr('is_relic')|sum(attribute='attempts')) %}
+{% set copies_total = data.copy_jobs|map(attribute='t1')|sum(attribute='to_make') %}
+<div class="totals">
+  <div class="stat">
+    <span class="label">Invention jobs</span>
+    <span class="value" title="invention jobs to install — each on a T1 copy at its max runs, one attempt per run (relic attempts counted singly)">{{ jobs_total }}<span class="sub">{{ attempts_total }} attempts · {{ data.sections|length }} pipelines</span></span>
+  </div>
+  <div class="stat">
+    <span class="label">Copies to invent</span>
+    <span class="value" title="stockpile target net of BPCs on hand and expected from in-flight jobs">{{ data.sections|sum(attribute='to_invent') }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Copy jobs</span>
+    <span class="value" title="T1 copy jobs to install, each at the blueprint's max runs — net of the copy stacks and copy jobs in flight">{{ copies_total }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Buy total</span>
+    <span class="value" title="{{ data.buy_total|isk }} ISK · {{ data.buys|selectattr('to_buy')|list|length }} items">{{ data.buy_total|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Outlay</span>
+    <span class="value" title="{{ data.total_outlay|isk }} ISK — datacores, decryptors, relics and fees for every attempt, before netting inputs on hand">{{ data.total_outlay|isk_short }}</span>
+  </div>
+  {% if data.buys_unpriced or data.buys_shallow %}
+  <div class="stat">
+    <span class="label">&nbsp;</span>
+    <span class="tags">
+      {% if data.buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — the totals understate; refresh prices">{{ data.buys_unpriced }} unpriced</span>{% endif %}
+      {% if data.buys_shallow %}<span class="badge warn" title="structure-market buys whose sell ladder has fewer units beating the Jita landed price than the tab buys — the rest cost Jita money">{{ data.buys_shallow }} shallow</span>{% endif %}
+    </span>
+  </div>
+  {% endif %}
+</div>
+
+<details class="section" open data-key="buy">
+<summary><h2>Buy <span class="muted">— {{ data.buys|selectattr('to_buy')|list|length }}
+  items, <span title="{{ data.buy_total|isk }} ISK">{{ data.buy_total|isk_short }}</span></span></h2></summary>
+{% if data.buys %}
+<div class="tablewrap">
+<table class="sortable aligned">
+  <thead><tr><th>Item</th><th class="num">Gross need</th>
+      <th class="num">On hand</th><th class="num">In flight</th>
+      <th class="num">To buy</th><th class="num">Unit price</th>
+      <th class="num">Total</th><th class="cat">Venue</th>
+      <th class="flags"></th></tr></thead>
+  {% for b in data.buys %}
+  <tr>
+    <td>{{ b.name }}</td>
+    <td class="num" title="attempts × qty per attempt, plus the Raw Material Buffer ({{ (b.margin * 100)|round(1) }}%)">{{ b.gross|qty }}</td>
+    <td class="num">{{ b.on_hand|qty }}</td>
+    <td class="num">{{ b.in_progress|qty }}</td>
+    <td class="num"><b>{{ b.to_buy|qty }}</b></td>
+    <td class="num">{{ b.price|isk }}</td>
+    {% set line_total = (b.to_buy * b.price) if b.price is not none else none %}
+    <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
+    <td class="cat">{% if b.venue == 'structure' %}<span class="badge accent" title="cheaper landed (price + freight-in) at the structure market than at Jita">{{ settings.structure_market_label() }}</span>{% elif b.price is not none %}<span class="muted">Jita</span>{% endif %}</td>
+    <td class="flags">{% if b.price is none %}<span class="badge warn">unpriced</span>{% endif %}
+        {% if b.shallow %}<span class="badge warn" title="only {{ b.structure_units_cheaper|qty }} of {{ b.to_buy|qty }} units on the structure's sell ladder land at or below the Jita landed price — the rest must come from elsewhere">shallow</span>{% endif %}
+        {% if b.region_wide %}<span class="badge" title="priced from the region-wide best order (no hub-station order)">region price</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% if data.multibuy_hub or data.multibuy_structure %}
+<details id="multibuy">
+  <summary class="muted">Multibuy (paste into EVE's Multibuy window{% if data.multibuy_structure %} — one block per market{% endif %})</summary>
+  {% if data.multibuy_hub %}
+  <p class="muted">Jita</p>
+  <textarea class="multibuy" readonly onclick="this.select()"
+    aria-label="Multibuy — Jita">{{ data.multibuy_hub }}</textarea>
+  {% endif %}
+  {% if data.multibuy_structure %}
+  <p class="muted">{{ settings.structure_market_label() }} structure market</p>
+  <textarea class="multibuy" readonly onclick="this.select()"
+    aria-label="Multibuy — {{ settings.structure_market_label() }} structure market">{{ data.multibuy_structure }}</textarea>
+  {% endif %}
+</details>
+{% endif %}
+{% else %}<p class="muted">Nothing to buy — every input is covered by
+stock or in-flight jobs.</p>{% endif %}
+</details>
+
+{% set t1_rows = data.sections|rejectattr('is_relic')|list %}
+<details class="section" open data-key="t1-copies">
+<summary><h2>T1 copy jobs <span class="muted">— {{ copies_total }} copies to make at
+  max runs, stockpile target {{ t1_pct }}% of the runs consumed</span></h2></summary>
+{% if t1_rows %}
+<div class="tablewrap">
+<table class="sortable">
+  <thead><tr><th>Blueprint</th><th class="cat">For</th>
+      <th class="num">To make</th>
+      <th class="num">Runs used</th><th class="num">Target runs</th>
+      <th class="num">On hand</th><th class="num">Copying</th>
+      <th class="num">Fee / copy</th>
+      <th class="flags"></th></tr></thead>
+  {% for s in t1_rows %}
+  <tr>
+    <td>{{ s.t1_name }}</td>
+    <td class="cat muted">{{ s.product_name }}</td>
+    <td class="num" data-sort="{{ s.t1.to_make }}" title="{{ s.t1.runs_to_make|qty }} runs → {{ s.t1.to_make|qty }} cop{{ 'y' if s.t1.to_make == 1 else 'ies' }} of {{ s.t1.max_runs }} runs each"><b>{{ s.t1.to_make|qty }}</b><span class="muted"> × {{ s.t1.max_runs }}</span></td>
+    <td class="num" title="one licensed run per invention attempt">{{ s.attempts|qty }}</td>
+    <td class="num" title="{{ s.attempts|qty }} runs consumed × {{ t1_pct }}%">{{ s.t1.target|qty }}</td>
+    <td class="num" title="runs on the copy stack: copies minus the BPO assumed to sit with it, each at the blueprint's max of {{ s.t1.max_runs }} runs">{{ s.t1.from_stock|qty }}</td>
+    <td class="num" title="licensed runs on copy jobs in flight">{{ s.t1.from_flight|qty }}</td>
+    <td class="num" title="{{ (s.copy_fee * s.t1.max_runs)|isk }} ISK per {{ s.t1.max_runs }}-run copy job ({{ s.copy_fee|isk }} per run)">{{ (s.copy_fee * s.t1.max_runs)|isk_short }}</td>
+    <td class="flags">{% if s.t1.shared %}<span class="badge" title="{{ s.product_name }} and {{ s.t1.shared|join(', ') }} draw from the same copy stack — counted once, never double-credited">shared</span>{% endif %}
+        {% if s.t1.to_make == 0 and s.attempts %}<span class="badge good" title="the copy stack and copy jobs in flight cover this cycle's attempts">covered</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No copy jobs — every invention pipeline invents from relics (consumed one per attempt, no copy job).</p>{% endif %}
+</details>
+
+<details class="section" open data-key="invention">
+<summary><h2>Invention jobs <span class="muted">— {{ attempts_total }} attempts,
+  stockpile target {{ t2_pct }}% of one cycle's copies</span></h2></summary>
+<div class="tablewrap">
+<table class="sortable">
+  <thead><tr><th>Product</th><th class="cat">Source · decryptor</th>
+      <th class="num">Jobs</th>
+      <th class="num">Chance</th><th class="num">Target</th>
+      <th class="num">On hand</th><th class="num">In flight</th>
+      <th class="num">Invent</th>
+      <th class="num">Cost / run</th><th class="flags"></th></tr></thead>
+  {% for s in data.sections %}
+  <tr>
+    <td>{{ s.product_name }}</td>
+    <td class="cat muted" style="white-space:nowrap" title="invent from {{ s.t1_name }}{% if s.decryptor_name %} with a {{ s.decryptor_name }}{% endif %} → {{ s.runs_per_copy }}-run ME{{ s.invented_me }}/TE{{ s.invented_te }} copies">{{ s.t1_name }}{% if s.decryptor_name %} · {{ s.decryptor_name|replace(' Decryptor', '') }}{% endif %}</td>
+    {% if s.is_relic %}
+    <td class="num" data-sort="{{ s.attempts }}" title="{{ s.attempts|qty }} attempts = ceil(copies to invent ÷ chance); relic invention job grouping is not modeled — one relic per attempt"><b>{{ s.attempts|qty }}</b></td>
+    {% else %}
+    <td class="num" data-sort="{{ s.jobs }}" title="{{ s.attempts|qty }} attempts = ceil(copies to invent ÷ chance), in {{ s.jobs|qty }} job{{ 's' if s.jobs != 1 }} of up to {{ s.max_runs }} runs — the T1 copy's max, one attempt per run"><b>{{ s.jobs|qty }}</b><span class="muted"> × {{ s.max_runs }}</span></td>
+    {% endif %}
+    <td class="num" data-sort="{{ s.probability }}">{{ "%.1f"|format(s.probability * 100) }}%</td>
+    <td class="num" title="{{ s.cycle_copies|qty }} cop{{ 'y' if s.cycle_copies == 1 else 'ies' }} per cycle × {{ t2_pct }}%">{{ s.target|qty }}</td>
+    <td class="num" title="BPCs of this blueprint in tracked hangars (each counted as one {{ s.runs_per_copy }}-run copy)">{{ s.from_stock|qty }}</td>
+    <td class="num" title="{{ s.flight_attempts_seen|qty }} invention attempt{{ 's' if s.flight_attempts_seen != 1 }} in flight × {{ "%.1f"|format(s.probability * 100) }}% chance">{{ s.from_flight|qty }}</td>
+    <td class="num" title="target − on hand − in flight">{{ s.to_invent|qty }}</td>
+    <td class="num" title="{{ s.cost_per_run|isk }} ISK per licensed run — (datacores{{ ' + relic' if s.is_relic }} + decryptor + fees) ÷ (chance × runs per copy)">{{ s.cost_per_run|isk_short }}</td>
+    <td class="flags">{% if s.covered %}<span class="badge good" title="stock and in-flight jobs already cover the target — no attempts needed">covered</span>{% endif %}
+        {% if s.is_relic %}<span class="badge" title="relics are consumed one per attempt — no copy job; they are in the buy list, net of loot on hand">relic</span>{% endif %}
+        {% if s.unpriced %}<span class="badge warn" title="{{ s.unpriced }} input price(s) missing — counted as 0; refresh prices">unpriced</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+</details>
+
+<details class="muted" style="margin-top:.8rem">
+  <summary>How this is computed</summary>
+  <p>Target = one cycle's copies (the pipeline's quantity per run ÷ runs
+  per invented copy) × the T2 BPC Buffer ({{ t2_pct }}%). BPCs
+  in tracked hangars count as one copy each at the configured runs per copy;
+  invention attempts in flight convert at the configured chance. Attempts
+  = the remainder ÷ chance, rounded up. Each attempt consumes one licensed
+  run of a T1 copy: the copy target in runs is attempts × the T1 BPC Buffer
+  ({{ t1_pct }}%), net of the copy stack (minus the BPO assumed to sit with
+  it, each copy assumed to hold the blueprint's max runs) and the licensed
+  runs on copy jobs in flight; copies are then made at max runs each.
+  Pipelines sharing a blueprint draw from one pool. Inputs net
+  once across all pipelines against stock and in-flight jobs; buy prices
+  are the venue's raw quote, cost per run uses landed prices. Change the
+  BPC Buffer percentages in Settings (Stockpile Buffer panel).</p>
+</details>
+{% endif %}
+{% endblock %}

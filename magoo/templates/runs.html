@@ -34,7 +34,7 @@
       {% if r.status != 'complete' %}
       <form class="inline" method="post"
             action="{{ url_for('run_delete', index_run_id=r.index_run_id) }}"
-            onsubmit="return confirm('Discard run {{ r.run_number }}? It was never executed — its plan is deleted permanently.')">
+            data-confirm="Discard run {{ r.run_number }}? It was never executed — its plan is deleted permanently.">
         <button class="mini danger">discard</button>
       </form>
       {% endif %}</td>

@@ -9,11 +9,21 @@
 {% set exceeds = run.wallet_character_isk is not none and buy_total > wallets %}
 <div class="pagehead">
   <h1>{{ m.run_title(run, superseded) }}</h1>
-  <span class="cap">planned {{ run.planned_start }} ·
-    {{ items|length }} items in chain ·
-    wallet at plan time <span title="{{ run.wallet_character_isk|isk }} char / {{ run.wallet_corporation_isk|isk }} corp">{{ run.wallet_character_isk|isk_short }} char /
-    {{ run.wallet_corporation_isk|isk_short }} corp</span>
-    {% if run.completed_at %}· executed {{ run.completed_at }}{% endif %}</span>
+  {# A plain-English caption like the Chain and Profit tabs (user request
+     2026-09-01); the plan-time wallets still back the "exceeds wallets"
+     badge in the strip below. #}
+  {% if run.completed_at %}
+  <span class="cap">What you bought and which jobs you installed this cycle,
+    sized from your stock, in-flight jobs and prices as they stood when you
+    planned it ({{ run.planned_start }} UTC). Executed
+    {{ run.completed_at }} — it is in cost history.</span>
+  {% else %}
+  <span class="cap">What to buy and which jobs to install this cycle, sized
+    from your stock, in-flight jobs and prices as they stood when you planned
+    it ({{ run.planned_start }} UTC). Mark it executed once the buys and
+    installs are done — that puts the buy list and jobs into cost
+    history.</span>
+  {% endif %}
   <div class="actions">
     {% if buys %}
     <button type="button" class="mini"
@@ -22,13 +32,13 @@
     {% if run.status != 'complete' %}
     <form method="post"
           action="{{ url_for('run_complete', index_run_id=run.index_run_id) }}"
-          onsubmit="return confirm('Mark run {{ run.run_number }} executed? The {{ buy_total|isk_short }} ISK buy list and installed jobs enter cost history.')">
+          data-confirm="Mark run {{ run.run_number }} executed? The {{ buy_total|isk_short }} ISK buy list and installed jobs enter cost history.">
       <button class="primary">✓ Mark executed</button>
     </form>
     {% else %}
     <form method="post"
           action="{{ url_for('run_reopen', index_run_id=run.index_run_id) }}"
-          onsubmit="return confirm('Reopen run {{ run.run_number }}? It is removed from cost history.')">
+          data-confirm="Reopen run {{ run.run_number }}? It is removed from cost history.">
       <button class="danger">Reopen run</button>
     </form>
     {% endif %}
@@ -44,8 +54,10 @@
   </div>
   <div class="stat">
     <span class="label">Mfg slots</span>
+    {# Structure comps ride under the Mfg slots count (user request
+       2026-09-01) — their slots are already inside mfg_slots_used. #}
     <span class="value {% if mfg_slots_used > settings.manufacturing_slots %}bad{% endif %}"
-          title="jobs allocated / manufacturing pool">{{ mfg_slots_used }}<span class="sub">/ {{ settings.manufacturing_slots }}</span></span>
+          title="jobs allocated / manufacturing pool{% if struct_builds or struct_buys %} · structure components: {{ struct_builds|length }} built in {{ struct_slots }} slot{{ 's' if struct_slots != 1 }} · {{ struct_buys|length }} bought{% endif %}">{{ mfg_slots_used }}<span class="sub">/ {{ settings.manufacturing_slots }}{% if struct_builds %} · {{ struct_slots }} in structure comps{% endif %}</span></span>
   </div>
   <div class="stat">
     <span class="label">Reaction slots</span>
@@ -60,12 +72,6 @@
     <span class="label">Low stock</span>
     <span class="value {% if low_stock %}warn{% endif %}" title="won't sustain the next run">{{ low_stock|length }}</span>
   </div>
-  {% if struct_builds or struct_buys %}
-  <div class="stat">
-    <span class="label">Structure comps</span>
-    <span class="value" title="structure component types built / bought this cycle">{{ struct_builds|length }}<span class="sub">built · {{ struct_buys|length }} bought</span></span>
-  </div>
-  {% endif %}
   {% if exceeds or buys_unpriced or structure_buys %}
   <div class="stat">
     <span class="label">&nbsp;</span>
@@ -101,7 +107,8 @@
 </div>
 {% endif %}
 
-<h2>Buy <span class="muted">— {{ buys|length }} items, <span title="{{ buy_total|isk }} ISK">{{ buy_total|isk_short }}</span></span></h2>
+<details class="section" open data-key="buy">
+<summary><h2>Buy <span class="muted">— {{ buys|length }} items, <span title="{{ buy_total|isk }} ISK">{{ buy_total|isk_short }}</span></span></h2></summary>
 {% if buys %}
 <div class="tablewrap">
 <table class="sortable aligned">
@@ -140,28 +147,29 @@
   {% endif %}
 </details>
 {% else %}<p class="muted">Nothing to buy.</p>{% endif %}
+</details>
 
-<h2>Manufacturing jobs <span class="muted">— {{ builds|length }} items,
-  {{ builds|sum(attribute='jobs_allocated') }} slots</span></h2>
+{# No invention section here (user ruling 2026-09-01): the run's invention
+   vintage only feeds the Profit tab's cost line; everything else about
+   invention lives on the Invention tab. #}
+<details class="section" open data-key="mfg">
+<summary><h2>Manufacturing jobs <span class="muted">— {{ m.job_stats(builds) }}</span></h2></summary>
 {% if builds %}
 {% for category, group in builds_grouped %}
-<h3 class="subhead">{{ category }}
-  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
-  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+<details class="section" open data-key="mfg:{{ category|lower|replace(' ', '-') }}">
+<summary><h3 class="subhead">{{ category }}
+  <span class="muted">— {{ m.job_stats(group) }}</span></h3></summary>
 {{ m.job_table(group) }}
+</details>
 {% endfor %}
 {% else %}<p class="muted">No manufacturing jobs.</p>{% endif %}
-
-{% if struct_builds or struct_buys %}
-<h2>Structure components <span class="muted">— {{ struct_builds|length }} built
-  ({{ struct_slots }} slots), {{ struct_buys|length }} bought</span></h2>
-{% if struct_builds %}
-{{ m.job_table(struct_builds) }}
-{% endif %}
+{# Built structure components are the "Structure Components" group above
+   (2026-09-01); the bought ones keep this sub-table. #}
 {% if struct_buys %}
-<h3 class="subhead">Bought this cycle <span class="muted">— cheaper to buy than
-  build, blacklisted, or out of job slots; these also appear in the Buy list
-  and Multibuy above</span></h3>
+<details class="section" open data-key="mfg:structure-components-bought">
+<summary><h3 class="subhead">Structure components bought <span class="muted">— {{ m.buy_stats(struct_buys) }};
+  cheaper to buy than build, blacklisted, or out of job slots; these also
+  appear in the Buy list and Multibuy above</span></h3></summary>
 <div class="tablewrap">
 <table class="sortable aligned">
   <thead><tr><th>Item</th><th class="num">Qty</th>
@@ -185,23 +193,27 @@
   {% endfor %}
 </table>
 </div>
+</details>
 {% endif %}
-{% endif %}
+</details>
 
-<h2>Reaction jobs <span class="muted">— {{ reactions|length }} items,
-  {{ reactions|sum(attribute='jobs_allocated') }} slots</span></h2>
+<details class="section" open data-key="reactions">
+<summary><h2>Reaction jobs <span class="muted">— {{ m.job_stats(reactions) }}</span></h2></summary>
 {% if reactions %}
 {% for category, group in reactions_grouped %}
-<h3 class="subhead">{{ category }}
-  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
-  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+<details class="section" open data-key="reactions:{{ category|lower|replace(' ', '-') }}">
+<summary><h3 class="subhead">{{ category }}
+  <span class="muted">— {{ m.job_stats(group) }}</span></h3></summary>
 {{ m.job_table(group) }}
+</details>
 {% endfor %}
 {% else %}<p class="muted">No reaction jobs.</p>{% endif %}
+</details>
 
 {% if alchemy %}
-<h2>Alchemy <span class="muted">— {{ alchemy|length }} items,
-  {{ alchemy|map(attribute='item')|sum(attribute='jobs_allocated') }} slots</span></h2>
+<details class="section" open data-key="alchemy">
+<summary><h2>Alchemy <span class="muted">— {{ alchemy|length }} items,
+  {{ alchemy|map(attribute='item')|sum(attribute='jobs_allocated') }} slots</span></h2></summary>
 <p class="muted">Cheaper than the direct reaction at current landed prices
   (venue price + courier); runs in
   slots that would otherwise sit idle. Install the unrefined reaction jobs
@@ -248,6 +260,7 @@
     {% endfor %}
   </ul>
 </div>
+</details>
 {% endif %}
 
 <dialog id="deficit" class="breakdown" aria-labelledby="deficit-name">

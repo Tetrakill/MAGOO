@@ -36,6 +36,21 @@
         onclick="openDeficit(this)">{{ i.name }}</button></td>
 {%- endmacro %}
 
+{# Section-header stats (2026-09-01): every job-table h2/h3 on Plan, Chain
+   and the Slot Planner reads "— N items, S slots, X" where X is Σ build qty
+   × unit price (the plan-time snapshot on the run tabs, today's on
+   Planning — the same price the Buy list uses, so sections reconcile);
+   buy_stats is the twin for bought rows and drops the slots. Unpriced rows
+   count as 0 and are called out. Single-line output on purpose: tests and
+   tooltips read it verbatim. #}
+{% macro job_stats(rows, plan_time=true) -%}
+{{ rows|length }} item{{ 's' if rows|length != 1 }}, {{ rows|slots }} slot{{ 's' if rows|slots != 1 }}, <span title="{{ rows|build_value|isk }} ISK — build qty × unit price{{ ' at plan time' if plan_time else ' today' }}{% if rows|unpriced %}; {{ rows|unpriced }} unpriced item{{ 's' if rows|unpriced != 1 }} count as 0{% endif %}">{{ rows|build_value|isk_short }}</span>{% if rows|unpriced %}, {{ rows|unpriced }} unpriced{% endif %}
+{%- endmacro %}
+
+{% macro buy_stats(rows, plan_time=true) -%}
+{{ rows|length }} item{{ 's' if rows|length != 1 }}, <span title="{{ rows|buy_value|isk }} ISK — qty × unit price{{ ' at plan time' if plan_time else ' today' }}{% if rows|unpriced %}; {{ rows|unpriced }} unpriced item{{ 's' if rows|unpriced != 1 }} count as 0{% endif %}">{{ rows|buy_value|isk_short }}</span>{% if rows|unpriced %}, {{ rows|unpriced }} unpriced{% endif %}
+{%- endmacro %}
+
 {% macro job_table(group, execution=true) %}
 <div class="tablewrap">
 <table class="sortable aligned">

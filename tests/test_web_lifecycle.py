@@ -248,6 +248,9 @@ def _settings_form(**over) -> dict:
         "skill_outpost_construction": "5",
         "structure_freight_in": "",
         "structure_buy_enabled": "1",
+        "skill_encryption": "5",
+        "t1_overbuild_pct": "400",
+        "t2_overbuild_pct": "400",
     }
     for cls in config.ITEM_CLASSES:
         form[f"{cls}_structure"] = ""

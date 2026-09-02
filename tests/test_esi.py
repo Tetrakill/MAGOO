@@ -62,17 +62,21 @@ def corp_asset(item_id, type_id, qty, location_id=STATION, *,
     }
 
 
-def job(job_id, installer, product, runs=5, location=STATION, end=None):
-    return {
+def job(job_id, installer, product, runs=5, location=STATION, end=None,
+        activity=1, blueprint_type=None):
+    record = {
         "job_id": job_id,
         "installer_id": installer,
-        "activity_id": 1,
+        "activity_id": activity,
         "status": "active",
         "product_type_id": product,
         "runs": runs,
         "output_location_id": location,
         "end_date": end or "2099-01-01T00:00:00Z",
     }
+    if blueprint_type is not None:
+        record["blueprint_type_id"] = blueprint_type
+    return record
 
 
 def patch_pull(monkeypatch, *, personal_jobs=None, personal_assets=None,
@@ -741,3 +745,111 @@ def test_multi_cycle_jobs_net_from_slot_pool(conn):
     snap = engine.snapshot_from_state(conn)
     assert snap.slots_available[config.ACTIVITY_MANUFACTURING] == 8
     assert snap.slots_available[config.ACTIVITY_REACTION] == 4
+
+
+# --- Lab job crediting (v1.23) ----------------------------------------------
+
+
+def test_invention_jobs_credit_attempts_no_slots(conn, ref, monkeypatch):
+    """Activity-8 jobs credit RAW attempts under the invented blueprint
+    type (the engine converts to expected copies) and never touch the
+    slot pools."""
+    add_character(conn, 2001)
+    zealot_bp = 12004  # Zealot Blueprint (the invented type)
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: [job(1, 2001, zealot_bp, runs=6, activity=8)]},
+        corp_assets={2001: []},
+        corp_jobs={2001: []},
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert state["in_progress"].get(zealot_bp, 0) == 6  # attempts, portion 1
+    assert state["active_jobs"][config.ACTIVITY_MANUFACTURING] == 0
+    assert state["active_jobs"][config.ACTIVITY_REACTION] == 0
+    assert state["job_ends"][config.ACTIVITY_MANUFACTURING] == []
+
+
+def test_copy_jobs_credit_licensed_runs_by_blueprint_type(conn, ref, monkeypatch):
+    """Activity-5 jobs key on blueprint_type_id (product_type_id is
+    optional in ESI) and credit copies × licensed runs — one run per copy
+    when the record carries no licensed_runs."""
+    add_character(conn, 2001)
+    omen_bp = 2007  # Omen Blueprint
+    with_runs = job(1, 2001, None, runs=4, activity=5, blueprint_type=omen_bp)
+    del with_runs["product_type_id"]
+    with_runs["licensed_runs"] = 10
+    bare = job(2, 2001, None, runs=3, activity=5, blueprint_type=omen_bp)
+    del bare["product_type_id"]
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: [with_runs, bare]},
+        corp_assets={2001: []},
+        corp_jobs={2001: []},
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert state["in_progress"].get(omen_bp, 0) == 4 * 10 + 3
+    assert state["active_jobs"][config.ACTIVITY_MANUFACTURING] == 0
+
+
+def test_copy_job_on_invented_blueprint_is_not_an_attempt(conn, ref, monkeypatch):
+    """Review 2026-09-01: a copy job on a T2 blueprint ORIGINAL keys the
+    same in_progress slot as invention attempts on that type, which the
+    engine converts at the invention chance — so it is not credited at
+    all (the copies count as stock once delivered)."""
+    add_character(conn, 2001)
+    zealot_bp = 12004  # an invented (T2) blueprint type
+    copy = job(1, 2001, None, runs=10, activity=5, blueprint_type=zealot_bp)
+    del copy["product_type_id"]
+    copy["licensed_runs"] = 10
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: [copy]},
+        corp_assets={2001: []},
+        corp_jobs={2001: []},
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert zealot_bp not in state["in_progress"]
+
+
+def test_research_jobs_still_dropped(conn, ref, monkeypatch):
+    add_character(conn, 2001)
+    omen_bp = 2007
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: [
+            job(1, 2001, omen_bp, runs=3, activity=3),
+            job(2, 2001, omen_bp, runs=3, activity=4),
+        ]},
+        corp_assets={2001: []},
+        corp_jobs={2001: []},
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert omen_bp not in state["in_progress"]
+
+
+def test_lab_job_delivery_filter_applies(conn, ref, monkeypatch):
+    """A lab job delivering into an untracked system contributes nothing
+    (its output BPC will never appear in tracked stock)."""
+    add_character(conn, 2001)
+    zealot_bp = 12004
+    conn.execute(
+        "INSERT INTO location_system (location_id, solar_system_id) "
+        "VALUES (?, ?)",
+        (60099999, UNTRACKED),
+    )
+    conn.commit()
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: [
+            job(1, 2001, zealot_bp, runs=6, activity=8, location=60099999)
+        ]},
+        corp_assets={2001: []},
+        corp_jobs={2001: []},
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert zealot_bp not in state["in_progress"]

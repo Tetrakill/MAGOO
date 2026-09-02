@@ -160,6 +160,34 @@ anywhere, iterates quickly, and owns its own data pipeline.
     both profit views. Finals are never compared (their quote is a sell
     reference).
 
+16. **T2/T3 invention (v1.22)** — Per pipeline whose final is
+    invention-capable (its manufacturing blueprint has at least one
+    `ref_invention` source), the user
+    picks a decryptor, "no decryptor", or off (a plain dropdown — the
+    inline nine-option comparison was removed 2026-08-31 as clutter; the
+    chosen option's economics show on the save flash and both profit
+    views; the run pages carry no invention information — user ruling
+    2026-09-01). Multi-source finals — T3 subsystems/hulls invented
+    from relic tiers (Intact/Malfunctioning/Wrecked), and the seven T2
+    targets with several T1 sources — add a **source select** beside the
+    decryptor; relics are consumed one per attempt (bought like datacores,
+    no copy job). Note the hull-batch consequence: an Intact-relic ship
+    final builds in whole 20-hull batches (runs-per-BPC is the ship batch
+    unit). The
+    choice **overrides** the pipeline's runs-per-BPC and the blueprint's
+    ME/TE (materialized at config time; §5 Invention, §7 Invention pass).
+    Each run persists its invention cost VINTAGE and amortizes the
+    computed cost per hull on both profit views (`kind='invention'`
+    lines; the manual BPC-cost figure stays for bought copies) — while
+    all production and purchasing lives on the **Invention tab** (v1.23):
+    a live BPC stockpile workbench that targets
+    `ceil(one cycle's copies × the T1/T2 BPC Stockpile Overbuild
+    settings)` (default 400%, range 100–1000%), netted against BPCs on
+    hand (ESI-counted; T1 copies = stack minus the BPO) and in-flight
+    lab jobs, and lists the datacores/decryptors/relics to buy (with
+    Multibuy) plus the copy jobs to install — recomputed from current
+    stock on every load, never persisted. Lab jobs consume no slot pool.
+
 ---
 
 ## 3. Architecture
@@ -268,7 +296,8 @@ suffix match would wrongly hit.
 | `ref_blueprint` | blueprint_id, product_id, activity_id, portion_size, base_time, max_runs |
 | `ref_blueprint_material` | blueprint_id, activity_id, material_id, quantity, consumed |
 | `ref_type_attribute` | type_id, attribute_id, attribute_name, value |
-| `ref_blueprint_skill` | blueprint_id, activity_id, skill_type_id, level — skill prerequisites (job-time math only, never demand) |
+| `ref_blueprint_skill` | blueprint_id, activity_id, skill_type_id, level — skill prerequisites (job-time math and invention chance, never demand) |
+| `ref_invention` | v1.22: blueprint_id (T1 source), product_blueprint_id (invented blueprint TYPE), probability, runs (per invented copy), time — one row per invention edge; datacores/skills live in the two tables above at activity_id 8 |
 | `ref_dogma_attribute` | attribute_id, name, default_value — dogma attribute definitions |
 | `ref_industry_modifier` | source_type_id, activity_id, kind, dogma_attribute_id, filter_id |
 | `ref_industry_target_filter` | filter_id, name, kind (category/group), ref_id |
@@ -283,8 +312,17 @@ Each blueprint record carries `blueprintTypeID`, `maxProductionLimit`, and an
 `research_material`, `research_time`. Each activity has `time`, `materials[]`,
 `products[]`, `skills[]`. Product `quantity` is the portion size.
 
-Magoo imports only `manufacturing` (activity 1) and `reaction` (activity 11);
-invention and copying are out of scope.
+Magoo imports `manufacturing` (activity 1) and `reaction` (activity 11) into
+`ref_blueprint`, and (v1.22) `invention` (activity 8) into its own
+`ref_invention` table — invention products are blueprint TYPES and one source
+can carry several (T3 relics), so merging them into `ref_blueprint` would
+poison `blueprint_for_product`'s `MIN(activity_id)` pick. Invention rows with
+no probability or an unpublished product are skipped (only unpublished
+sources carry them in live data). Copying imports no blueprint rows (it has
+only `time`), but both lab activities' structure/rig bonuses land in
+`ref_industry_modifier` via `SDE_MODIFIER_ACTIVITY_IDS`, feeding the
+invention/copy job-fee math through the ordinary `structure_multiplier`
+machinery (Raitaru cost ×0.97). Research activities stay out of scope.
 
 ### Three import rules that matter
 
@@ -407,8 +445,99 @@ cost = EIV × ((system_cost_index × structure_cost_mult) + facility_tax + SCC_s
 EIV uses **base** (pre-ME) quantities against CCP adjusted prices.
 `structure_cost_mult` is the structure's cost bonus read from data (Raitaru
 0.97 / Azbel 0.96 / Sotiyo 0.95; refineries 1.0); rig cost bonuses are not
-modeled (`attributeEngRigCostBonus` is 0 on the fitted rig families). The
-SCC surcharge is the `industry_scc_surcharge` setting (default 0.04).
+modeled for manufacturing/reactions (`attributeEngRigCostBonus` is 0 on
+those rig families) — the LAB rig families do carry one and are modeled
+for the invention/copying fees (−10%/−12% on the engineering security
+bands, see §5 Invention). The SCC surcharge is the
+`industry_scc_surcharge` setting (default 0.04).
+
+### Invention (v1.22)
+
+```
+P(success) = base_probability × (1 + (sci1 + sci2)/30 + encryption/40) × decryptor_prob_mult
+```
+
+clamped at 1.0. `base_probability` and the base runs per invented copy come
+from `ref_invention`; the required skills from `ref_blueprint_skill` at
+activity 8 — the "… Encryption Methods" skill supplies the /40 term (its own
+`skill_encryption` setting), the two datacore sciences the /30 terms, each
+resolved through the same `_per_bp_skill_level` name families the time math
+uses (racial Starship Engineering / Tech 2 Science levels).
+
+The invented copy is **ME 2 / TE 4** with `base_runs` licensed runs, plus
+the chosen decryptor's modifiers (dogma attrs 1112
+`inventionPropabilityMultiplier` — CCP's typo, verbatim — 1113 ME, 1114 TE,
+1124 runs; the 8 generic decryptors are group 1304).
+
+Per attempt: the activity-8 datacores, one decryptor (if chosen), one 1-run
+T1 copy (BPO on hand — only the copy job fee is charged), and the invention
+job fee.
+
+**Relic sources (T3, 2026-08-31).** The 56 relic-invented targets (48
+subsystems, 4 strategic cruisers, 4 tactical destroyers) each offer three
+sources whose tier is uniform across every family — Intact 0.26 / 20 runs,
+Malfunctioning 0.21 / 10, Wrecked 0.14 / 3 (time 3600s) — with identical
+datacores and skills per family (Sleeper Encryption Methods rides
+`skill_encryption`; decryptors apply unrestricted). A relic is an ITEM
+consumed one per attempt: it is priced landed and bought like a datacore,
+there is **no copy job** (copy fee 0), and the invention fee base is **2%
+of the INVENTED blueprint's product manufacturing EIV** (a relic has no
+manufacturing activity of its own; user decision 2026-08-31, pending
+in-client verification). Relics are detected by carrying no
+`ref_blueprint` rows at all. The seven multi-T1-source T2 targets use the
+same source picker with the ordinary T1 fee/copy math — the choice is
+which BPO you own. Each lab fee reads its own class row — `invention` and `copying`
+(split 2026-08-31: copying has its own per-system cost index in game; on an
+existing database the copying row seeds from the invention row it used to
+share) — and the standard fee formula with the base scaled to **2% of the
+T1 blueprint's manufacturing EIV** (`JOB_FEE_EIV_FRACTION`, pending
+in-client verification like the SCC surcharge), each with its own
+activity's structure cost bonus and its class's asserted **cost-rig tier**
+(2026-08-31): every Standup Invention / Blueprint Copy / Laboratory
+Optimization rig, M/L/XL alike, carries `attributeEngRigCostBonus` −10%
+(T1) / −12% (T2) on the engineering security bands 1.0/1.9/2.1 (verified
+live SDE) — `LAB_RIG_COST_PERCENT`, stored in the lab class's `me_rig`
+column. Lab job TIME bonuses stay unmodeled.
+
+Cost (engine `_invention_pass` / `costing.invention_cost`):
+
+```
+cost_per_licensed_run = attempt_cost / (P × runs_per_copy)
+```
+
+Sizing (v1.23, the live **Invention tab** — `engine.invention_stockpile`,
+never persisted, recomputed from current stock on every load):
+
+```
+cycle_copies   = ceil(ceil(output_qty_per_run / portion) / runs_per_copy)
+T2 target      = ceil(cycle_copies × t2_bpc_overbuild)        -- setting, default 400%
+to_invent      = target − BPCs on hand − floor(in-flight attempts × P)
+attempts       = ceil(to_invent / P)
+T1 target runs = ceil(attempts × t1_bpc_overbuild)           -- one run per attempt
+runs_to_make   = T1 target − (stack − 1 on hand) × max_runs − licensed runs copying
+copy jobs      = ceil(runs_to_make / max_runs)               -- copies at maxProductionLimit
+invention jobs = ceil(attempts / max_runs)                   -- one attempt per run of a max-run copy
+```
+
+BPC stock is ESI-counted like any other material (blueprint types flow
+into `on_hand` untouched); each stocked copy counts as one copy at the
+CONFIGURED runs_per_copy, in-flight invention attempts convert at the
+CONFIGURED chance, and the T1 BPO is assumed to sit with its copy stack
+in a tracked system (stack-minus-one — user decisions 2026-09-01).
+Pipelines sharing a source or invented blueprint draw from ONE shared
+pool, never double-credited; datacores/decryptors/relics net once across
+pipelines against stock + in-flight. The index run itself injects no buy
+rows and sizes no production — `copies_needed`/`attempts` persist as
+informational cycle figures, and the realized replay prices the
+CONTINUOUS expectation `1/(P × runs_per_copy × portion)` from the
+vintage row, so overbuild cycles never spike per-hull cost and
+stock-covered cycles never dip it.
+
+Datacore/decryptor prices in the invention cost are **landed** (venue raw +
+that venue's flat ISK/m³ × packaged m³) — the invention lines carry their
+own freight, and the freight-in aggregation only reads `material` lines, so
+nothing double-counts. Missing prices count 0 and surface as `unpriced`
+badges. Lab jobs contend for no slot pool (decision "T2 invention chain").
 
 ### Alchemy mechanics (v1.4)
 
@@ -467,9 +596,28 @@ Reference tables are described in §4. Application state follows.
 | `final_product_type_id` | |
 | `output_qty_per_run` | Desired finished output per index run |
 | `is_active` | Inactive pipelines excluded from planning (cost history stays attributable) |
-| `runs_per_bpc` | v1.1: runs on the final's blueprint copy — caps runs/job and is the batch rounding unit; NULL = uncapped |
-| `bpc_cost_isk` | v1.5: all-in ISK per BPC, amortized per hull as bpc_cost_isk ÷ runs_per_bpc |
+| `runs_per_bpc` | v1.1: runs on the final's blueprint copy — caps runs/job and is the batch rounding unit; NULL = uncapped. v1.22: MATERIALIZED from the invention math while `use_invention` is on |
+| `bpc_cost_isk` | v1.5: all-in ISK per BPC, amortized per hull as bpc_cost_isk ÷ runs_per_bpc. v1.22: ignored while `use_invention` is on (the computed invention cost replaces it; greyed out in the UI) |
+| `invention_source_blueprint_id` | 2026-08-31: the chosen source for a multi-source final — a relic TYPE id (T3 tiers) or a T1 blueprint id (the seven multi-T1 targets). NULL = auto (single-source). An invalid/vanished choice behaves as a stale config (bpc fallback + the reduced Off control) |
+| `use_invention`, `decryptor_type_id` | v1.22: the pipeline's invention choice (`decryptor_type_id` NULL = no decryptor). Enabling/changing it materializes the derived values at CONFIG time — runs into `runs_per_bpc`, invented ME/TE into the T2 blueprint's `blueprint_setting` — so the resolver chain and the planning path are untouched; disabling restores the stashed runs and the paste-contract ME/TE defaults. The paste updates only the quantity of an invention pipeline. A stale choice (SDE drift removes the source, or the final has several sources) silently falls back to `bpc_cost_isk`, and the Pipelines page keeps the Off control reachable for it |
+| `manual_runs_per_bpc` | v1.22 review: the user's own runs_per_bpc, stashed on the OFF→ON toggle (kept across decryptor changes). The manual-BPC amortization fallback (`costing.bpc_divisor`) divides by THIS while `use_invention` is on, so toggling invention can never reprice pre-invention realized history; turning invention off restores it into `runs_per_bpc` |
 | `created_at`, `modified_at` | |
+
+**`index_run_invention`** (v1.22) — the invention economics persisted with
+each planned run, one row per invention-enabled pipeline whose final had
+runs allocated: the source (`t1_blueprint_id` — a T1 blueprint or, since
+2026-08-31, a relic type id), decryptor, skill-applied probability,
+invented ME/TE/runs-per-copy, copies_needed, attempts, the datacores JSON
+(`[[type_id, qty_per_attempt, landed_price|null], …]` — carries the relic
+consumable triple for relic sources), decryptor price,
+both per-attempt fees (copy fee 0 for relics), and cost_per_run (schema 5
+dropped the never-read `copies_needed`/`attempts` sizing figures). Nothing
+on the run pages renders it (user ruling 2026-09-01: no invention
+information inside Index Runs); it exists to give lag costing a stable
+vintage — the realized `hull_cost` reads THIS row (suppressing the `bpc`
+line), never the live pipeline config or today's prices. Written for
+every resolving invention pipeline of the run, a slot-starved final
+included. Deleted with its run or its pipeline.
 
 > **No stored BOM.** The build chain is re-derived on every planning pass
 > (§7 Phase 2). There is deliberately no stage table and no per-item build/buy
@@ -990,6 +1138,20 @@ showed heavy multi-tier catch-up breaking it — six processed-material
 low-stock flags, and capacity-starved buy flips sized off the stale draft
 draw.)
 
+### Invention pass (v1.22; vintage-only since v1.23)
+
+After the loop converges (and before persistence), `_invention_pass`
+persists each invention-enabled pipeline's invention VINTAGE into
+`index_run_invention` — the skill-applied probability, invented stats,
+per-attempt input prices and fees, and cost_per_run — for lag costing and
+the run's profit view. Since v1.23 it adds NOTHING to the plan items:
+sizing, purchasing and copy jobs live on the live Invention tab
+(`engine.invention_stockpile`, §5), which targets the BPC stockpile from
+CURRENT stock rather than any index run. The invention cost per licensed
+run still replaces the `bpc_cost_isk` adder on the final inside
+`_chain_coster` (same constant per-unit term, so the MILP objective's
+shape is unchanged).
+
 ### Phase 8 — Cost lot bookkeeping
 
 > **Dormant since v1.5.** Lag-based costing (§10, v1.5 row) is the
@@ -1464,11 +1626,12 @@ stock scoping, sections and wording rather than engine surgery.
   structure still count — same corp-assets pull, no new endpoint.
 - **Run tabs**: `_display_category` collapses category 65 to "Upwell
   Structures" and 66 to "Structure Rigs & Modules" (106 EVE groups
-  otherwise); a **Structure components** `<h2>` on Plan (built rows via a
-  shared `job_table` macro + a "Bought this cycle" table that mirrors the
-  Buy list) and on Chain, with strip stats; manufacturing slot totals still
-  sum over the split-off rows; category ranks renumbered (ships 0–3,
-  structures 4–5, reactions 10–13, unranked 20).
+  otherwise); structure components are a **Structure Components** category
+  group inside Manufacturing on Plan, Chain and the Slot Planner (since
+  2026-09-01 — v1.9 gave them their own `<h2>`), with a "Structure
+  components bought" sub-table on Plan that mirrors the Buy list, and strip
+  stats; manufacturing slot totals sum over every built row; category ranks
+  renumbered (ships 0–3, structures 4–5, reactions 10–13, unranked 20).
 - **Paste**: omitted ME/TE → intermediate defaults for non-ship finals
   (ships keep 0/0); a pipeline's blueprint_setting pin is removed with the
   pipeline; help text covers structures and the flow-mode caveat.
@@ -2057,7 +2220,7 @@ user's Windows machine against the live database.
 | Long jobs (> cycle) | Allowed, span multiple cycles | Excluded via active-job check |
 | Slot contention | MILP on build savings | Lowest-margin items get bought instead |
 | ME/TE ~~and decrypter~~ | Global per-blueprint; explicit beats ~~ESI~~ the global default (revised 2026-08-20) | Enables planning against future research; the ESI owned-blueprint step and decrypters were superseded by the v1.1 paste model — struck 2026-08-20 |
-| ~~Default decrypter~~ | ~~Optimized Augmentation~~ Superseded 2026-08-20: decrypter feature struck from spec (never implemented; invention is out of scope) | |
+| ~~Default decrypter~~ | ~~Optimized Augmentation~~ Superseded 2026-08-20: decrypter feature struck from spec ~~(never implemented; invention is out of scope)~~ — reinstated v1.22 as a per-pipeline choice with no default (see "T2 invention" rows below) | |
 | Facility assignment | ~~Per (category, activity)~~ → global settings per item class (2026-08-15) | User asserts structure, ME/TE rig tier, security, index, and tax once per class; simpler and matches practice |
 | Facility math depth | Structure bonuses from data; rig tier asserted per class | Rig-applicability filtering not needed at planning time |
 | Ship batching | Multiples of 8 (configurable), capacity wins; **runs-per-BPC, when set, replaces the multiple** — subcap ships build whole blueprint copies | Revised 2026-08-15 |
@@ -2071,7 +2234,7 @@ user's Windows machine against the live database.
 | Production blacklist | Per-category + per-item "buy, don't build"; finals exempt | Mirrors EVE-IPH's blacklist; sub-chains pruned at expansion (v1.3) |
 | In-progress jobs | Count toward current stock | Prevents duplicate recommendations |
 | Blueprint availability | Assume unlimited copies | Not modelled as a constraint |
-| T2 invention chain | Out of scope — BPCs assumed on hand | Lab slots drop out; only two pools contend |
+| T2 invention chain | ~~Out of scope — BPCs assumed on hand~~ In scope since v1.22 (per-pipeline decryptor choice, computed cost, datacores on the buy list) — but lab slots stay unmodeled: invention/copy jobs contend for no pool and ESI keeps dropping them from slot accounting | Lab slots drop out; only two pools contend |
 | Plan drift | ESI is the ledger, plan is advisory | Reconcile after the fact |
 | Aggregate ISK/hr reporting | Deferred | Data model supports it when wanted |
 | Rig applicability source | `industryModifierSources` + `industryTargetFilters` (2026-08-15) | canFitShipGroup lists structures a rig fits, not products it bonuses; CCP now ships applicability as data |
@@ -2085,7 +2248,7 @@ user's Windows machine against the live database.
 | Run execution truth (v1.5) | One user-asserted bit per run: "Mark executed" (reversible) | Planned prices stand in for receipts; abandoned replans stay `planned` and are invisible to costing |
 | Sell-side fees (v1.5) | Broker fee from Broker Relations + station-owner standings (NPC venue) or flat structure rate; sales tax from Accounting | Formula constants pending in-client verification, like all industry math |
 | Freight (v1.5) | Flat ISK/m³ in (bought materials, packaged volume) and out (finished hull, packaged volume); **no collateral term by design**. v1.6: capital-priced hulls replace freight-out with a fixed per-hull movement cost | User decision 2026-08-18 |
-| BPC cost (v1.5) | Per-pipeline all-in ISK per copy, amortized ÷ runs_per_bpc | Invention math stays out of scope; user enters the number |
+| BPC cost (v1.5) | Per-pipeline all-in ISK per copy, amortized ÷ runs_per_bpc | ~~Invention math stays out of scope; user enters the number~~ v1.22: kept ONLY for non-invention pipelines (bought copies) and as the fallback for a stale invention config; an invention-enabled pipeline computes the figure instead |
 | Per-class security (2026-08-20) | High/Low/Null **dropdown** replaces the numeric field; stored capital_ships 2.1 migrates to nullsec; reaction classes offer Low/Null only | Live data showed the field used as a band multiplier; out-of-range statuses silently read as highsec |
 | Subcap SCC surcharge (2026-08-20) | The SCC market surcharge applies to sub-capital net proceeds too | The game levies ~1.5% on all sell orders since Apr 2023, not just capitals |
 | Price snapshot venue (2026-08-20) | Jita 4-4 station only (location 60003760), not region-wide min sell — the HUB leg; the structure leg (v1.10) deliberately takes its best order plus a depth flag, see "Structure depth rule (2026-08-22)" | A 1-unit scam/stale order in a backwater Forge station must not set cost basis or MILP savings |
@@ -2127,6 +2290,31 @@ user's Windows machine against the live database.
 | Structure depth rule (2026-08-22) | Best price + flag, never a fill price: shallow = units of the structure's sell ladder landing ≤ the Jita landed price < quantity to buy; no order splitting across venues | User choice — a thin cheap order still sets the quote; the flag tells the user to buy the remainder in Jita |
 | One structure market (2026-08-22) | The v1.6 capital-pricing structure (C-J6MT preset / custom ID) is also the buy venue; a second flat freight-in rate for its leg | One authed order-book pull serves both; no second structure setting |
 | Alchemy comparison landed (2026-08-24) | Both routes' materials and the recovered credit price LANDED (venue raw + that venue's courier rate × packaged m³, the same `_landed_price` leg as build savings); the comparison stays single-stage | Freight does not cancel between the routes — at 55% yield the unrefined route hauls ~1.8× the m³ per composite unit, so raw prices overstated alchemy by ~500–1,250 ISK/unit at 900 ISK/m³ and flipped marginal routes (run 49: Hexite +1,304 raw → −130 landed) |
+| T2 invention: materialize at config time (v1.22) | Choosing a decryptor writes the derived values THEN — runs into `pipeline.runs_per_bpc` (the user's own value stashed in `manual_runs_per_bpc` on the OFF→ON edge), invented ME/TE into the T2 blueprint's `blueprint_setting`; disabling restores the stashed runs and the paste-default ME/TE; the paste updates only qty while invention is on | The resolver chain, `_size_jobs` batch rounding and the `bpc_runs_limit` flow stay untouched; the only plan-time addition is the cost math and the buy rows. The stash exists because the manual-BPC fallback reads the live `runs_per_bpc` — without it the toggle silently repriced every pre-invention executed run's realized BPC line (review find, 2026-08-31) |
+| T2 invention: stale-config escape (v1.22) | A `use_invention=1` pipeline whose source no longer resolves keeps a reduced control on the Pipelines page (current-stale + Off); the BPC-cost input re-enables since costing falls back to it | The Off POST deliberately runs before the capability check; without the control the materialized runs/ME/TE were unfixable short of deleting the pipeline (and its profit history) |
+| T2 invention: capability rule (v1.22) | ~~A final is invention-capable when its manufacturing blueprint has EXACTLY ONE `ref_invention` source; T3 deferred~~ 2026-08-31: capable = AT LEAST one source; multi-source finals (T3 relic tiers, and the seven multi-T1-source T2 targets) store a chosen source (`pipeline.invention_source_blueprint_id`) picked via a source select beside the decryptor; single-source stays auto (column NULL, heals multi→single drift) | Every T2 target has one source in live data (verified, build 3484357); the source picker generalizes to all 63 multi-source targets with one mechanism |
+| T3 relic fee base (2026-08-31) | A relic attempt's invention fee base = 2% of the INVENTED blueprint's product manufacturing EIV; copy fee 0 (a relic is consumed outright — no copy job) | Relics have no manufacturing activity, so the T2 base (source's act-1 EIV) is undefined; user decision, pending in-client verification like the other fee constants |
+| Relic as consumable-in-JSON (2026-08-31) | The relic rides the `datacores` tuple/JSON as one extra per-attempt triple — no schema change, and the buy-row demand loop, stock netting (wormhole loot), hull-cost replay and run-page Input table all work untouched | One representation for every per-attempt consumable beats a parallel relic column set |
+| Subsystem classification (2026-08-31) | Category 32 (T3 subsystems) classifies `t2_ships`, joining the techLevel-3 hulls already there | CCP's "Medium T2 Ships" rig target filter (8) spans category 32 — the user's T2-ship rigs bonus subsystem jobs in game, so pricing them under `other` understated ME/TE bonuses |
+| BPC stockpile overbuild (v1.23) | Two settings, `t1_bpc_overbuild` / `t2_bpc_overbuild` (default 400%, clamp 100–1000%): the Invention tab targets ceil(one cycle's copies × mult), netted against BPC stock and in-flight lab jobs | User request 2026-09-01: BPCs stocked like any other input material; the flat-multiplier alternative was rejected for netting |
+| Invention tab is live; runs keep cost only (v1.23) | All invention/copy PRODUCTION and purchasing moved to the top-level "Invention" tab — computed from the latest ESI snapshot + price cache on every GET, never persisted (the Planning-page pattern). Index runs persist only the cost vintage (`index_run_invention`; copies/attempts informational) and inject no buy rows. Same day the tab was restructured to the Planning / Index Run shape: totals strip, then sortable tables in the order the work happens — Buy + Multibuy · T1 copy jobs · Invention jobs — the install checklist panel, and a "How this is computed" disclosure; no per-pipeline prose | User decision 2026-09-01: "keep invention/copy costs as part of each index run, but pull out the actual stockpiles and material purchases to an entire new tab… live and based off current stock, not index runs" |
+| Lab jobs credit in-progress (v1.23) | ESI activity-8 jobs credit raw attempts under the invented blueprint type; activity-5 jobs credit copies under `blueprint_type_id` (`product_type_id` is optional in ESI); portion forced 1; research 3/4 still dropped; labs still contend for NO slot pool | Amends "T2 invention chain": the in-progress-counts-as-stock invariant now covers BPCs; the engine converts attempts to expected copies at the configured chance |
+| T1 BPC stock = stack minus one (v1.23) | `max(0, on_hand[T1 blueprint] − 1)` copies, each assumed to hold the blueprint's `maxProductionLimit` runs: the BPO is assumed to sit with its copy stack in a tracked hangar; assets cannot tell BPO from BPC or runs remaining (only the dropped read_blueprints scopes can) | User decision 2026-09-01 over "whole stack is copies" and re-adding the ESI scopes; stakes are copy fees + checklist workload |
+| Copies at max runs (2026-09-01) | Copy jobs are planned at the T1 blueprint's `maxProductionLimit` (`Refdata.max_runs`); the T1 side of the Invention tab is denominated in licensed RUNS (one per attempt), stocked copies count max runs each, and activity-5 jobs credit copies × `licensed_runs`. Invention jobs group the same way — `ceil(attempts / max_runs)` jobs of up to max runs each; relic sources (no T1 blueprint) show plain attempts, their job grouping unmodeled | User request: "when making copies assume the max runs per copy the blueprint allows" and "invention should be the same as copies" — copy fees are per run, so the cost per attempt is unchanged |
+| Shared-pool netting (v1.23) | Pipelines sharing a T1 source (Arazu + Lachesis ← Celestis) or an invented blueprint draw stock/in-flight from ONE pool in pipeline order; inputs net once across pipelines | Mirrors the v1.22 shared-datacore rule; double-crediting a copy stack would under-produce |
+| Collapsible sections (2026-09-01) | Every h2 section and h3 category group on the data tabs only (Planning, Index Runs Plan/Chain, Invention) is a native `details.section`, open by default, heading-as-summary with a ▾/▸ marker; closed state persists per page family + `data-key` in localStorage (run ids normalised, `?view=` part of the key so Plan and Chain remember separately). Pagehead, totals, alerts, checklist panels, dialogs and methodology disclosures are never sections; Dashboard, Pipelines, Settings and ESI stay static by user ruling | User request: collapse header and sub-header tables on Planning, Index Runs and Invention, default open — the Ops Console's existing `<details>` idiom, no JS framework |
+| Section-header stats; structure components nested (2026-09-01) | Every job-table h2/h3 on Plan, Chain and the Slot Planner reads "N items, S slots, X" — X = Σ build qty × unit price (plan-time snapshot on the run tabs, today's on Planning; unpriced rows count 0 and are called out); Raw inputs and the bought sub-table show the buy twin (`_macros` `job_stats` / `buy_stats`, filters `slots` / `build_value` / `buy_value` / `unpriced`). Structure components render as a Manufacturing category group instead of their own `<h2>`; the bought rows keep a sub-table under Manufacturing on Plan; the totals-strip "Structure comps" stat is folded into the Mfg slots stat's sub-line ("· 7 structure comps", built/bought in the tooltip) on Plan and the Slot Planner | User request; the unit price is the snapshot the Buy list prices from, so the section figures reconcile with the Buy total and the strip |
+| No invention information inside Index Runs (2026-09-01) | The run Plan tab's "Invention — amortized cost" vintage table is gone (`_invention_context` deleted); `index_run_invention` still persists per run and feeds only the Profit tab's invention cost line; everything else about invention is the Invention tab's | User ruling: index runs are the buy/install worksheet; invention is planned and tracked on its own tab |
+| Settings "Stockpile Buffer" panel (2026-09-01) | A new panel between Global and Alchemy (side-nav `#stockpile`) holds the five sizing buffers, relabelled the same day — Intermediate Buffer (`stockpile_buffer`), Raw Material Buffer (`input_purchase_margin`), Composite Reaction Buffer (`composite_reaction_extra_runs`), T1 / T2 BPC Buffer (the overbuilds) — moved out of Global; same form, same field names, no storage change | User request: the buffers are one decision family and were scattered through Global |
+| Confirmations via the in-app dialog (2026-09-01) | Every destructive submit (Mark executed, Reopen run, Discard run, Delete pipeline, Clear all pipelines, Remove character) declares `data-confirm` on its form; one shared `<dialog id="confirm">` in base.html intercepts the submit (capture phase), asks, and re-submits via `requestSubmit` on yes. `window.confirm()` is gone from the templates (JS keeps it only as a fallback where `showModal` is missing) | Embedded browsers — the Claude Code Browser pane, any WebView with dialogs suppressed — answer `confirm()` false instantly, silently cancelling the submit: "Mark executed" did nothing there, the same failure that killed the original pipeline delete (§ Pipelines) |
+| Review fixes, invention arc (2026-09-01) | 15 confirmed findings + 9 cleanups from the xhigh code review, all applied: the vintage row persists for a slot-starved final too (else hull_cost fell back to the manual bpc line); `invention_probability` rounds to 12 places and the engine's `_ceil`/`_floor` round away float noise (7/0.4375 planned 17 attempts); the Invention tab's buys carry the Raw Material Buffer and the shallow flag; one `costing.resolve_invention` rule makes a vanished decryptor STALE (bpc fallback + Off control) everywhere; `engine.rematerialize_invention` re-derives runs/ME/TE after every SDE import (`ImportJob(on_imported=…)`); ESI skips copy jobs on invented (T2/T3) blueprint originals (they would read as attempts); profit cards label by line kind; `/invention` prices only `invention_type_ids` after its empty-state checks (inactive / stale named as such) and guards an empty price cache; the Chain strip folds structure comps under Manufactured; the enable flash's batch wording respects `EXACT_QTY_SHIP_GROUPS`; pipelines selects `requestSubmit()` (scroll restore) with guarded sessionStorage; strip sub-line reads "N in structure comps"; `prices_refresh` pulls `market_type_ids` (EIV bases go to the adjusted store only); schema 5 drops the never-read `copies_needed`/`attempts`; shared helpers `store.set_blueprint_setting`, `_paste_default_me_te`, `costing.landed_price`, `_bpc_line`, `_price_maps`; `Refdata.max_runs` memoised; `_split_structure_components` returns a pair; decryptor cost line now tested | Recall-mode review; each finding independently verified before fixing |
+| Pipelines inline editing (2026-09-01) | Runs/BPC, ME and TE are inline-editable (fetch saves, 422 refusals) whenever invention is OFF — the paste remains the bulk path and writes the same `blueprint_setting` pin; while invention is ON the three cells are read-only with one non-wrapping `inv` badge each, and the edit routes refuse with 422. Full-form submits on the page (invention selects, activate/delete, paste) restore the scroll position after their redirect. Same day: the table became `table.pipelines` — content-packed columns (the `profit` rule), 4rem figure inputs, date-only Created with the timestamp on hover, `mini` row actions in a slack-absorbing column, and a multi-source row's selects stacked so the table fits the page | User feedback: the values were paste-only display cells; the badge wrapped differently per column width; every submit jumped to the top; the 100%-width table with 6.5rem inputs sprawled |
+| T2 invention: lab facility (v1.22) | ~~One `invention` class row drives BOTH the invention and copy fees~~ Split 2026-08-31 (user request): separate `invention` and `copying` class rows, each fee with its own activity's structure cost bonus. Amended same day (user request): the lab rows carry a security band and a cost-rig tier like every other class — the tier (in `me_rig`) is the lab's Standup Invention/Copy/Laboratory Optimization rig, a universal −10%/−12% JOB-COST bonus on the engineering bands (verified across M/L/XL); the TE column stays empty (lab time unmodeled). On an existing database `copying` seeds from the `invention` row it used to share (new classes otherwise seed from `other`); costing falls back to the invention row if the copying row is missing | The split exists because copying has its own per-system cost index in game; the cost-rig tier reuses the one-rig-per-class assertion model — no applicability filtering, same as ME/TE rigs |
+| T2 invention: expected-value sizing (v1.22) | `attempts = ceil(copies / P)` buys datacores/decryptors at expected quantities, rounded up; per-run cost amortizes at the continuous expectation | The plan is advisory (ESI is the ledger); variance of a binomial across a cycle doesn't warrant a safety-stock model |
+| T2 invention: landed invention lines (v1.22) | Datacore/decryptor prices inside the invention cost are landed; the buy-list rows keep venue raw prices like every other buy | Same freight stance as build savings and the alchemy comparison; `_freight_in_lines` only aggregates `material` lines so nothing double-counts |
+| Compare-decryptors table removed (2026-08-31) | The Pipelines page keeps only the decryptor dropdown — the per-row nine-option economics table was struck as clutter (user request). The refresh list still covers datacores + all decryptors for every capable pipeline, so switching choices prices immediately; per-option numbers live on the run and profit pages | The comparison was the page's heaviest element (9 costings + ~30 cache reads per capable row per GET) for a decision made once per pipeline |
+| T2 invention: lag semantics (v1.22) | The realized view reads the per-run `index_run_invention` snapshot at lag 0; the what-if view computes live. **v1.23:** the replay prices the CONTINUOUS expected consumption (1/(P × runs × portion)) from the vintage row, never `attempts` — production volume belongs to the Invention tab's stockpile, so a 4× overbuild cycle and a stock-covered cycle cost the same per hull | The invention spend happens AT the run that licenses the copies — there is no deeper vintage to walk back to; per-hull cost stays amortized (user decision) |
+| T2 invention: skills (v1.22) | One new setting (`skill_encryption`, /40 term); the datacore sciences reuse `skill_starship_engineering` / `skill_science` through the existing `_per_bp_skill_level` name families | The families already route every science skill correctly; only Encryption Methods had no home (and its formula weight differs) |
 
 ---
 
@@ -2138,8 +2326,20 @@ user's Windows machine against the live database.
   4-4-filtered regional orders, v1.6 structure market).
 - **Multi-activity items** — items producible via both manufacturing and
   reaction are not yet disambiguated.
-- **System cost indices** — currently user-asserted per item class; pulling
-  live values from ESI `/industry/systems/` remains unimplemented.
+- **System cost indices** — currently user-asserted per item class (the
+  v1.22 `invention` and `copying` lab classes included); pulling live
+  values from ESI `/industry/systems/` remains unimplemented.
+- ~~T3 / relic invention~~ — resolved 2026-08-31: multi-source targets get
+  a source picker; relics are consumed per attempt, priced landed, bought
+  on the plan.
+- ~~In-flight invention jobs~~ — resolved v1.23: activity-5/8 jobs credit
+  their output blueprint into in-progress, and the Invention tab nets BPC
+  stock and in-flight attempts before sizing; lab jobs still contend for
+  no slot pool.
+- **Invention fee constants** — the 2% EIV fee base
+  (`JOB_FEE_EIV_FRACTION`), the relic fee base (2% of the invented
+  blueprint's product manufacturing EIV — decision 2026-08-31), and the
+  lab cost indices await in-client verification, like the SCC surcharge.
 - **ETag/Expires response caching** — confirmed open (2026-08-20); would
   speed refreshes and cut the error-limit budget draw.
 - **Deployment** — how the user runs it day to day (local script, service,

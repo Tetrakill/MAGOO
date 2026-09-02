@@ -15,13 +15,14 @@
 <div class="settings">
 <aside class="sidenav">
   <a href="#global">Global</a>
+  <a href="#stockpile">Stockpile Buffer</a>
   <a href="#alchemy">Alchemy</a>
   <a href="#skills">Skills</a>
   <a href="#subcap">High Sec Trade Hub Pricing</a>
   <a href="#capital">Null Sec Trade Hub Pricing</a>
-  <a href="#classes">Build settings</a>
+  <a href="#classes">Build Settings</a>
   <a href="#blacklist">Blacklist</a>
-  <a href="#tracked">Tracked systems</a>
+  <a href="#tracked">Tracked Systems</a>
 </aside>
 
 <div class="settings-main">
@@ -29,40 +30,61 @@
 <div class="panel" id="global">
   <h2>Global</h2>
   <div class="fields">
-    <label for="buffer_pct">Stockpile buffer
-      <small>0.1–10%; buildable intermediates only — final product counts are exact, raw inputs are just-in-time</small></label>
-    <span class="withunit"><input id="buffer_pct" name="buffer_pct" type="number" step="0.1" min="0.1" max="10"
-           value="{{ settings.stockpile_buffer|pct }}">%</span>
-    <label for="purchase_margin_pct">Input purchase margin
-      <small>extra raw materials bought vs. what this cycle's planned jobs consume</small></label>
-    <span class="withunit"><input id="purchase_margin_pct" name="purchase_margin_pct" type="number" step="0.1" min="0" max="50"
-           value="{{ settings.input_purchase_margin|pct }}">%</span>
-    <label for="duration">Max run duration <small>hours — the index-run cycle window</small></label>
+    <label for="duration">Max Run Duration <small>hours — the index-run cycle window</small></label>
     <input id="duration" name="duration" type="number" step="0.5" min="1"
            value="{{ settings.max_run_duration_hours }}">
-    <label for="batch">Ship batch multiple <small>ship builds round up to a multiple of this</small></label>
+    <label for="batch">Ship Batch Multiple <small>ship builds round up to a multiple of this</small></label>
     <input id="batch" name="batch" type="number" min="1" value="{{ settings.ship_batch_multiple }}">
-    <label for="extra_runs">Composite reaction extra runs <small>extra buffer for composite reaction inputs</small></label>
-    <input id="extra_runs" name="extra_runs" type="number" min="0"
-           value="{{ settings.composite_reaction_extra_runs }}">
-    <label for="mfg_slots">Manufacturing slots <small>total pool; multi-cycle active jobs (from ESI) subtract from this</small></label>
+    <label for="mfg_slots">Manufacturing Slots <small>total pool; multi-cycle active jobs (from ESI) subtract from this</small></label>
     <input id="mfg_slots" name="mfg_slots" type="number" min="0" value="{{ settings.manufacturing_slots }}">
-    <label for="reaction_slots">Reaction slots <small>total pool</small></label>
+    <label for="reaction_slots">Reaction Slots <small>total pool</small></label>
     <input id="reaction_slots" name="reaction_slots" type="number" min="0" value="{{ settings.reaction_slots }}">
-    <label for="count_fitted_stock">Count fitted &amp; deployed items as stock
+    <label for="count_fitted_stock">Count Fitted &amp; Deployed Items as Stock
       <small>when off, items fitted to or loaded in ships and structures (module, rig, subsystem, service, fuel, core, drone and fighter slots/bays) and anything deployed in space — anchored structures, sov hubs, POCOs — are left out of ESI on-hand stock; items stored inside them still count; applies at the next ESI update</small></label>
     <input id="count_fitted_stock" name="count_fitted_stock" type="checkbox" {{ 'checked' if settings.count_fitted_stock }}>
-    <label for="intermediate_me">Intermediate component ME
+    <label for="intermediate_me">Intermediate Component ME
       <small>every blueprint without an explicit setting; a final product's ME/TE comes from the pipeline paste</small></label>
     <input id="intermediate_me" name="intermediate_me" type="number" min="0" max="10"
            value="{{ settings.default_intermediate_me }}">
-    <label for="intermediate_te">Intermediate component TE</label>
+    <label for="intermediate_te">Intermediate Component TE</label>
     <input id="intermediate_te" name="intermediate_te" type="number" min="0" max="20"
            value="{{ settings.default_intermediate_te }}">
-    <label for="industry_scc_pct">Industry SCC surcharge
+    <label for="industry_scc_pct">Industry SCC Surcharge
       <small>flat SCC tax on every job installation fee; server-side rate (not in the SDE), 4% per EVE University; verify against a live install quote</small></label>
     <span class="withunit"><input id="industry_scc_pct" name="industry_scc_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.industry_scc_surcharge|pct }}">%</span>
+  </div>
+</div>
+
+{# Stockpile buffer panel (user request 2026-09-01): the five sizing
+   buffers, carved out of Global — same form, same field names. #}
+<div class="panel" id="stockpile">
+  <h2>Stockpile Buffer <span class="muted">— how much extra each cycle plans for</span></h2>
+  <div class="fields">
+    <label for="buffer_pct">Intermediate Buffer
+      <small>0.1–10%; buildable intermediates only — final product counts are exact, raw inputs are just-in-time</small></label>
+    <span class="withunit"><input id="buffer_pct" name="buffer_pct" type="number" step="0.1" min="0.1" max="10"
+           value="{{ settings.stockpile_buffer|pct }}">%</span>
+    <label for="purchase_margin_pct">Raw Material Buffer
+      <small>extra raw materials bought vs. what this cycle's planned jobs consume</small></label>
+    <span class="withunit"><input id="purchase_margin_pct" name="purchase_margin_pct" type="number" step="0.1" min="0" max="50"
+           value="{{ settings.input_purchase_margin|pct }}">%</span>
+    <label for="extra_runs">Composite Reaction Buffer <small>extra runs planned for composite reaction inputs</small></label>
+    <input id="extra_runs" name="extra_runs" type="number" min="0"
+           value="{{ settings.composite_reaction_extra_runs }}">
+    <label for="t1_overbuild_pct">T1 BPC Buffer
+      <small>Invention tab: target T1 source copies = this × the attempts
+      one cycle consumes, netted against copies on hand (stack minus the
+      BPO) and copy jobs in flight</small></label>
+    <span class="withunit"><input id="t1_overbuild_pct" name="t1_overbuild_pct"
+      type="number" step="25" min="100" max="1000"
+      value="{{ settings.t1_bpc_overbuild|pct }}">%</span>
+    <label for="t2_overbuild_pct">T2 BPC Buffer
+      <small>Invention tab: target invented copies = this × one cycle's
+      need, netted against BPCs on hand and invention jobs in flight</small></label>
+    <span class="withunit"><input id="t2_overbuild_pct" name="t2_overbuild_pct"
+      type="number" step="25" min="100" max="1000"
+      value="{{ settings.t2_bpc_overbuild|pct }}">%</span>
   </div>
 </div>
 
@@ -77,13 +99,13 @@
     reactions are far more slot-efficient).</p>
   </details>
   <div class="fields">
-    <label for="alchemy_enabled">Enable alchemy</label>
+    <label for="alchemy_enabled">Enable Alchemy</label>
     <input id="alchemy_enabled" name="alchemy_enabled" type="checkbox" {{ 'checked' if settings.alchemy_enabled }}>
-    <label for="alchemy_yield_pct">Reprocess yield
+    <label for="alchemy_yield_pct">Reprocess Yield
       <small>unrefined items reprocess under scrapmetal rules: flat yield, max 55% (50% structure base × Scrap Metal Processing V, no rig bonuses); fold any reprocessing tax in here</small></label>
     <span class="withunit"><input id="alchemy_yield_pct" name="alchemy_yield_pct" type="number" step="0.5" min="0" max="100"
            value="{{ settings.alchemy_reprocess_yield|pct }}">%</span>
-    <label for="max_alchemy_jobs">Max alchemy jobs per type <small>per unrefined formula per cycle; 0 disables</small></label>
+    <label for="max_alchemy_jobs">Max Alchemy Jobs per Type <small>per unrefined formula per cycle; 0 disables</small></label>
     <input id="max_alchemy_jobs" name="max_alchemy_jobs" type="number" min="0"
            value="{{ settings.max_alchemy_jobs_per_type }}">
   </div>
@@ -100,6 +122,10 @@
     modules, Skyhooks and structure fighters. Tech I structure rigs and
     structure components need only Industry; Tech II Standup rigs also take
     the Tech 2 Science level.</p>
+    <p>Invention chance also reads three of these: the racial Encryption
+    Methods level (÷40) plus the two datacore sciences (÷30 each) — the
+    Racial Starship Engineering level for ship engineering datacores and
+    the Tech 2 Science / Engineering level for everything else.</p>
   </details>
   <div class="fields cols2">
     <label for="skill_industry">Industry</label>
@@ -116,6 +142,10 @@
     <input id="skill_science" name="skill_science" type="number" min="0" max="5" value="{{ settings.skill_science }}">
     <label for="skill_outpost_construction">Outpost Construction</label>
     <input id="skill_outpost_construction" name="skill_outpost_construction" type="number" min="0" max="5" value="{{ settings.skill_outpost_construction }}">
+    <label for="skill_encryption">Racial Encryption Methods
+      <small>invention chance only; the datacore sciences reuse the two
+      levels above</small></label>
+    <input id="skill_encryption" name="skill_encryption" type="number" min="0" max="5" value="{{ settings.skill_encryption }}">
   </div>
 </div>
 
@@ -130,10 +160,10 @@
     <b>sales tax {{ "%.2f"|format(sales_tax * 100) }}%</b> —
     verify against a sell-order window in the client.</p>
   <div class="fields cols2">
-    <label for="region">Price region
+    <label for="region">Price Region
       <small>10000002 = The Forge; quotes come from its hub station (Jita 4-4), and raw inputs with no hub-station order (NPC-seeded goods such as Marines or Janitors) take this region's region-wide best price</small></label>
     <input id="region" name="region" type="number" min="1" required value="{{ settings.price_region_id }}">
-    <label for="source">Price source <small>min sell or max buy</small></label>
+    <label for="source">Price Source <small>min sell or max buy</small></label>
     <select id="source" name="source">
       <option value="sell" {{ 'selected' if settings.price_source == 'sell' }}>sell</option>
       <option value="buy" {{ 'selected' if settings.price_source == 'buy' }}>buy</option>
@@ -142,10 +172,10 @@
     <input id="skill_accounting" name="skill_accounting" type="number" min="0" max="5" value="{{ settings.skill_accounting }}">
     <label for="skill_broker_relations">Broker Relations</label>
     <input id="skill_broker_relations" name="skill_broker_relations" type="number" min="0" max="5" value="{{ settings.skill_broker_relations }}">
-    <label for="standing_faction">Faction standing <small>station owner</small></label>
+    <label for="standing_faction">Faction Standing <small>station owner</small></label>
     <input id="standing_faction" name="standing_faction" type="number" step="0.01" min="-10" max="10"
            value="{{ settings.standing_broker_faction }}">
-    <label for="standing_corp">Corp standing <small>station owner</small></label>
+    <label for="standing_corp">Corp Standing <small>station owner</small></label>
     <input id="standing_corp" name="standing_corp" type="number" step="0.01" min="-10" max="10"
            value="{{ settings.standing_broker_corp }}">
     <label for="freight_in">Courier Highsec Market → Industry Hub <small>ISK/m³, bought materials hauled in from this hub (the null-sec leg is set in the panel below)</small></label>
@@ -179,30 +209,30 @@
       <option value="cj6" {% if settings.capital_market_mode == 'cj6' %}selected{% endif %}>C-J6MT Keepstar</option>
       <option value="custom" {% if settings.capital_market_mode == 'custom' %}selected{% endif %}>Custom structure ID</option>
     </select>
-    <label for="capital_structure_id">Custom structure ID <small>only used with Custom</small></label>
+    <label for="capital_structure_id">Custom Structure ID <small>only used with Custom</small></label>
     <input id="capital_structure_id" name="capital_structure_id" type="number" min="0" style="width:11rem"
            value="{{ settings.capital_structure_id or '' }}" placeholder="structure id">
-    <label for="structure_buy_enabled">Buy inputs here when cheaper landed <small>off = every input is priced from Jita, as before</small></label>
+    <label for="structure_buy_enabled">Buy Inputs Here When Cheaper Landed <small>off = every input is priced from Jita, as before</small></label>
     <input id="structure_buy_enabled" name="structure_buy_enabled" type="checkbox" {{ 'checked' if settings.structure_buy_enabled }}>
     <label for="structure_freight_in">Courier Null Sec Market → Industry Hub <small>ISK/m³, bought materials hauled in from this market</small></label>
     <input id="structure_freight_in" name="structure_freight_in" type="number" step="1" min="0" value="{{ settings.structure_freight_in_isk_per_m3 }}">
-    <label for="capital_sales_tax_pct">Sales tax <small>capital-class hulls</small></label>
+    <label for="capital_sales_tax_pct">Sales Tax <small>capital-class hulls</small></label>
     <span class="withunit"><input id="capital_sales_tax_pct" name="capital_sales_tax_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.capital_sales_tax|pct }}">%</span>
-    <label for="capital_broker_pct">Broker fee</label>
+    <label for="capital_broker_pct">Broker Fee</label>
     <span class="withunit"><input id="capital_broker_pct" name="capital_broker_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.capital_broker_rate|pct }}">%</span>
-    <label for="capital_movement_cost">Movement cost <small>ISK per hull</small></label>
+    <label for="capital_movement_cost">Capital Movement Cost <small>ISK per hull</small></label>
     <input id="capital_movement_cost" name="capital_movement_cost" type="number" step="100000" min="0"
            value="{{ settings.capital_movement_cost_isk }}">
-    <label for="capital_scc_pct">SCC surcharge</label>
+    <label for="capital_scc_pct">SCC Surcharge</label>
     <span class="withunit"><input id="capital_scc_pct" name="capital_scc_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.capital_scc_surcharge|pct }}">%</span>
   </div>
 </div>
 
 <div class="panel" id="classes">
-  <h2>Build settings <span class="muted">— where you build each class of item</span></h2>
+  <h2>Build Settings <span class="muted">— where you build each class of item</span></h2>
   <details class="muted help">
     <summary>How rig bonuses are applied</summary>
     <p>Where each class of items is built, and what rigs the structure
@@ -216,8 +246,8 @@
   </details>
   <div class="tablewrap">
   <table class="classes">
-    <thead><tr><th>Class</th><th>Structure</th><th>Security</th><th>ME rig</th>
-        <th>TE rig</th><th class="num">Cost index %</th><th class="num">Tax %</th></tr></thead>
+    <thead><tr><th>Class</th><th>Structure</th><th>Security</th><th>ME Rig</th>
+        <th>TE Rig</th><th class="num">Cost Index %</th><th class="num">Tax %</th></tr></thead>
     {% for cls in item_classes %}
     {% set cs = class_settings[cls] %}
     <tr>
@@ -228,6 +258,27 @@
             {{ 'selected' if cs.structure_type_id == value }}>{{ label }}</option>
         {% endfor %}
       </select></td>
+      {% if cls in ('invention', 'copying') %}
+      {# v1.22: the labs run invention / T1 copy JOBS — no materials. The
+         rig column asserts the lab's Standup Invention / Copy /
+         Laboratory Optimization tier, a JOB-COST bonus (-10%/-12%) scaled
+         by the security band; job time is not modeled, so the TE column
+         stays empty. Split into two rows 2026-08-31. #}
+      {% set band = 'high' if cs.security >= 0.45 else ('low' if cs.security > 0 else 'null') %}
+      <td><select name="{{ cls }}_security_band" aria-label="{{ CLASS_LABELS[cls] }} — security band"
+            title="security band of the lab system — scales the cost rig's bonus (×1.0 high / ×1.9 low / ×2.1 null-WH)">
+          <option value="high" {{ 'selected' if band == 'high' }}>highsec</option>
+          <option value="low" {{ 'selected' if band == 'low' }}>lowsec</option>
+          <option value="null" {{ 'selected' if band == 'null' }}>null/WH</option>
+      </select></td>
+      <td><select name="{{ cls }}_me_rig" aria-label="{{ CLASS_LABELS[cls] }} — cost rig"
+            title="Standup {{ 'Invention' if cls == 'invention' else 'Blueprint Copy' }} / Laboratory Optimization rig tier — job cost −10% (T1) / −12% (T2), scaled by the security band">
+        {% for tier in ('none','t1','t2') %}
+          <option value="{{ tier }}" {{ 'selected' if cs.me_rig == tier }}>{{ tier }}</option>
+        {% endfor %}
+      </select></td>
+      <td class="muted" title="job time is not modeled for the labs — no TE rig">—</td>
+      {% else %}
       {% set band = 'high' if cs.security >= 0.45 else ('low' if cs.security > 0 else 'null') %}
       <td><select name="{{ cls }}_security_band" aria-label="{{ CLASS_LABELS[cls] }} — security band"
             title="security band of the build system">
@@ -248,6 +299,7 @@
           <option value="{{ tier }}" {{ 'selected' if cs.te_rig == tier }}>{{ tier }}</option>
         {% endfor %}
       </select></td>
+      {% endif %}
       <td class="num"><input name="{{ cls }}_index_pct" type="number" step="0.01" min="0"
                  aria-label="{{ CLASS_LABELS[cls] }} — system cost index %"
                  value="{{ cs.system_cost_index|pct }}" title="system cost index as shown in the industry window, e.g. 5.21"></td>
@@ -263,7 +315,7 @@
 </form>
 
 <div class="panel" id="blacklist">
-  <h2>Production blacklist</h2>
+  <h2>Production Blacklist</h2>
   <p class="muted" style="margin:.2rem 0 .6rem">Items you check or list here
   get <b>bought instead of built</b>, and their sub-chains drop out of the
   plan. Your final products are always built.</p>
@@ -277,7 +329,7 @@
     <p style="margin:.6rem 0 0"><button>Save blacklist categories</button></p>
   </form>
 
-  <h3 class="subhead">Do-not-build items</h3>
+  <h3 class="subhead">Do-Not-Build Items</h3>
   <form method="post" action="{{ url_for('blacklist_item_add') }}" class="addrow">
     <input name="item" aria-label="Item to blacklist" placeholder="Item name (e.g. Fernite Carbide)" size="34">
     <button>Add</button>
@@ -299,7 +351,7 @@
 </div>
 
 <div class="panel" id="tracked">
-  <h2>Tracked solar systems</h2>
+  <h2>Tracked Solar Systems</h2>
   <p class="muted" style="margin:.2rem 0 .6rem">Only assets in these systems
   count as stock. Leave the list empty to count everything, everywhere.</p>
   <form method="post" action="{{ url_for('tracked_add') }}" class="addrow">

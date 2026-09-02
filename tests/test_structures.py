@@ -260,10 +260,10 @@ def test_split_structure_components_partition():
     comp_bought = {"group_id": 536, "name": "Structure Construction Parts"}
     hull = {"group_id": 1657, "name": "Astrahus", "jobs_allocated": 1}
     mineral = {"group_id": 18, "name": "Tritanium"}
-    built, bought, other = _split_structure_components(
+    built, bought = _split_structure_components(
         [hull, comp_built], [mineral, comp_bought]
     )
-    assert built == [comp_built] and bought == [comp_bought] and other == [hull]
+    assert built == [comp_built] and bought == [comp_bought]
     # slot totals must sum over the unsplit list (the split is display-only)
     assert sum(i["jobs_allocated"] for i in [hull, comp_built]) == 3
 
@@ -314,8 +314,12 @@ def test_run_detail_template_renders_structure_components_section(ref):
            "wallet_corporation_isk": 2e9, "completed_at": None}
     ctx = dict(
         run=run, items=[hangar, parts, trit, astrahus], final_net_margin={},
-        buys=[trit, parts], builds=[astrahus], reactions=[],
-        builds_grouped=[("Upwell Structures", [astrahus])], reactions_grouped=[],
+        buys=[trit, parts], builds=[astrahus, hangar], reactions=[],
+        # 2026-09-01: built structure components are a Manufacturing
+        # category group; only the bought ones keep a sub-table.
+        builds_grouped=[("Upwell Structures", [astrahus]),
+                        ("Structure Components", [hangar])],
+        reactions_grouped=[],
         struct_builds=[hangar], struct_buys=[parts], struct_slots=2,
         chain_struct=[], alchemy=[], alchemy_yield=0.55, chain_rows=[],
         chain_raws=[], chain_mfg=[], chain_reactions=[],
@@ -331,13 +335,33 @@ def test_run_detail_template_renders_structure_components_section(ref):
     )
     with app.test_request_context("/runs/1"):
         html = render_template("run_detail.html", **ctx)
-    assert "Structure components" in html
-    assert "1 built" in html and "1 bought" in html
-    assert "Bought this cycle" in html
+    assert "Structure Components" in html  # a group inside Manufacturing
+    # Totals strip: structure comps ride under the Mfg slots count (sub-line
+    # + tooltip), not as their own stat (2026-09-01).
+    assert "· 2 in structure comps</span>" in html
+    assert "structure components: 1 built in 2 slots · 1 bought" in html
+    assert ">Structure comps</span>" not in html
+    assert "Structure components bought" in html
     assert "Upwell Structures" in html
     assert "region price" in html  # Tritanium priced region-wide at plan time
-    assert "Structure comps" in html  # totals strip stat
     assert "cheaper to buy than" in html
+    # Section-header stats: items, slots, Σ build qty × unit price (1,000
+    # each): the group (hangar 4 × 1,000) and the h2 over both groups
+    # (+ Astrahus 1 × 1,000); the bought sub-table's twin (parts 12 × 1,000).
+    assert "1 item, 2 slots, <span" in html and ">4.00K</span>" in html
+    assert "2 items, 3 slots, <span" in html and ">5.00K</span>" in html
+    assert "1 item, <span" in html and ">12.00K</span>" in html
+    assert "build qty × unit price at plan time" in html
+    # Destructive submits are guarded by the shared in-app dialog, never by
+    # window.confirm() (embedded browsers answer it false — 2026-09-01).
+    assert 'data-confirm="Mark run 99 executed? The 5.01M ISK buy list' in html
+    assert "onsubmit" not in html and "return confirm(" not in html
+    # Plain-English caption (2026-09-01): the planned variant on a planned
+    # run; no stat string. (Whitespace-normalised: the caption wraps.)
+    flat = " ".join(html.split())
+    assert "What to buy and which jobs to install this cycle" in flat
+    assert "Mark it executed once the buys and installs are done" in flat
+    assert "items in chain" not in flat and "wallet at plan time" not in flat
 
 
 def test_run_chain_template_renders_structure_components_section(ref):
@@ -352,6 +376,11 @@ def test_run_chain_template_renders_structure_components_section(ref):
         "build_qty": 4 if status == "build" else 0,
         "buy_qty": 4 if status == "buy" else 0, "alchemy_out": 0,
         "capacity_limited": False, "short": False,
+        # section-header stats keys (2026-09-01)
+        "jobs_allocated": 1 if status == "build" else 0,
+        "recommended_build_qty": 4 if status == "build" else 0,
+        "recommended_buy_qty": 4 if status == "buy" else 0,
+        "price_snapshot": 1000.0,
     }
     hangar = row("Structure Hangar Array", 536, "build")
     trit = row("Tritanium", 18, "buy", buildable=False, activity=None)
@@ -365,17 +394,29 @@ def test_run_chain_template_renders_structure_components_section(ref):
            "index_run_id": 1}
     ctx = dict(
         run=run, chain_rows=[hangar, trit, partial, starved, unmet], chain_raws=[trit],
+        # 2026-09-01: structure components are a Manufacturing group; the
+        # flat row lists feed the h2 header stats.
         chain_mfg=[("Upwell Structures", [starved, unmet]),
-                   ("Advanced Capital Construction Components", [partial])],
-        chain_reactions=[], chain_struct=[hangar],
+                   ("Advanced Capital Construction Components", [partial]),
+                   ("Structure Components", [hangar])],
+        chain_mfg_rows=[starved, unmet, partial, hangar],
+        chain_reactions=[], chain_reaction_rows=[], chain_struct=[hangar],
         chain_counts={"covered": 0, "buy": 1, "build": 3, "react": 0, "alchemy": 0,
                       "unmet": 2},
     )
     with app.test_request_context("/runs/1?view=chain"):
         html = render_template("run_chain.html", **ctx)
-    assert "Structure components" in html
-    assert "Structure comps" in html
+    assert "Structure Components" in html  # group heading inside Manufacturing
+    # The strip counts structure comps INSIDE Manufactured (a sub-line),
+    # never as a second stat that would double-count them (2026-09-01).
+    assert "· 1 structure comps" in html
+    assert ">Structure comps</span>" not in html
     assert "Structure Hangar Array" in html
+    # h2 stats over the flat rows: 4 items, 3 with a job, 3 × 4 × 1,000;
+    # raw inputs show the buy twin (Tritanium 4 × 1,000).
+    assert "4 items, 3 slots, <span" in html and ">12.00K</span>" in html
+    assert "1 item, <span" in html and ">4.00K</span>" in html
+    assert "1 item, 1 slot, <span" in html  # the Structure Components group
     assert "raw input — bought just-in-time: 4" in html  # Tritanium tooltip
     assert ">+buy</span>" in html and "4 of the deficit is bought" in html
     assert ">+unmet</span>" in html and "only 5 of the 8 deficit is planned" in html

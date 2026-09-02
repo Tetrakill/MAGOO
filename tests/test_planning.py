@@ -455,6 +455,8 @@ def _ctx(**over):
         structure_buys=set(),
         shallow=set(),
         region_wide=set(),
+        builds=[],
+        reactions=[],
         builds_grouped=[],
         reactions_grouped=[],
         struct_builds=[],

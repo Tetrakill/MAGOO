@@ -15,6 +15,7 @@ Phases:
   8. Cost-lot bookkeeping primitives (FIFO vintage costing)
 """
 
+import json
 import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 
-from . import bom, config, industry, store
+from . import bom, config, costing, industry, store
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +160,11 @@ class Plan:
     index_run_id: int | None
     run_number: int
     items: dict[int, PlanItem]
+    # v1.22: per-pipeline invention VINTAGE computed by _invention_pass
+    # (pipeline_id -> the index_run_invention row as a dict) — the carrier
+    # to the persist step; empty when no active pipeline's invention
+    # choice resolves.
+    invention: dict[int, dict] = field(default_factory=dict)
 
     def by_action(self, action: str) -> list[PlanItem]:
         return sorted(
@@ -412,15 +418,9 @@ def _game_job_run_cap(time_per_run: float, blueprint=None) -> int:
 
 
 def _skill_levels(settings) -> industry.SkillLevels:
-    return industry.SkillLevels(
-        industry=settings.skill_industry,
-        advanced_industry=settings.skill_advanced_industry,
-        reactions=settings.skill_reactions,
-        adv_ship_construction=settings.skill_adv_ship_construction,
-        starship_engineering=settings.skill_starship_engineering,
-        science=settings.skill_science,
-        outpost_construction=settings.skill_outpost_construction,
-    )
+    # v1.22: the mapping lives on Settings so costing's invention math can
+    # reuse it without importing the engine.
+    return settings.skill_levels()
 
 
 def _size_jobs(conn, ref, merged: dict[int, PlanItem]):
@@ -551,13 +551,24 @@ def _unit_build_cost(
 
 
 def _landed_price(ref, settings, snapshot, type_id: int) -> float | None:
-    """Landed buy price: the chosen venue's raw price plus THAT venue's
-    flat inbound freight on packaged volume (v1.10). None when unpriced."""
-    price = snapshot.price(type_id)
-    if price is None:
-        return None
-    freight_in = settings.freight_in_rate(snapshot.venue(type_id))
-    return price + freight_in * ref.type_info(type_id).freight_volume
+    """Landed buy price from a Snapshot: costing.landed_price over the
+    chosen venue's raw price (v1.10). None when unpriced."""
+    return costing.landed_price(
+        ref, settings, snapshot.price(type_id), snapshot.venue(type_id), type_id
+    )
+
+
+def _ceil(x: float) -> int:
+    """math.ceil after rounding away float noise (review 2026-09-01): the
+    invention chance and the overbuild multipliers are short decimals whose
+    quotients and products land an ulp off exact integers (7 / 0.4375,
+    10 × 1.1), and a raw ceil would plan a whole extra attempt or copy."""
+    return math.ceil(round(x, 9))
+
+
+def _floor(x: float) -> int:
+    """math.floor with the same guard — 16 × 0.4375 must credit 7 copies."""
+    return math.floor(round(x, 9))
 
 
 def _stamp_price(item: PlanItem, snapshot: Snapshot) -> None:
@@ -577,6 +588,81 @@ def _stamp_price(item: PlanItem, snapshot: Snapshot) -> None:
         if item.buy_venue == store.BUY_VENUE_STRUCTURE
         else None
     )
+
+
+def _invention_configs(conn, ref) -> dict[int, tuple]:
+    """pipeline_id -> (pipeline row, InventionSource, Decryptor | None) for
+    active use_invention pipelines whose choice still resolves
+    (costing.resolve_invention — the one stale-config rule since the
+    2026-09-01 review; v1.22, multi-source/T3 since 2026-08-31). A stale
+    pipeline — source gone after SDE drift, a multi-source final with a
+    missing/invalid choice, or a decryptor id that no longer resolves —
+    silently falls back to the manual bpc_cost_isk path; the Pipelines
+    page shows it its Off control."""
+    configs: dict[int, tuple] = {}
+    for pipeline in store.active_pipelines(conn):
+        resolved = costing.resolve_invention(ref, pipeline)
+        if resolved is None:
+            continue
+        source, decryptor = resolved
+        configs[pipeline["pipeline_id"]] = (pipeline, source, decryptor)
+    return configs
+
+
+def materialize_invention(
+    conn, ref, pipeline_id: int, source, decryptor, chosen_id
+) -> tuple[int, int, int]:
+    """Write a pipeline's invention choice (v1.22 materialise-at-config-
+    time): use_invention on, the decryptor and source choice, runs_per_bpc
+    = the invented copy's runs — the user's own value stashed in
+    manual_runs_per_bpc on the OFF -> ON transition only (SET right-hand
+    sides read the OLD row, so one statement suffices) — and the invented
+    ME/TE pinned on the T2 blueprint. Returns (me, te, runs). Shared by
+    the Pipelines-page save and rematerialize_invention."""
+    me, te, runs = industry.invented_bpc(
+        source.runs,
+        decryptor.me_mod if decryptor else 0,
+        decryptor.te_mod if decryptor else 0,
+        decryptor.run_mod if decryptor else 0,
+    )
+    conn.execute(
+        "UPDATE pipeline SET manual_runs_per_bpc = CASE "
+        "WHEN use_invention THEN manual_runs_per_bpc "
+        "ELSE runs_per_bpc END, "
+        "use_invention = 1, decryptor_type_id = ?, "
+        "invention_source_blueprint_id = ?, "
+        "runs_per_bpc = ?, modified_at = datetime('now') "
+        "WHERE pipeline_id = ?",
+        (decryptor.type_id if decryptor else None, chosen_id, runs, pipeline_id),
+    )
+    store.set_blueprint_setting(conn, source.product_blueprint_id, me, te)
+    return me, te, runs
+
+
+def rematerialize_invention(conn, ref) -> int:
+    """After an SDE import: re-derive every invention pipeline's
+    materialised runs_per_bpc and ME/TE from the NEW reference data
+    (review 2026-09-01: they were written once at config time while every
+    cost path recomputed from ref data, so a rebalanced decryptor or relic
+    tier desynchronised the batch size the run plans from the copies the
+    vintage and the Invention tab assume). Stale configs — source or
+    decryptor gone — are left for the Pipelines page's Off control.
+    Returns the number rewritten."""
+    rewritten = 0
+    for pipeline in conn.execute(
+        "SELECT * FROM pipeline WHERE use_invention = 1"
+    ).fetchall():
+        resolved = costing.resolve_invention(ref, pipeline)
+        if resolved is None:
+            continue
+        source, decryptor = resolved
+        materialize_invention(
+            conn, ref, pipeline["pipeline_id"], source, decryptor,
+            pipeline["invention_source_blueprint_id"],
+        )
+        rewritten += 1
+    conn.commit()
+    return rewritten
 
 
 def _chain_coster(conn, ref, snapshot: Snapshot):
@@ -606,10 +692,30 @@ def _chain_coster(conn, ref, snapshot: Snapshot):
     pipelines = store.active_pipelines(conn)
     finals = {p["final_product_type_id"] for p in pipelines}
     bpc_per_unit: dict[int, float] = {}
+    invention_configs = _invention_configs(conn, ref)
     for p in pipelines:
         tid = p["final_product_type_id"]
-        if p["bpc_cost_isk"] and p["runs_per_bpc"] and tid not in bpc_per_unit:
-            bpc_per_unit[tid] = p["bpc_cost_isk"] / p["runs_per_bpc"]
+        if tid in bpc_per_unit:
+            continue
+        cfg = invention_configs.get(p["pipeline_id"])
+        if cfg is not None:
+            # v1.22: computed expected invention cost per licensed run
+            # replaces the hand-entered bpc figure — same constant per-unit
+            # adder on finals, so the MILP objective shape is unchanged.
+            _pipeline, source, decryptor = cfg
+            cost = costing.invention_cost(
+                ref, settings, class_settings, source, decryptor,
+                price_of=lambda t: _landed_price(ref, settings, snapshot, t),
+                adjusted_of=snapshot.adjusted,
+            )
+            blueprint = ref.blueprint_for_product(tid)
+            bpc_per_unit[tid] = cost.cost_per_run / (
+                blueprint.portion_size if blueprint else 1
+            )
+        elif p["bpc_cost_isk"] and costing.bpc_divisor(p):
+            # bpc_divisor: the stashed manual runs while a (stale)
+            # invention flag holds the materialized value in runs_per_bpc.
+            bpc_per_unit[tid] = p["bpc_cost_isk"] / costing.bpc_divisor(p)
     memo: dict[int, tuple[float, int]] = {}
 
     def buy_cost(type_id: int) -> float | None:
@@ -1237,11 +1343,331 @@ def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
 # ---------------------------------------------------------------------------
 
 
-def demand_type_ids(conn, ref) -> set[int]:
-    """Every type the active pipelines demand — the price-fetch list.
-    With alchemy enabled, routes feeding a demanded composite add their
+def _invention_pass(
+    conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot
+) -> dict[int, dict]:
+    """v1.22, run ONCE after the convergence loop: persist each
+    invention-enabled pipeline's invention VINTAGE — the skill-applied
+    probability, invented stats, per-attempt input prices and fees, and
+    cost_per_run — for lag costing and the run's profit view.
+
+    Since v1.23 this pass adds NOTHING to the plan items: sizing,
+    purchasing and copy jobs live on the live Invention tab
+    (invention_stockpile), which targets the BPC stockpile from CURRENT
+    stock rather than any index run. Every resolving pipeline gets a row
+    — a final the slot pool starved to zero runs included (review
+    2026-09-01: without it the executed run's profit view fell back to
+    the manual bpc line, the very figure invention ignores)."""
+    configs = _invention_configs(conn, ref)
+    if not configs:
+        return {}
+    settings = store.get_settings(conn)
+    class_settings = store.get_class_settings(conn)
+    rows: dict[int, dict] = {}
+    for pipeline_id, (pipeline, source, decryptor) in configs.items():
+        if pipeline["final_product_type_id"] not in merged:
+            continue
+        cost = costing.invention_cost(
+            ref, settings, class_settings, source, decryptor,
+            price_of=lambda t: _landed_price(ref, settings, snapshot, t),
+            adjusted_of=snapshot.adjusted,
+        )
+        rows[pipeline_id] = {
+            "pipeline_id": pipeline_id,
+            "t1_blueprint_id": source.t1_blueprint_id,
+            "decryptor_type_id": decryptor.type_id if decryptor else None,
+            "probability": cost.probability,
+            "invented_me": cost.me,
+            "invented_te": cost.te,
+            "runs_per_copy": cost.runs_per_copy,
+            "datacores": json.dumps(
+                [[t, q, p] for t, q, p in cost.datacores]
+            ),
+            "decryptor_unit_price": cost.decryptor_price,
+            "invention_fee_per_attempt": cost.invention_fee,
+            "copy_fee_per_attempt": cost.copy_fee,
+            "cost_per_run": cost.cost_per_run,
+        }
+    return rows
+
+
+def invention_stockpile(conn, ref, snapshot: Snapshot) -> dict:
+    """The live Invention tab (v1.23): per invention-enabled pipeline, a
+    TARGET-based BPC stockpile netted against current stock and in-flight
+    lab jobs — never persisted, recomputed on every GET.
+
+    T2: target = ceil(cycle copies × t2_bpc_overbuild), where cycle
+    copies = ceil(ceil(output_qty_per_run / portion) / runs_per_copy)
+    (invariant to whole-copy batch rounding; a dual-role final consumed
+    by another pipeline can be allocated more in a real run — the tab
+    deliberately sizes from configured output only). Stock draws from a
+    SHARED per-blueprint pool of on_hand[invented blueprint type] (each
+    unit ≈ one copy at the CONFIGURED runs_per_copy), then from the
+    in-flight pool of activity-8 attempts converted at the CONFIGURED
+    chance (floor(attempts × P) — decryptor drift between install and
+    now shifts the estimate). attempts = ceil(remainder / P).
+
+    T1 (non-relic sources): consumed = attempts; target = ceil(attempts
+    × t1_bpc_overbuild); stock = stack-minus-one (the BPO assumed to sit
+    with its copy stack — and unseen entirely if stored outside the
+    tracked systems); in-flight = activity-5 copy runs. Pipelines
+    sharing a source (Arazu AND Lachesis from Celestis) draw from ONE
+    pool in pipeline_id order — never double-credited.
+
+    Datacores/decryptors/relics: gross = attempts-scaled, netted ONCE
+    across all pipelines against on_hand + in_progress (the v1.22 rule);
+    buy rows carry venue RAW prices like every buy list."""
+    configs = _invention_configs(conn, ref)
+    settings = store.get_settings(conn)
+    class_settings = store.get_class_settings(conn)
+    t2_pool: dict[int, int] = {}
+    t2_flight_pool: dict[int, int] = {}
+    t1_pool: dict[int, int] = {}
+    t1_flight_pool: dict[int, int] = {}
+    t1_owners: dict[int, list[str]] = {}
+    sections: list[dict] = []
+    demand: dict[int, int] = {}
+    for pipeline_id, (pipeline, source, decryptor) in sorted(
+        configs.items()
+    ):
+        cost = costing.invention_cost(
+            ref, settings, class_settings, source, decryptor,
+            price_of=lambda t: _landed_price(ref, settings, snapshot, t),
+            adjusted_of=snapshot.adjusted,
+        )
+        final_id = pipeline["final_product_type_id"]
+        final_bp = ref.blueprint_for_product(final_id)
+        portion = final_bp.portion_size if final_bp else 1
+        cycle_runs = math.ceil(pipeline["output_qty_per_run"] / portion)
+        cycle_copies = math.ceil(cycle_runs / cost.runs_per_copy)
+        target = _ceil(cycle_copies * settings.t2_bpc_overbuild)
+
+        bp_id = source.product_blueprint_id
+        t2_pool.setdefault(bp_id, snapshot.on_hand.get(bp_id, 0))
+        t2_flight_pool.setdefault(bp_id, snapshot.in_progress.get(bp_id, 0))
+        from_stock = min(target, t2_pool[bp_id])
+        t2_pool[bp_id] -= from_stock
+        flight_attempts = t2_flight_pool[bp_id]
+        flight_copies = _floor(flight_attempts * cost.probability)
+        from_flight = min(target - from_stock, flight_copies)
+        if from_flight:
+            # Decrement in ATTEMPTS so a second pipeline sharing the
+            # blueprint cannot re-credit the same in-flight jobs.
+            used = min(_ceil(from_flight / cost.probability), flight_attempts)
+            t2_flight_pool[bp_id] -= used
+        to_invent = max(0, target - from_stock - from_flight)
+        attempts = _ceil(to_invent / cost.probability) if to_invent else 0
+        if attempts:
+            for type_id, qty, _price in cost.datacores:
+                demand[type_id] = demand.get(type_id, 0) + qty * attempts
+            if decryptor is not None:
+                demand[decryptor.type_id] = (
+                    demand.get(decryptor.type_id, 0) + attempts
+                )
+
+        t1 = None
+        if not ref.is_relic_source(source.t1_blueprint_id):
+            # Everything here is in licensed RUNS: an attempt consumes one
+            # run of a T1 copy, copies are made at the blueprint's max
+            # runs (user decision 2026-09-01), stocked copies are assumed
+            # to hold max runs each, and in-flight copy jobs credit
+            # copies × licensed runs.
+            t1_id = source.t1_blueprint_id
+            max_runs = ref.max_runs(t1_id)
+            t1_owners.setdefault(t1_id, []).append(
+                (pipeline_id, pipeline["name"])
+            )
+            # Stack minus one: the BPO assumed among its copies.
+            t1_pool.setdefault(
+                t1_id,
+                max(0, snapshot.on_hand.get(t1_id, 0) - 1) * max_runs,
+            )
+            t1_flight_pool.setdefault(
+                t1_id, snapshot.in_progress.get(t1_id, 0)
+            )
+            t1_target = _ceil(attempts * settings.t1_bpc_overbuild)
+            t1_from_stock = min(t1_target, t1_pool[t1_id])
+            t1_pool[t1_id] -= t1_from_stock
+            t1_from_flight = min(
+                t1_target - t1_from_stock, t1_flight_pool[t1_id]
+            )
+            t1_flight_pool[t1_id] -= t1_from_flight
+            runs_to_make = t1_target - t1_from_stock - t1_from_flight
+            t1 = {
+                "blueprint_id": t1_id,
+                "max_runs": max_runs,
+                "target": t1_target,
+                "from_stock": t1_from_stock,
+                "from_flight": t1_from_flight,
+                "runs_to_make": runs_to_make,
+                # copy JOBS to install, each at max runs
+                "to_make": math.ceil(runs_to_make / max_runs),
+            }
+
+        # Invention jobs group like copy jobs (user decision 2026-09-01):
+        # a job on a T1 copy runs up to the copy's max runs, one attempt
+        # per run. Relics have no T1 blueprint, so their job grouping is
+        # not modeled — attempts stand alone.
+        jobs = (
+            math.ceil(attempts / t1["max_runs"]) if t1 and attempts else
+            (0 if t1 else None)
+        )
+        sections.append(
+            {
+                "pipeline_id": pipeline_id,
+                "product_name": ref.type_info(final_id).name,
+                "t1_name": ref.type_info(source.t1_blueprint_id).name,
+                "is_relic": ref.is_relic_source(source.t1_blueprint_id),
+                "decryptor_name": decryptor.name if decryptor else None,
+                "probability": cost.probability,
+                "runs_per_copy": cost.runs_per_copy,
+                "invented_me": cost.me,
+                "invented_te": cost.te,
+                "cycle_copies": cycle_copies,
+                "target": target,
+                "from_stock": from_stock,
+                "from_flight": from_flight,
+                "flight_attempts_seen": flight_attempts,
+                "to_invent": to_invent,
+                "attempts": attempts,
+                "max_runs": t1["max_runs"] if t1 else None,
+                "jobs": jobs,
+                "covered": to_invent == 0,
+                "t1": t1,
+                "unpriced": cost.unpriced,
+                "attempt_cost": cost.attempt_cost,
+                "copy_fee": cost.copy_fee,
+                "cost_per_run": cost.cost_per_run,
+                "outlay": cost.attempt_cost * attempts,
+            }
+        )
+    for section in sections:
+        t1 = section["t1"]
+        if t1 and len(t1_owners.get(t1["blueprint_id"], [])) > 1:
+            # Keyed by pipeline_id, not name (a renamed SDE type would
+            # list the section itself).
+            t1["shared"] = [
+                name
+                for owner_id, name in t1_owners[t1["blueprint_id"]]
+                if owner_id != section["pipeline_id"]
+            ]
+        elif t1:
+            t1["shared"] = []
+
+    # One netting pass across ALL pipelines' input demand, so shared
+    # datacore/relic stock is never credited twice (the v1.22 rule). Like
+    # every other bought input (review 2026-09-01): the Raw Material
+    # Buffer inflates the need before netting, and a structure-venue buy
+    # whose cheap ladder is shorter than the buy is flagged shallow.
+    margin = settings.input_purchase_margin
+    buys: list[dict] = []
+    for type_id, raw_need in sorted(demand.items()):
+        gross = _ceil(raw_need * (1.0 + margin))
+        on_hand = snapshot.on_hand.get(type_id, 0)
+        in_flight = snapshot.in_progress.get(type_id, 0)
+        to_buy = max(0, gross - on_hand - in_flight)
+        venue = snapshot.venue(type_id)
+        units_cheaper = (
+            snapshot.structure_units_cheaper.get(type_id)
+            if venue == store.BUY_VENUE_STRUCTURE
+            else None
+        )
+        buys.append(
+            {
+                "type_id": type_id,
+                "name": ref.type_info(type_id).name,
+                "gross": gross,
+                "margin": margin,
+                "on_hand": on_hand,
+                "in_progress": in_flight,
+                "to_buy": to_buy,
+                "price": snapshot.price(type_id),
+                "venue": venue,
+                "region_wide": type_id in snapshot.region_wide,
+                "structure_units_cheaper": units_cheaper,
+                "shallow": units_cheaper is not None and to_buy > units_cheaper,
+            }
+        )
+    multibuy: dict[str, list[str]] = {}
+    for buy in buys:
+        if buy["to_buy"] <= 0:
+            continue
+        multibuy.setdefault(buy["venue"], []).append(
+            f"{buy['name']} {buy['to_buy']}"
+        )
+    return {
+        "sections": sections,
+        "buys": buys,
+        "buy_total": sum(
+            b["to_buy"] * (b["price"] or 0.0) for b in buys
+        ),
+        "buys_unpriced": sum(
+            1 for b in buys if b["to_buy"] > 0 and b["price"] is None
+        ),
+        "buys_shallow": sum(1 for b in buys if b["shallow"]),
+        "multibuy_hub": "\n".join(
+            multibuy.get(store.BUY_VENUE_HUB, [])
+        ),
+        "multibuy_structure": "\n".join(
+            multibuy.get(store.BUY_VENUE_STRUCTURE, [])
+        ),
+        "copy_jobs": [
+            s
+            for s in sections
+            if s["t1"] and s["t1"]["to_make"] > 0
+        ],
+        "total_outlay": sum(s["outlay"] for s in sections),
+    }
+
+
+def _invention_price_ids(conn, ref) -> tuple[set[int], set[int]]:
+    """(market ids, adjusted-only ids) that every CAPABLE pipeline's
+    invention choices can need — chosen or not, active or not, so
+    switching or enabling any choice prices immediately off the ordinary
+    cache (v1.22; multi-source since 2026-08-31). Market: ALL sources'
+    datacores, every relic source type itself, all decryptors.
+    Adjusted-only: each source's fee EIV base (the T1 blueprint's
+    manufacturing materials, or for a relic the INVENTED blueprint's —
+    spelled out because a capable INACTIVE pipeline's finals never
+    expand), which invention_cost prices through CCP adjusted prices
+    alone: the per-type order-book pull never needs them (review
+    2026-09-01 — an inactive capable pipeline's EIV materials cost ~7
+    wasted order-book requests per refresh)."""
+    market: set[int] = set()
+    adjusted: set[int] = set()
+    for pipeline in conn.execute(
+        "SELECT final_product_type_id FROM pipeline"
+    ):
+        sources = ref.invention_sources_for_product(
+            pipeline["final_product_type_id"]
+        )
+        if not sources:
+            continue
+        market.update(d.type_id for d in ref.decryptors())
+        for source in sources:
+            market.update(
+                m
+                for m, _qty in ref.materials(
+                    source.t1_blueprint_id, config.ACTIVITY_INVENTION
+                )
+            )
+            if ref.is_relic_source(source.t1_blueprint_id):
+                market.add(source.t1_blueprint_id)
+                eiv_blueprint = source.product_blueprint_id
+            else:
+                eiv_blueprint = source.t1_blueprint_id
+            adjusted.update(
+                m
+                for m, _qty in ref.materials(
+                    eiv_blueprint, config.ACTIVITY_MANUFACTURING
+                )
+            )
+    return market, adjusted
+
+
+def _add_alchemy_ids(conn, ref, ids: set[int]) -> None:
+    """With alchemy enabled, routes feeding a demanded composite add their
     formula inputs, unrefined product, and recovered outputs."""
-    ids = set(_expand_and_merge(conn, ref))
     if store.get_settings(conn).alchemy_enabled:
         for route in ref.alchemy_routes().values():
             if route.composite_id not in ids:
@@ -1254,7 +1680,34 @@ def demand_type_ids(conn, ref) -> set[int]:
                     route.formula.blueprint_id, route.formula.activity_id
                 )
             )
+
+
+def market_type_ids(conn, ref) -> set[int]:
+    """What the per-type ORDER-BOOK refresh must pull: the active
+    pipelines' demand (alchemy included) plus the invention market
+    inputs — never the adjusted-only EIV bases."""
+    ids = set(_expand_and_merge(conn, ref))
+    ids |= _invention_price_ids(conn, ref)[0]
+    _add_alchemy_ids(conn, ref, ids)
     return ids
+
+
+def demand_type_ids(conn, ref) -> set[int]:
+    """Every type planning may price — market_type_ids plus the
+    adjusted-only invention EIV bases: the cache-READ list for /run,
+    Planning and the price refresh's adjusted-price store."""
+    market, adjusted = _invention_price_ids(conn, ref)
+    ids = set(_expand_and_merge(conn, ref)) | market
+    _add_alchemy_ids(conn, ref, ids)
+    return ids | adjusted
+
+
+def invention_type_ids(conn, ref) -> set[int]:
+    """The Invention tab's price set — the invention inputs and their
+    EIV bases, a few dozen ids rather than the whole demand set (review
+    2026-09-01)."""
+    market, adjusted = _invention_price_ids(conn, ref)
+    return market | adjusted
 
 
 def _multi_cycle_overhang(job_ends: list, horizon: datetime) -> int:
@@ -1416,6 +1869,10 @@ def plan_index_run(
             _alchemy_pass(conn, ref, merged, snapshot)
         _finalize(conn, ref, merged, snapshot)
 
+    # v1.22/v1.23: the invention VINTAGE is taken once the allocation has
+    # converged (the pass adds nothing to the plan items).
+    invention = _invention_pass(conn, ref, merged, snapshot)
+
     index_run_id = None
     if persist:
         # The run number is assigned inside the INSERT itself: a separate
@@ -1509,8 +1966,39 @@ def plan_index_run(
                     for pipeline_id, qty in item.pipeline_share.items()
                 ],
             )
+        conn.executemany(
+            "INSERT INTO index_run_invention (index_run_id, pipeline_id, "
+            "t1_blueprint_id, decryptor_type_id, probability, invented_me, "
+            "invented_te, runs_per_copy, datacores, "
+            "decryptor_unit_price, invention_fee_per_attempt, "
+            "copy_fee_per_attempt, cost_per_run) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    index_run_id,
+                    row["pipeline_id"],
+                    row["t1_blueprint_id"],
+                    row["decryptor_type_id"],
+                    row["probability"],
+                    row["invented_me"],
+                    row["invented_te"],
+                    row["runs_per_copy"],
+                    row["datacores"],
+                    row["decryptor_unit_price"],
+                    row["invention_fee_per_attempt"],
+                    row["copy_fee_per_attempt"],
+                    row["cost_per_run"],
+                )
+                for row in invention.values()
+            ],
+        )
         conn.commit()
-    return Plan(index_run_id=index_run_id, run_number=run_number, items=merged)
+    return Plan(
+        index_run_id=index_run_id,
+        run_number=run_number,
+        items=merged,
+        invention=invention,
+    )
 
 
 def _steady_output_qty(conn, plan: Plan, current: dict | None) -> dict | None:
