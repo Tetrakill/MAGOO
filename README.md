@@ -27,10 +27,7 @@ The plan is advisory; ESI is the ledger.
 
 Downloads live on the [releases page](https://github.com/Tetrakill/MAGOO/releases).
 
-> **No release yet.** The first tagged release puts both files there. Until
-> then, see *Running from source* below.
-
-Two downloads will be offered per release:
+Two downloads are offered per release:
 
 | Download | Use it when |
 | --- | --- |
