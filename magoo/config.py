@@ -141,13 +141,26 @@ SDE_DATASETS = (
 # --- Activity IDs ----------------------------------------------------------
 
 ACTIVITY_MANUFACTURING = 1
+ACTIVITY_COPYING = 5
+ACTIVITY_INVENTION = 8
 ACTIVITY_REACTION = 11
 
-# SDE activity names -> activity IDs. Only these two are imported; invention
-# and copying are out of scope (PROJECT.md §4).
+# SDE activity names -> activity IDs imported into ref_blueprint. Only these
+# two produce ITEM rows there; invention (v1.22) is imported separately into
+# ref_invention because its products are BLUEPRINT types and one source can
+# carry several — merging it here would poison blueprint_for_product.
 SDE_ACTIVITY_IDS = {
     "manufacturing": ACTIVITY_MANUFACTURING,
     "reaction": ACTIVITY_REACTION,
+}
+
+# Activities whose structure/rig bonuses land in ref_industry_modifier: the
+# two above plus the lab activities (v1.22) — invention and copy job fees
+# read the engineering complex's cost bonus (strEngCostBonus et al.).
+SDE_MODIFIER_ACTIVITY_IDS = {
+    **SDE_ACTIVITY_IDS,
+    "copying": ACTIVITY_COPYING,
+    "invention": ACTIVITY_INVENTION,
 }
 
 # --- Category IDs ----------------------------------------------------------
@@ -156,6 +169,10 @@ SDE_ACTIVITY_IDS = {
 # excluded from BOM demand or expansion will stockpile "Industry".
 CATEGORY_SKILL = 16
 CATEGORY_SHIP = 6
+# T3 subsystems. CCP's "Medium T2 Ships" rig target filter (8) spans
+# category 32 alongside the T2 cruiser groups, so subsystems share the
+# t2_ships facility setup (industry.classify_item, decision 2026-08-31).
+CATEGORY_SUBSYSTEM = 32
 # v1.9: Upwell structures (Citadels, Engineering Complexes, Refineries,
 # FLEX structures), their Standup rigs / service / weapon modules, and the
 # Structure Components commodity group — the Upwell/Standup/component
@@ -218,6 +235,14 @@ ITEM_CLASSES = (
     "structures",  # v1.9: categories 65/66 + Structure Components (536)
     "reactions",
     "other",
+    # v1.22: the labs where invention and T1 copy jobs are installed.
+    # Never returned by industry.classify_item — no PRODUCT classifies
+    # here; the invention cost math looks them up by name. Split into two
+    # rows 2026-08-31 (user request): copying has its own per-system cost
+    # index in game. On an existing database the copying row seeds from
+    # the invention row it used to share (store._seed_class_settings).
+    "invention",
+    "copying",
 )
 
 # Capital hulls: CCP's "Capital Ships" rig target filter (Dreadnought,
@@ -314,6 +339,14 @@ BLACKLIST_CATEGORIES = (
 RIG_ME_PERCENT = {"none": 0.0, "t1": -2.0, "t2": -2.4}
 RIG_TE_PERCENT = {"none": 0.0, "t1": -20.0, "t2": -24.0}
 
+# Lab rig JOB-COST magnitudes (v1.22, verified live SDE 2026-08-31):
+# every Standup Invention / Blueprint Copy / Laboratory Optimization rig —
+# M, L and XL alike — carries attributeEngRigCostBonus -10.0 (T1) / -12.0
+# (T2) on the standard engineering security bands (1.0/1.9/2.1). The
+# manufacturing/reaction rig families carry 0 there, which is why cost
+# rigs are modeled only for the lab activities.
+LAB_RIG_COST_PERCENT = {"none": 0.0, "t1": -10.0, "t2": -12.0}
+
 # Thukker component rigs (added 2026-08-21, verified live SDE): a lowsec
 # specialist family with its own security bands (0.1 highsec / 1.9 lowsec /
 # 0.1 null-WH) and a single tier. Their ME bonus splits by covered group:
@@ -403,3 +436,30 @@ MAX_JOB_SECONDS = 30 * 24 * 3600
 
 SCC_SURCHARGE = 0.04  # 4% (EVE University wiki)
 NPC_STATION_FACILITY_TAX = 0.0025  # 0.25% (EVE University wiki)
+
+# --- Invention (v1.22) -----------------------------------------------------
+
+# Invention and copying job fees use 2% of the T1 blueprint's manufacturing
+# EIV as the fee base (EVE University wiki; pending in-client verification
+# like SCC_SURCHARGE) — the caller scales EIV before job_install_cost.
+JOB_FEE_EIV_FRACTION = 0.02
+
+# An invented copy starts at ME 2 / TE 4; the decryptor's modifiers add to
+# these and to the base run count (invention product quantity).
+INVENTED_BASE_ME = 2
+INVENTED_BASE_TE = 4
+
+DATACORE_GROUP = 333
+DECRYPTOR_GROUP = 1304  # the 8 generic decryptors (published)
+
+# Decryptor dogma attribute NAMES, verbatim from the SDE — including CCP's
+# "Propability" typo. Do not "fix" the spelling.
+ATTR_INVENTION_PROB_MULT = "inventionPropabilityMultiplier"
+ATTR_INVENTION_ME_MOD = "inventionMEModifier"
+ATTR_INVENTION_TE_MOD = "inventionTEModifier"
+ATTR_INVENTION_RUN_MOD = "inventionMaxRunModifier"
+
+# The racial "* Encryption Methods" skills weigh /40 in the invention chance
+# (datacore sciences weigh /30) and get their own user-entered level;
+# industry._per_bp_skill_level routes them by this name suffix.
+SKILL_SUFFIX_ENCRYPTION = "Encryption Methods"

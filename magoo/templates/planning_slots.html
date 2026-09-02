@@ -25,8 +25,10 @@
 <div class="totals">
   <div class="stat">
     <span class="label">Mfg slots</span>
+    {# Structure comps ride under the Mfg slots count (user request
+       2026-09-01). #}
     <span class="value {% if mfg_over %}bad{% endif %}"
-          title="uncapped steady-state job demand / manufacturing pool">{{ mfg_demand }}<span class="sub">/ {{ settings.manufacturing_slots }}</span></span>
+          title="uncapped steady-state job demand / manufacturing pool{% if struct_builds or struct_buys %} · structure components each cycle: {{ struct_builds|length }} built in {{ struct_slots }} slot{{ 's' if struct_slots != 1 }} · {{ struct_buys|length }} bought{% endif %}">{{ mfg_demand }}<span class="sub">/ {{ settings.manufacturing_slots }}{% if struct_builds %} · {{ struct_slots }} in structure comps{% endif %}</span></span>
   </div>
   <div class="stat">
     <span class="label">Reaction slots</span>
@@ -41,12 +43,6 @@
     <span class="label">Chain</span>
     <span class="value">{{ rows|length }}<span class="sub">items</span></span>
   </div>
-  {% if struct_builds or struct_buys %}
-  <div class="stat">
-    <span class="label">Structure comps</span>
-    <span class="value" title="structure component types built / bought each cycle">{{ struct_builds|length }}<span class="sub">built · {{ struct_buys|length }} bought</span></span>
-  </div>
-  {% endif %}
   {% if buys_unpriced or structure_buys %}
   <div class="stat">
     <span class="label">&nbsp;</span>
@@ -69,8 +65,9 @@
 </div>
 {% endif %}
 
-<h2>Replacement materials <span class="muted">— {{ buys|length }} items each cycle,
-  <span title="{{ buy_total|isk }} ISK">{{ buy_total|isk_short }}</span></span></h2>
+<details class="section" open data-key="buy">
+<summary><h2>Replacement materials <span class="muted">— {{ buys|length }} items each cycle,
+  <span title="{{ buy_total|isk }} ISK">{{ buy_total|isk_short }}</span></span></h2></summary>
 {% if buys %}
 <div class="tablewrap">
 <table class="sortable aligned">
@@ -97,33 +94,35 @@
 </table>
 </div>
 {% else %}<p class="muted">Nothing to buy.</p>{% endif %}
+</details>
 
-<h2>Manufacturing jobs <span class="muted">— each cycle</span></h2>
+{# Built structure components are the "Structure Components" group in here
+   (2026-09-01); bought ones are in the materials list above. #}
+<details class="section" open data-key="mfg">
+<summary><h2>Manufacturing jobs <span class="muted">— each cycle: {{ m.job_stats(builds, plan_time=false) }}</span></h2></summary>
 {% if builds_grouped %}
 {% for category, group in builds_grouped %}
-<h3 class="subhead">{{ category }}
-  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
-  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+<details class="section" open data-key="mfg:{{ category|lower|replace(' ', '-') }}">
+<summary><h3 class="subhead">{{ category }}
+  <span class="muted">— {{ m.job_stats(group, plan_time=false) }}</span></h3></summary>
 {{ m.job_table(group, execution=false) }}
+</details>
 {% endfor %}
 {% else %}<p class="muted">No manufacturing jobs.</p>{% endif %}
+</details>
 
-{% if struct_builds %}
-<h2>Structure components <span class="muted">— {{ struct_builds|length }} built
-  each cycle ({{ struct_slots }} slots); bought ones are in the materials
-  list above</span></h2>
-{{ m.job_table(struct_builds, execution=false) }}
-{% endif %}
-
-<h2>Reaction jobs <span class="muted">— each cycle</span></h2>
+<details class="section" open data-key="reactions">
+<summary><h2>Reaction jobs <span class="muted">— each cycle: {{ m.job_stats(reactions, plan_time=false) }}</span></h2></summary>
 {% if reactions_grouped %}
 {% for category, group in reactions_grouped %}
-<h3 class="subhead">{{ category }}
-  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }},
-  {{ group|sum(attribute='jobs_allocated') }} slots</span></h3>
+<details class="section" open data-key="reactions:{{ category|lower|replace(' ', '-') }}">
+<summary><h3 class="subhead">{{ category }}
+  <span class="muted">— {{ m.job_stats(group, plan_time=false) }}</span></h3></summary>
 {{ m.job_table(group, execution=false) }}
+</details>
 {% endfor %}
 {% else %}<p class="muted">No reaction jobs.</p>{% endif %}
+</details>
 
 {% endif %}
 {% endblock %}

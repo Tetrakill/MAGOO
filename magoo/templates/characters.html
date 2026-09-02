@@ -80,7 +80,7 @@ off — the corporation table above already covers them.</p>
     <td class="muted">{{ c.expires_at or 'no token' }}</td>
     <td><form class="inline" method="post"
           action="{{ url_for('character_delete', character_id=c.character_id) }}"
-          onsubmit="return confirm('Remove {{ c.character_name }} from Magoo? Its saved login is deleted and it stops contributing to plans. You can add it back by logging in again.')">
+          data-confirm="Remove {{ c.character_name }} from Magoo? Its saved login is deleted and it stops contributing to plans. You can add it back by logging in again.">
           <button class="mini danger"
             title="delete this character's saved login and remove it from the pool">remove</button></form></td>
   </tr>

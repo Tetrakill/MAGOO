@@ -74,6 +74,22 @@ h3.subhead { font-size: .85rem; font-weight: 600; margin: 1.1rem 0 .3rem;
              color: var(--text); border-bottom: 1px solid var(--line); padding-bottom: .25rem; }
 h3.subhead::before { content: "▸"; color: var(--accent); margin-right: .4rem; }
 h3.subhead .muted { font-weight: 400; }
+/* Collapsible sections (2026-09-01): every h2 section and h3 category
+   group on the data tabs is a native <details class="section">, open by
+   default; the heading IS the summary and its marker shows the state
+   (▾ open / ▸ closed — the subhead's accent marker turns, the h2 gets a
+   dim one). Closed state persists per page + data-key (localStorage). */
+details.section > summary { list-style: none; cursor: pointer; }
+details.section > summary::-webkit-details-marker { display: none; }
+details.section > summary > h2, details.section > summary > h3.subhead { display: block; }
+details.section > summary > h2::before { content: "▾"; color: var(--dim); margin-right: .4rem;
+                                          display: inline-block; width: .8em; }
+details.section:not([open]) > summary > h2::before { content: "▸"; }
+details.section > summary > h3.subhead::before { content: "▾"; }
+details.section:not([open]) > summary > h3.subhead::before { content: "▸"; }
+details.section > summary:hover > h2::before { color: var(--text); }
+details.section > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px;
+                                          border-radius: var(--r-btn); }
 a { color: var(--accent); }
 .muted { color: var(--dim); }
 .pagehead { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: .6rem; }
@@ -284,6 +300,17 @@ h2 .muted { font-weight: 400; font-size: .9rem; }
 table.profit td, table.profit th { width: 1%; white-space: nowrap; }
 table.profit td.tagcol, table.profit th.tagcol { width: auto; padding-left: 1rem; }
 table.profit td.num, table.profit th.num { padding-left: 1.1rem; }
+/* pipelines table: the same content-packing — the four small figure
+   inputs shrink to their digits, the actions column absorbs the slack */
+table.pipelines td, table.pipelines th { width: 1%; white-space: nowrap; }
+table.pipelines td.actions, table.pipelines th.actions { width: auto; }
+table.pipelines td.num input { width: 4rem; }
+table.pipelines td.num input.isk { width: 7rem; }
+table.pipelines td.actions form.inline + form.inline { margin-left: .3rem; }
+/* a multi-source final (relic tier + decryptor) stacks its two selects:
+   side by side they would widen the Invention column for every row and
+   push the table past the page */
+table.pipelines td form.inline:has(select + select) { display: inline-grid; gap: .2rem; }
 
 /* ---- settings page: side-nav + field grid + sticky save bar ---- */
 .settings { display: grid; grid-template-columns: 11rem minmax(0, 1fr); gap: 1.4rem; align-items: start; }
@@ -335,6 +362,15 @@ dialog.breakdown::backdrop { background: rgba(0, 0, 0, .6); }
 dialog.breakdown th { position: static; }
 .dialog-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
 .dialog-head h2 { margin: 0; }
+/* Confirmation dialog (2026-09-01): the one guard for destructive submits
+   (data-confirm forms) — window.confirm() is suppressed in embedded
+   browsers and silently cancelled the submit. */
+dialog.confirm { background: var(--panel); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.2rem;
+  max-width: min(30rem, 92vw); }
+dialog.confirm::backdrop { background: rgba(0, 0, 0, .6); }
+dialog.confirm p { margin: 0; line-height: 1.45; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: .9rem; }
 form.inline { display: inline; }
 textarea.multibuy { width: 100%; height: 10rem; font-family: var(--mono); font-size: .85rem; }
 details > summary { cursor: pointer; }
@@ -350,6 +386,42 @@ td.end { text-align: right; }
        box-shadow: 0 4px 14px rgba(0,0,0,.45); }
 </style>
 <script>
+// Confirmation guard (2026-09-01): a form with data-confirm="question" is
+// held back and asked through the shared <dialog id="confirm"> instead of
+// window.confirm(), which embedded browsers (the Claude Code Browser pane,
+// any WebView with dialogs suppressed) answer false instantly — silently
+// cancelling the submit. Capture phase, so the spinner listener below and
+// a page's own submit listeners only ever see the confirmed re-submit.
+document.addEventListener("submit", function (e) {
+  const form = e.target;
+  if (!(form instanceof HTMLFormElement) || !form.dataset.confirm) return;
+  if (form.dataset.confirmed) { delete form.dataset.confirmed; return; }
+  e.preventDefault();
+  e.stopPropagation();
+  const submitter = e.submitter;
+  const go = () => {
+    form.dataset.confirmed = "1";
+    try { form.requestSubmit(submitter || undefined); }
+    finally { delete form.dataset.confirmed; }
+  };
+  const dlg = document.getElementById("confirm");
+  if (!dlg || typeof dlg.showModal !== "function") {
+    if (window.confirm(form.dataset.confirm)) go();
+    return;
+  }
+  dlg.querySelector("#confirm-msg").textContent = form.dataset.confirm;
+  const yes = dlg.querySelector("#confirm-yes");
+  yes.textContent = form.dataset.confirmLabel
+    || (submitter && submitter.textContent.trim()) || "Confirm";
+  yes.className = "mini " + (submitter && submitter.classList.contains("danger") ? "danger" : "primary");
+  dlg.returnValue = "";
+  dlg.onclose = () => {
+    dlg.onclose = null;
+    if (dlg.returnValue === "yes") go();
+    else if (submitter) submitter.focus();
+  };
+  dlg.showModal();
+}, true);
 // Show a spinner over the submit button while the next page loads.
 document.addEventListener("submit", function (e) {
   const btn = e.submitter || e.target.querySelector("button[type=submit], button:not([type])");
@@ -389,6 +461,26 @@ function inlineSave(input) {
     })
     .catch(() => { announce("save failed — reloading"); input.form.submit(); });
 }
+
+// Collapsible sections: open by default; a section the user closed stays
+// closed on that page family (run ids normalised so run 62 and run 63
+// share state; the ?view= tab is part of the key so a run's Plan and
+// Chain views, which reuse section keys, do not share). Opening
+// re-measures aligned tables, which are skipped while hidden. Runs on
+// DOMContentLoaded (this script is in <head>) and is registered before
+// layoutAligned's listener so closed sections are hidden before measuring.
+document.addEventListener("DOMContentLoaded", () => {
+  const view = new URLSearchParams(location.search).get("view");
+  const page = location.pathname.replace(/\d+/g, "#") + (view ? "?view=" + view : "");
+  const keyOf = d => "section:" + page + ":" + d.dataset.key;
+  document.querySelectorAll("details.section[data-key]").forEach(d => {
+    try { if (localStorage.getItem(keyOf(d)) === "closed") d.open = false; } catch {}
+    d.addEventListener("toggle", () => {
+      try { localStorage.setItem(keyOf(d), d.open ? "open" : "closed"); } catch {}
+      if (d.open && typeof layoutAligned === "function") layoutAligned();
+    });
+  });
+});
 
 // Aligned tables (run Plan/Chain): size the Item column to the longest
 // item name on the page, then make every table the same width by flexing
@@ -623,6 +715,10 @@ document.addEventListener("DOMContentLoaded", function () {
     <a href="{{ url_for('planning') }}"
        title="what-if views at today's prices — nothing saved"
        {% if ep == 'planning' %}aria-current="page" class="active"{% endif %}>Planning</a>
+    {# ep == exactly: endpoint 'pipeline_invention' must not light this up #}
+    <a href="{{ url_for('invention') }}"
+       title="live BPC stockpile — what to invent, copy and buy, from current stock and in-flight lab jobs; nothing saved"
+       {% if ep == 'invention' %}aria-current="page" class="active"{% endif %}>Invention</a>
     <a href="{{ url_for('runs') }}"
        title="each index run is one planned cycle: a buy list and the jobs to install"
        {% if ep.startswith('run') %}aria-current="page" class="active"{% endif %}>Index Runs</a>
@@ -659,5 +755,14 @@ document.addEventListener("DOMContentLoaded", function () {
   {% endfor %}
   {% block content %}{% endblock %}
 </main>
+{# Shared confirmation dialog — see the submit guard in the head script.
+   Cancel comes first so it takes focus; Escape cancels natively. #}
+<dialog id="confirm" class="confirm" aria-labelledby="confirm-msg">
+  <p id="confirm-msg"></p>
+  <div class="dialog-actions">
+    <button type="button" class="mini" onclick="this.closest('dialog').close('no')">Cancel</button>
+    <button type="button" class="mini primary" id="confirm-yes" onclick="this.closest('dialog').close('yes')">Confirm</button>
+  </div>
+</dialog>
 </body>
 </html>

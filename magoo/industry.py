@@ -61,6 +61,12 @@ def classify_item(ref, type_id: int, activity_id: int | None = None) -> str:
         # >= not ==: techLevel-3 Strategic Cruisers deliberately share the
         # t2_ships facility setup (decision 2026-08-20) — do not "fix".
         return "t2_ships" if tech >= 2.0 else "t1_ships"
+    if info.category_id == config.CATEGORY_SUBSYSTEM:
+        # T3 subsystems deliberately share the t2_ships facility setup:
+        # CCP's "Medium T2 Ships" rig filter (8) covers category 32 the
+        # same way the >= above keeps techLevel-3 hulls in t2_ships
+        # (decision 2026-08-31) — do not "fix".
+        return "t2_ships"
     if info.group_id in config.BASIC_CAPITAL_COMPONENT_GROUPS:
         return "basic_capital_components"
     if info.group_id in config.ADVANCED_COMPONENT_GROUPS:
@@ -111,7 +117,26 @@ def rig_multiplier(
 
     group_id is the PRODUCT's group: the Thukker tier's ME magnitude splits
     by covered group (-3.7% for capital-component groups, the standard
-    -2.0% for plain T2/T3 components) — see config's Thukker constants."""
+    -2.0% for plain T2/T3 components) — see config's Thukker constants.
+
+    Cost rigs exist only in the lab families (v1.22): the invention and
+    copying classes' single asserted tier (stored in me_rig) is their
+    Standup Invention/Copy/Laboratory Optimization rig, -10%/-12% job cost
+    on the engineering security bands. Manufacturing/reaction rig families
+    carry a zero cost bonus, so every other activity's cost multiplier
+    stays 1.0 here."""
+    if kind == "cost":
+        if activity_id not in (
+            config.ACTIVITY_INVENTION,
+            config.ACTIVITY_COPYING,
+        ):
+            return 1.0
+        pct = config.LAB_RIG_COST_PERCENT.get(setting.me_rig, 0.0)
+        if not pct:
+            return 1.0
+        return 1.0 + (
+            pct * config.rig_security_multiplier(setting.security, activity_id)
+        ) / 100.0
     tier = (
         setting.me_rig
         if kind == "material"
@@ -179,19 +204,25 @@ class SkillLevels:
     science: int = 5
     # v1.9 (appended last: tests construct SkillLevels positionally)
     outpost_construction: int = 5
+    # v1.22 (appended last, same rule): racial "* Encryption Methods" level
+    # for the invention chance — datacore sciences ride the two levels above.
+    encryption: int = 5
 
 
 def _per_bp_skill_level(skill_name: str, skills: SkillLevels) -> int:
     """Which user-entered level covers a required science/construction
     skill, by name family. Outpost Construction (Upwell structures, Standup
     modules, structure fighters) has its own level since v1.9 — before
-    that it silently rode on the science level."""
+    that it silently rode on the science level; the racial Encryption
+    Methods skills (invention chance, v1.22) likewise get their own."""
     if skill_name == config.SKILL_NAME_OUTPOST_CONSTRUCTION:
         return skills.outpost_construction
     if skill_name.endswith("Ship Construction"):
         return skills.adv_ship_construction
     if skill_name.endswith("Starship Engineering"):
         return skills.starship_engineering
+    if skill_name.endswith(config.SKILL_SUFFIX_ENCRYPTION):
+        return skills.encryption
     return skills.science
 
 
@@ -226,6 +257,61 @@ def skill_time_multiplier(
         )
         mult *= 1.0 + (per_level * level) / 100.0
     return mult
+
+
+# ---------------------------------------------------------------------------
+# Invention (v1.22 — pure math; the caller assembles prices and settings)
+# ---------------------------------------------------------------------------
+
+
+def invention_probability(
+    base: float,
+    science_levels,
+    encryption_level: int,
+    prob_mult: float = 1.0,
+) -> float:
+    """Invention success chance: base x (1 + Σ science/30 + encryption/40)
+    x decryptor multiplier, capped at certainty. science_levels carries one
+    entry per required datacore science skill (two in practice), each
+    resolved through _per_bp_skill_level's name families.
+
+    Rounded to 12 places (review 2026-09-01): the float product lands one
+    ulp below exact fractions such as 7/16 (base 0.30, all-V, no
+    decryptor), and the engine's ceil/floor sizing then misrounds by a
+    whole attempt at every multiple of the fraction."""
+    return min(
+        1.0,
+        round(
+            base
+            * (1.0 + sum(science_levels) / 30.0 + encryption_level / 40.0)
+            * prob_mult,
+            12,
+        ),
+    )
+
+
+def invented_bpc(
+    base_runs: int, me_mod: int = 0, te_mod: int = 0, run_mod: int = 0
+) -> tuple[int, int, int]:
+    """(me, te, runs) of an invented copy: ME 2 / TE 4 plus the decryptor's
+    modifiers; runs = the invention product quantity plus the decryptor's
+    run modifier. The clamps guard against data drift only — no in-game
+    combination lands below ME 0 / TE 0 / 1 run today."""
+    return (
+        max(0, config.INVENTED_BASE_ME + me_mod),
+        max(0, config.INVENTED_BASE_TE + te_mod),
+        max(1, base_runs + run_mod),
+    )
+
+
+def invention_cost_per_run(
+    attempt_cost: float, probability: float, runs_per_copy: int
+) -> float:
+    """Expected invention ISK per licensed run: each attempt succeeds with
+    chance `probability` and a success licenses runs_per_copy runs. The
+    caller guarantees probability > 0 (base probabilities in data are all
+    positive and the skill factor only raises them)."""
+    return attempt_cost / (probability * runs_per_copy)
 
 
 # ---------------------------------------------------------------------------

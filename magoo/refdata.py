@@ -39,6 +39,31 @@ class Blueprint:
 
 
 @dataclass(frozen=True)
+class InventionSource:
+    """One invention edge: a T1 blueprint (or relic) whose activity-8
+    products include this blueprint type, at a base probability, yielding
+    `runs` licensed runs per invented copy (before decryptor modifiers)."""
+
+    t1_blueprint_id: int
+    product_blueprint_id: int
+    probability: float
+    runs: int
+
+
+@dataclass(frozen=True)
+class Decryptor:
+    """A generic decryptor and its invention modifiers (dogma attrs
+    1112/1113/1114/1124 — note CCP's 'Propability' spelling in the name)."""
+
+    type_id: int
+    name: str
+    prob_mult: float
+    me_mod: int
+    te_mod: int
+    run_mod: int
+
+
+@dataclass(frozen=True)
 class AlchemyRoute:
     """An alternate supply route for a composite: run the unrefined reaction
     formula, then reprocess its product into the composite plus recovered
@@ -63,6 +88,11 @@ class Refdata:
         self._modifiers: dict[tuple[int, int], tuple] = {}
         self._reprocess: dict[int, tuple] = {}
         self._alchemy_routes: dict[int, AlchemyRoute] | None = None
+        self._invention_sources: dict[int, tuple[InventionSource, ...]] = {}
+        self._decryptors: tuple[Decryptor, ...] | None = None
+        self._is_relic: dict[int, bool] = {}
+        self._max_runs: dict[int, int] = {}
+        self._invention_products: set[int] | None = None
 
     def close(self) -> None:
         self.conn.close()
@@ -188,6 +218,156 @@ class Refdata:
                 )
             )
         return self._materials[key]
+
+    # -- invention (v1.22) -----------------------------------------------
+
+    def invention_sources(
+        self, product_blueprint_id: int
+    ) -> tuple[InventionSource, ...]:
+        """Every invention edge producing this blueprint type. Empty for
+        non-invented blueprints, and on a pre-v1.22 database where the
+        ref_invention table does not exist yet (re-import to populate)."""
+        if product_blueprint_id not in self._invention_sources:
+            try:
+                rows = self.conn.execute(
+                    "SELECT * FROM ref_invention "
+                    "WHERE product_blueprint_id = ? ORDER BY blueprint_id",
+                    (product_blueprint_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            self._invention_sources[product_blueprint_id] = tuple(
+                InventionSource(
+                    row["blueprint_id"],
+                    row["product_blueprint_id"],
+                    row["probability"],
+                    row["runs"],
+                )
+                for row in rows
+            )
+        return self._invention_sources[product_blueprint_id]
+
+    def invention_sources_for_product(
+        self, product_type_id: int
+    ) -> tuple[InventionSource, ...]:
+        """Every invention edge behind the blueprint that manufactures
+        product_type_id, highest probability first (Intact before
+        Malfunctioning before Wrecked; the multi-T1 targets' equal
+        probabilities fall back to blueprint_id for determinism). Empty
+        when the product is not buildable or not invented."""
+        bp = self.blueprint_for_product(product_type_id)
+        if bp is None or bp.activity_id != config.ACTIVITY_MANUFACTURING:
+            return ()
+        return tuple(
+            sorted(
+                self.invention_sources(bp.blueprint_id),
+                key=lambda s: (-s.probability, s.t1_blueprint_id),
+            )
+        )
+
+    def invention_source_for_product(
+        self, product_type_id: int, chosen_blueprint_id: int | None = None
+    ) -> InventionSource | None:
+        """The source to PLAN with: the single source when only one exists
+        (chosen ignored — heals drift where a multi-source target became
+        single-source); else the source matching the pipeline's stored
+        choice. None when the product is uninvented, or multi-source with
+        no/invalid choice — the stale-config path (bpc fallback)."""
+        sources = self.invention_sources_for_product(product_type_id)
+        if len(sources) == 1:
+            return sources[0]
+        for source in sources:
+            if source.t1_blueprint_id == chosen_blueprint_id:
+                return source
+        return None
+
+    def max_runs(self, blueprint_id: int) -> int:
+        """The blueprint's maxProductionLimit — the licensed runs a single
+        COPY of it can carry (the copy-job ceiling; manufacturing ignores
+        it). 1 when unknown, so a copy always holds at least one run."""
+        if blueprint_id not in self._max_runs:
+            row = self.conn.execute(
+                "SELECT max_runs FROM ref_blueprint WHERE blueprint_id = ? "
+                "AND activity_id = ?",
+                (blueprint_id, config.ACTIVITY_MANUFACTURING),
+            ).fetchone()
+            self._max_runs[blueprint_id] = (
+                max(1, int(row["max_runs"] or 1)) if row else 1
+            )
+        return self._max_runs[blueprint_id]
+
+    def is_invention_product(self, blueprint_type_id: int) -> bool:
+        """True when this blueprint type is INVENTED (a ref_invention
+        product — T2/T3 blueprints). ESI uses it to keep a copy job on a
+        T2 blueprint original out of the invention-attempts pool
+        (review 2026-09-01). Empty on a pre-v1.22 database."""
+        if self._invention_products is None:
+            try:
+                self._invention_products = {
+                    row["product_blueprint_id"]
+                    for row in self.conn.execute(
+                        "SELECT DISTINCT product_blueprint_id FROM ref_invention"
+                    )
+                }
+            except sqlite3.OperationalError:
+                self._invention_products = set()
+        return blueprint_type_id in self._invention_products
+
+    def is_relic_source(self, t1_blueprint_id: int) -> bool:
+        """True when the invention source is a relic — an ITEM consumed
+        per attempt, not a blueprint: relics carry no ref_blueprint rows
+        at all (the defining signature; live data has zero mixed
+        relic+BPO targets and zero single-source relic targets)."""
+        if t1_blueprint_id not in self._is_relic:
+            row = self.conn.execute(
+                "SELECT 1 FROM ref_blueprint WHERE blueprint_id = ? LIMIT 1",
+                (t1_blueprint_id,),
+            ).fetchone()
+            self._is_relic[t1_blueprint_id] = row is None
+        return self._is_relic[t1_blueprint_id]
+
+    def decryptors(self) -> tuple[Decryptor, ...]:
+        """The generic decryptors (group 1304, published), by name."""
+        if self._decryptors is None:
+            rows = self.conn.execute(
+                "SELECT type_id, name FROM ref_type "
+                "WHERE group_id = ? AND published = 1 ORDER BY name",
+                (config.DECRYPTOR_GROUP,),
+            ).fetchall()
+            self._decryptors = tuple(
+                Decryptor(
+                    row["type_id"],
+                    row["name"],
+                    float(
+                        self.attribute_by_name(
+                            row["type_id"], config.ATTR_INVENTION_PROB_MULT, 1.0
+                        )
+                    ),
+                    int(
+                        self.attribute_by_name(
+                            row["type_id"], config.ATTR_INVENTION_ME_MOD, 0.0
+                        )
+                    ),
+                    int(
+                        self.attribute_by_name(
+                            row["type_id"], config.ATTR_INVENTION_TE_MOD, 0.0
+                        )
+                    ),
+                    int(
+                        self.attribute_by_name(
+                            row["type_id"], config.ATTR_INVENTION_RUN_MOD, 0.0
+                        )
+                    ),
+                )
+                for row in rows
+            )
+        return self._decryptors
+
+    def decryptor(self, type_id: int) -> Decryptor | None:
+        for d in self.decryptors():
+            if d.type_id == type_id:
+                return d
+        return None
 
     # -- reprocessing / alchemy ------------------------------------------
 

@@ -250,6 +250,21 @@ CREATE TABLE ref_blueprint_skill (
     level         INTEGER NOT NULL,
     PRIMARY KEY (blueprint_id, activity_id, skill_type_id)
 );
+-- Invention (activity 8, v1.22): which T1 blueprint invents which T2/T3
+-- blueprint, at what base probability, and how many licensed runs each
+-- invented copy carries. Datacores live in ref_blueprint_material and the
+-- required skills in ref_blueprint_skill, both at activity_id 8. NEVER
+-- merged into ref_blueprint: invention products are blueprint TYPES, one
+-- source can carry several, and blueprint_for_product picks MIN(activity_id).
+CREATE TABLE ref_invention (
+    blueprint_id         INTEGER NOT NULL,  -- T1 source blueprint (or relic)
+    product_blueprint_id INTEGER NOT NULL,  -- invented blueprint type
+    probability          REAL NOT NULL,
+    runs                 INTEGER NOT NULL,  -- base runs per invented copy
+    time                 INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (blueprint_id, product_blueprint_id)
+);
+CREATE INDEX idx_ref_invention_product ON ref_invention (product_blueprint_id);
 CREATE TABLE ref_type_attribute (
     type_id        INTEGER NOT NULL,
     attribute_id   INTEGER NOT NULL,
@@ -312,6 +327,7 @@ REF_TABLES = (
     "ref_blueprint",
     "ref_blueprint_material",
     "ref_blueprint_skill",
+    "ref_invention",
     "ref_type_attribute",
     "ref_dogma_attribute",
     "ref_industry_modifier",
@@ -391,17 +407,22 @@ def _import_types(conn, records) -> int:
     return len(rows)
 
 
-def _import_blueprints(conn, records) -> tuple[int, int]:
-    """Import manufacturing and reaction activities only (PROJECT.md §4).
+def _import_blueprints(conn, records) -> tuple[int, int, int]:
+    """Import manufacturing and reaction activities (PROJECT.md §4), plus
+    invention (v1.22) into its own ref_invention table.
 
-    Skips: activities other than manufacturing/reaction, activities with no
-    products, materials in the skill category (16) — skills are
-    prerequisites, not demand — and blueprints whose blueprint TYPE is
-    unpublished (the SDE carries internal junk like "Test Reaction
-    Blueprint" producing real products; picking it silently corrupts BOM
-    quantities). Non-consumed materials are imported with consumed=0 so BOM
-    expansion can exclude them from deficits while still knowing they must
-    be on hand.
+    Skips: research/copying activities, activities with no products,
+    materials in the skill category (16) — skills are prerequisites, not
+    demand — and blueprints whose blueprint TYPE is unpublished (the SDE
+    carries internal junk like "Test Reaction Blueprint" producing real
+    products; picking it silently corrupts BOM quantities). Non-consumed
+    materials are imported with consumed=0 so BOM expansion can exclude
+    them from deficits while still knowing they must be on hand.
+
+    Invention rows additionally skip products with no probability or an
+    unpublished product blueprint type (both only occur together in the
+    live data); a source whose products are all skipped contributes no
+    material/skill rows either.
     """
     skill_type_ids = {
         row["type_id"]
@@ -416,13 +437,57 @@ def _import_blueprints(conn, records) -> tuple[int, int]:
             "SELECT type_id FROM ref_type WHERE published = 0"
         )
     }
-    bp_rows, mat_rows, skill_rows = [], [], []
+    bp_rows, mat_rows, skill_rows, inv_rows = [], [], [], []
     for r in records:
         bp_id = _record_id(r, "blueprintTypeID")
         if bp_id in unpublished:
             continue
         max_runs = _first(r, "maxProductionLimit")
         activities = _first(r, "activities", default={}) or {}
+
+        invention = activities.get("invention")
+        if invention:
+            products = []
+            for product in invention.get("products") or []:
+                probability = _first(product, "probability")
+                product_id = int(_first(product, "typeID", "typeId", "type_id"))
+                if probability is None or product_id in unpublished:
+                    continue
+                products.append(
+                    (
+                        bp_id,
+                        product_id,
+                        float(probability),
+                        int(_first(product, "quantity", default=1)),
+                        int(_first(invention, "time", default=0)),
+                    )
+                )
+            if products:
+                inv_rows.extend(products)
+                for skill in invention.get("skills") or []:
+                    skill_rows.append(
+                        (
+                            bp_id,
+                            config.ACTIVITY_INVENTION,
+                            int(_first(skill, "typeID", "typeId", "type_id")),
+                            int(_first(skill, "level", default=1)),
+                        )
+                    )
+                for material in invention.get("materials") or []:
+                    mat_id = int(_first(material, "typeID", "typeId", "type_id"))
+                    if mat_id in skill_type_ids:
+                        continue
+                    consumed = _first(material, "consumed", default=True)
+                    mat_rows.append(
+                        (
+                            bp_id,
+                            config.ACTIVITY_INVENTION,
+                            mat_id,
+                            int(_first(material, "quantity", default=0)),
+                            1 if consumed else 0,
+                        )
+                    )
+
         for act_name, act_id in config.SDE_ACTIVITY_IDS.items():
             activity = activities.get(act_name)
             if not activity:
@@ -475,7 +540,10 @@ def _import_blueprints(conn, records) -> tuple[int, int]:
         "INSERT OR REPLACE INTO ref_blueprint_skill VALUES (?, ?, ?, ?)",
         skill_rows,
     )
-    return len(bp_rows), len(mat_rows)
+    conn.executemany(
+        "INSERT INTO ref_invention VALUES (?, ?, ?, ?, ?)", inv_rows
+    )
+    return len(bp_rows), len(mat_rows), len(inv_rows)
 
 
 def _import_type_attributes(conn, dogma_records, type_dogma_records) -> int:
@@ -523,12 +591,14 @@ def _import_industry_modifiers(conn, sources_records, filters_records):
 
     industryTargetFilters: filter_id -> category IDs and/or group IDs.
 
-    Only manufacturing and reaction activities are kept.
+    Manufacturing, reaction, and (v1.22) the lab activities — invention and
+    copying — are kept; their cost/time bonuses drive the invention job-fee
+    math through the same structure_multiplier machinery.
     """
     mod_rows = []
     for r in sources_records:
         source_type_id = _record_id(r)
-        for act_name, act_id in config.SDE_ACTIVITY_IDS.items():
+        for act_name, act_id in config.SDE_MODIFIER_ACTIVITY_IDS.items():
             activity = r.get(act_name)
             if not activity:
                 continue
@@ -653,9 +723,12 @@ def run_import(force: bool = False, progress=None) -> bool:
             n = _import_types(conn, _read_dataset(zf, "types"))
             log.info(f"  ref_type                {n:>9,}")
             step(4, "blueprints")
-            n_bp, n_mat = _import_blueprints(conn, _read_dataset(zf, "blueprints"))
+            n_bp, n_mat, n_inv = _import_blueprints(
+                conn, _read_dataset(zf, "blueprints")
+            )
             log.info(f"  ref_blueprint           {n_bp:>9,}")
             log.info(f"  ref_blueprint_material  {n_mat:>9,}")
+            log.info(f"  ref_invention           {n_inv:>9,}")
             step(5, "dogma attributes")
             n = _import_type_attributes(
                 conn,
@@ -703,10 +776,14 @@ class ImportJob:
     done/error; while running the run_import progress events above are
     merged in; "done" carries "changed", "error" carries "error"."""
 
-    def __init__(self, runner=None):
+    def __init__(self, runner=None, on_imported=None):
         # None = late-bind to this module's run_import at start time, so
         # tests that monkeypatch sdeimport.run_import are honored.
+        # on_imported: called on the worker thread after a build actually
+        # changed (the web app re-derives invention pipelines' materialised
+        # runs/ME/TE from the new data — review 2026-09-01).
         self._runner = runner
+        self._on_imported = on_imported
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._status: dict = {"state": "idle"}
@@ -754,6 +831,8 @@ class ImportJob:
         runner = self._runner or run_import
         try:
             changed = runner(force=force, progress=self._emit)
+            if changed and self._on_imported is not None:
+                self._on_imported()
             self._emit({"state": "done", "changed": bool(changed)})
         except Exception as exc:  # shown in the UI, never a raw 500
             self._emit(

@@ -31,13 +31,21 @@
 
 {% if pipelines %}
 <div class="tablewrap">
-<table>
+<table class="pipelines">
   <thead><tr><th>Product</th><th class="num">Qty / run</th>
       <th class="num">Runs / BPC</th>
       <th class="num">ME</th><th class="num">TE</th>
+      <th>Invention</th>
       <th class="num">BPC cost (ISK)</th><th>Status</th>
-      <th>Created</th><th></th></tr></thead>
+      <th>Created</th><th class="actions"></th></tr></thead>
   {% for p in pipelines %}
+  {% set inv = invention.get(p.pipeline_id) %}
+  {# invented: the runs/ME/TE cells hold materialized values (badge them
+     even when stale); computed: the invention COST is live-computed, so
+     the manual BPC-cost input is ignored — not true for a stale config,
+     whose costing falls back to it. #}
+  {% set invented = inv and p.use_invention %}
+  {% set computed = invented and not inv.stale %}
   <tr>
     <td>{{ p.product_name }}</td>
     <td class="num">
@@ -48,32 +56,117 @@
                onchange="inlineSave(this)">
       </form>
     </td>
-    <td class="num">{{ p.runs_per_bpc if p.runs_per_bpc else '—' }}</td>
-    <td class="num">{{ p.me_level if p.me_level is not none else '—' }}</td>
-    <td class="num">{{ p.te_level if p.te_level is not none else '—' }}</td>
+    {# Invention on: the three values are materialized from the choice —
+       read-only with a uniform, non-wrapping badge. Off: inline-editable
+       like Qty and BPC cost (2026-09-01; the paste still sets them too). #}
+    {% if invented %}
+    <td class="num">{{ p.runs_per_bpc if p.runs_per_bpc else '—' }}
+      <span class="badge" title="derived from the invention choice">inv</span></td>
+    <td class="num">{{ p.me_level if p.me_level is not none else '—' }}
+      <span class="badge" title="derived from the invention choice">inv</span></td>
+    <td class="num">{{ p.te_level if p.te_level is not none else '—' }}
+      <span class="badge" title="derived from the invention choice">inv</span></td>
+    {% else %}
+    <td class="num">
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_runs_per_bpc', pipeline_id=p.pipeline_id) }}">
+        <input name="runs_per_bpc" type="number" min="1" placeholder="—"
+               value="{{ p.runs_per_bpc if p.runs_per_bpc else '' }}"
+               aria-label="Runs per BPC — {{ p.product_name }}"
+               title="runs on the final's blueprint copy: caps runs per job and
+               is the ship batch unit; blank = uncapped (BPO / ample copies)"
+               onchange="inlineSave(this)">
+      </form>
+    </td>
+    <td class="num">
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_me_te', pipeline_id=p.pipeline_id) }}">
+        <input name="me" type="number" min="0" max="10"
+               value="{{ p.me_level if p.me_level is not none else '' }}"
+               aria-label="ME — {{ p.product_name }}"
+               title="the final's blueprint ME (0-10)" onchange="inlineSave(this)">
+      </form>
+    </td>
+    <td class="num">
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_me_te', pipeline_id=p.pipeline_id) }}">
+        <input name="te" type="number" min="0" max="20"
+               value="{{ p.te_level if p.te_level is not none else '' }}"
+               aria-label="TE — {{ p.product_name }}"
+               title="the final's blueprint TE (0-20)" onchange="inlineSave(this)">
+      </form>
+    </td>
+    {% endif %}
+    <td>
+      {% if inv and inv.stale %}
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_invention', pipeline_id=p.pipeline_id) }}">
+        {# requestSubmit(), not submit(): only it fires the submit event the
+           scroll-restore script and the loading spinner listen for
+           (review 2026-09-01). #}
+        <select name="decryptor" onchange="this.form.requestSubmit()"
+                aria-label="Invention decryptor — {{ p.product_name }}"
+                title="this product's invention source or decryptor no longer
+                resolves (SDE change) — costing falls back to the BPC cost;
+                turn Off to restore the manual runs/ME/TE">
+          <option value="{{ inv.current }}" selected>stale — source or decryptor gone</option>
+          <option value="off">Off</option>
+        </select>
+      </form>
+      {% elif inv %}
+      <form class="inline" method="post"
+            action="{{ url_for('pipeline_invention', pipeline_id=p.pipeline_id) }}">
+        {% if inv.sources %}
+        <select name="source"
+                onchange="if (this.form.decryptor.value !== 'off') this.form.requestSubmit()"
+                aria-label="Invention source — {{ p.product_name }}"
+                title="invent from this relic or blueprint — the tier sets
+                the chance and the copy's licensed runs">
+          {% for s in inv.sources %}
+          <option value="{{ s.value }}" {{ 'selected' if inv.current_source == s.value }}>{{ s.label }}</option>
+          {% endfor %}
+        </select>
+        {% endif %}
+        <select name="decryptor" onchange="this.form.requestSubmit()"
+                aria-label="Invention decryptor — {{ p.product_name }}"
+                title="invent the BPC from {{ inv.t1_name }} — the choice
+                overrides runs/BPC, ME and TE">
+          <option value="off" {{ 'selected' if inv.current == 'off' }}>Off</option>
+          {% for o in inv.options %}
+          <option value="{{ o.value }}" {{ 'selected' if inv.current == o.value }}>{{ o.label }}</option>
+          {% endfor %}
+        </select>
+      </form>
+      {% else %}<span class="muted" title="the product's blueprint has no
+        invention source (T1 items and anything not invented)">—</span>{% endif %}
+    </td>
     <td class="num">
       <form class="inline" method="post"
             action="{{ url_for('pipeline_bpc_cost', pipeline_id=p.pipeline_id) }}">
-        <input name="bpc_cost" type="number" min="0" step="1000"
+        <input name="bpc_cost" type="number" min="0" step="1000" class="isk"
                value="{{ p.bpc_cost_isk or 0 }}"
                aria-label="BPC cost — {{ p.product_name }}"
+               {% if computed %}disabled
+               title="ignored while invention is on — the invention cost is
+               computed instead"
+               {% else %}
                title="All-in ISK to obtain
                one BPC (copy or invention); amortized per unit on the profit
-               page" onchange="inlineSave(this)">
+               page"{% endif %} onchange="inlineSave(this)">
       </form>
     </td>
     <td>{% if p.is_active %}<span class="badge good">active</span>
         {% else %}<span class="badge">inactive</span>{% endif %}</td>
-    <td class="muted">{{ p.created_at }}</td>
-    <td>
+    <td class="muted" title="{{ p.created_at }} UTC">{{ p.created_at[:10] }}</td>
+    <td class="actions">
       <form class="inline" method="post"
             action="{{ url_for('pipeline_toggle', pipeline_id=p.pipeline_id) }}">
-        <button>{{ 'deactivate' if p.is_active else 'activate' }}</button>
+        <button class="mini">{{ 'deactivate' if p.is_active else 'activate' }}</button>
       </form>
       <form class="inline" method="post"
             action="{{ url_for('pipeline_delete', pipeline_id=p.pipeline_id) }}"
-            onsubmit="return confirm('Delete the {{ p.product_name }} pipeline? Its profit history goes with it.')">
-        <button class="danger">delete</button>
+            data-confirm="Delete the {{ p.product_name }} pipeline? Its profit history goes with it.">
+        <button class="mini danger">delete</button>
       </form>
     </td>
   </tr>
@@ -85,11 +178,31 @@
   <summary class="muted">Clear all pipelines…</summary>
   <form method="post" action="{{ url_for('pipelines_clear') }}"
         style="margin-top:.5rem"
-        onsubmit="return confirm('Delete all {{ pipelines|length }} pipelines and their entire profit history? This cannot be undone.')">
+        data-confirm="Delete all {{ pipelines|length }} pipelines and their entire profit history? This cannot be undone.">
     <button class="danger">Yes — delete all {{ pipelines|length }} pipelines
     (and their profit history)</button>
   </form>
 </details>
 {% elif sde_ready %}<p class="muted">No pipelines yet — paste your first
 above; product and quantity is enough.</p>{% endif %}
+<script>
+// Full-form submits (the invention selects, activate/delete, the paste)
+// come back via a redirect — a fresh navigation that lands at the top.
+// Remember where the user was and put them back (2026-09-01). The inline
+// fetch() saves never reload, so they are unaffected.
+// Storage access is guarded like base.html's: a browser with site data
+// blocked throws on the sessionStorage getter itself.
+document.addEventListener("submit", () => {
+  try { sessionStorage.setItem("pipelines-scroll", String(window.scrollY)); } catch {}
+});
+(() => {
+  let y = null;
+  try {
+    y = sessionStorage.getItem("pipelines-scroll");
+    if (y !== null) sessionStorage.removeItem("pipelines-scroll");
+  } catch {}
+  if (y === null) return;
+  window.scrollTo(0, Number(y));
+})();
+</script>
 {% endblock %}

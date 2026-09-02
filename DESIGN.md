@@ -217,7 +217,13 @@ figures align. Loaded from Google Fonts at 400–700 (Sans) and 400–600 (Mono)
 ### Hierarchy
 - **Headline** (700, 1.45rem, −0.01em): the page title (h1); one per page.
 - **Title** (600, 1.05rem): section headings (h2), often carrying a dim
-  `— N items, M slots` qualifier inside the heading.
+  `— N items, M slots, X ISK` qualifier inside the heading (job-table
+  sections and their h3 groups render it via the `job_stats` macro; bought
+  sections via `buy_stats`, which drops the slots).
+- **Settings copy** (user ruling 2026-09-01): panel headers, side-nav
+  links, setting labels and the Build Settings column heads are Title Case
+  ("Raw Material Buffer", "Build Settings", "ME Rig"); the dim heading
+  qualifiers and the `<small>` help captions stay sentences.
 - **Subhead** (600, 0.85rem): category subheadings (h3.subhead), underlined
   with a hairline and prefixed with an accent ▸.
 - **Body** (400, 14px/1.45): all prose. Explanatory paragraphs cap at 80ch.
@@ -354,6 +360,10 @@ and hover with the teal Hover Wash.
   `2.81B/741M/12K`; `data-sort` overrides for derived cells), `aligned`
   (+`dense`) for fixed-width stacked category tables sized by the longest
   item name, `profit` (content-packed columns, badge column absorbs slack),
+  `pipelines` (the same packing for the editable pipeline grid: 4rem
+  figure inputs, a 7rem `.isk` input, `mini` row actions in a
+  slack-absorbing `.actions` column, and a multi-source row's two selects
+  stacked so the Invention column stays one select wide),
   `classes` (the editable settings grid: selects and inputs living directly
   in cells).
 - **Row states (beyond neg/top):** `superseded` (Slate Dim text — a retired
@@ -421,6 +431,35 @@ prose ("How this is computed") under a dim summary; a details block gates
 destructive bulk actions behind one extra click; `details#multibuy` holds
 read-only `textarea.multibuy` copy-paste blocks (10rem, mono) that
 select-all on click.
+
+### Confirmation Dialog
+`dialog#confirm` (2026-09-01): every destructive or irreversible submit —
+Mark executed, Reopen run, Discard run, Delete pipeline, Clear all
+pipelines, Remove character — declares `data-confirm="…question…"` on its
+form and is guarded by one shared native `<dialog>` in base.html, styled
+like the breakdown dialogs. The confirm button borrows the submitting
+button's label and tone (danger stays danger, primary stays primary);
+Cancel takes focus first, Escape cancels, focus returns to the button on
+cancel. Never `window.confirm()`: embedded browsers (the Claude Code
+Browser pane, any WebView with dialogs suppressed) answer it false
+instantly and silently cancel the submit — the failure that once killed
+the pipeline delete.
+
+### Collapsible Sections
+`details.section` (2026-09-01): every h2 section and h3 category group on
+the data tabs — Planning, Index Runs (Plan / Chain), Invention — is a
+native `<details>` that is **open by default**; the heading itself is the
+`<summary>` (native marker hidden), and its glyph shows the state: the
+subhead's accent ▸ turns ▾ when open, the h2 gains a dim one. A section the
+user closes stays closed for that page family (`data-key` + a
+run-id-normalised path + the `?view=` tab in localStorage), so closing
+"Reaction jobs" on run 62 keeps it closed on run 63 — but a run's Plan and
+Chain views, which reuse keys, remember separately. Opening re-measures
+`table.aligned`, which `layoutAligned()` skips while hidden. Pagehead,
+totals strip, alert panels, checklist panels, dialogs, and the methodology
+disclosures are never sections; the Profit views have no headed sections,
+and the Dashboard, Pipelines, Settings and ESI tabs are deliberately not
+collapsible.
 
 ### Save Bar
 Sticky-bottom Void Panel bar (the one floating shadow) pairing a dim note —

@@ -82,7 +82,10 @@
     <span title="Null Sec Market Share: {{ card.cost.structure_material_cost|isk }} ISK of this unit's materials {% if lagged %}were bought{% else %}are cheaper landed{% endif %} at the null-sec market">({{ "%.1f"|format(card.cost.structure_material_share_pct) }}% null-sec market)</span>{% endif %} ·
     job fees {{ card.cost.subtotal('install')|isk }} ·
     freight {{ card.cost.subtotal('freight_in')|isk }} ·
-    BPC {{ card.cost.subtotal('bpc')|isk }} ·
+    {# Label by the lines' KIND, not the subtotal's truthiness: an
+       invention pipeline whose inputs are all unpriced sums to 0 and
+       must still read "invention", not "BPC" (review 2026-09-01). #}
+    {% if card.cost.lines|selectattr('kind', 'equalto', 'invention')|list %}invention {{ card.cost.subtotal('invention')|isk }}{% else %}BPC {{ card.cost.subtotal('bpc')|isk }}{% endif %} ·
     total {{ card.cost.total|isk }} / unit</p>
   <table class="sortable">
     <thead><tr><th>Item</th><th>Kind</th><th class="num">Depth</th>

@@ -49,8 +49,10 @@
 {% include "_run_subnav.html" %}
 <div class="totals">
   <div class="stat"><span class="label">Raw inputs</span><span class="value">{{ chain_raws|length }}</span></div>
-  <div class="stat"><span class="label">Manufactured</span><span class="value">{{ chain_mfg|map(attribute='1')|map('length')|sum }}</span></div>
-  {% if chain_struct %}<div class="stat"><span class="label">Structure comps</span><span class="value">{{ chain_struct|length }}</span></div>{% endif %}
+  {# Structure components are INSIDE Manufactured (their group sits under
+     Manufacturing since 2026-09-01), so they ride as its sub-line rather
+     than a second stat that would double-count them. #}
+  <div class="stat"><span class="label">Manufactured</span><span class="value" title="buildable manufacturing items in the chain{% if chain_struct %}, {{ chain_struct|length }} of them structure components{% endif %}">{{ chain_mfg|map(attribute='1')|map('length')|sum }}{% if chain_struct %}<span class="sub">· {{ chain_struct|length }} structure comps</span>{% endif %}</span></div>
   <div class="stat"><span class="label">Reacted</span><span class="value">{{ chain_reactions|map(attribute='1')|map('length')|sum }}</span></div>
   <div class="stat"><span class="label">Covered</span><span class="value good">{{ chain_counts.covered }}</span></div>
   <div class="stat"><span class="label">Buy</span><span class="value {% if chain_counts.buy %}warn{% endif %}">{{ chain_counts.buy }}</span></div>
@@ -58,30 +60,35 @@
   <div class="stat"><span class="label">React</span><span class="value">{{ chain_counts.react }}</span></div>
   {% if chain_counts.alchemy %}<div class="stat"><span class="label">Alchemy</span><span class="value">{{ chain_counts.alchemy }}</span></div>{% endif %}
   {% if chain_counts.unmet %}<div class="stat"><span class="label">Unmet</span><span class="value bad">{{ chain_counts.unmet }}</span></div>{% endif %}
+  
 </div>
 
-<h2>Raw inputs <span class="muted">— {{ chain_raws|length }} items</span></h2>
+<details class="section" open data-key="raw">
+<summary><h2>Raw inputs <span class="muted">— {{ m.buy_stats(chain_raws) }}</span></h2></summary>
 {% if chain_raws %}{{ chain_table(chain_raws, show_category=True) }}
 {% else %}<p class="muted">None.</p>{% endif %}
+</details>
 
-<h2>Manufacturing <span class="muted">—
-  {{ chain_mfg|map(attribute='1')|map('length')|sum }} items</span></h2>
+{# Structure components are a category group in here (2026-09-01). #}
+<details class="section" open data-key="mfg">
+<summary><h2>Manufacturing <span class="muted">— {{ m.job_stats(chain_mfg_rows) }}</span></h2></summary>
 {% for category, group in chain_mfg %}
-<h3 class="subhead">{{ category }}
-  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }}</span></h3>
+<details class="section" open data-key="mfg:{{ category|lower|replace(' ', '-') }}">
+<summary><h3 class="subhead">{{ category }}
+  <span class="muted">— {{ m.job_stats(group) }}</span></h3></summary>
 {{ chain_table(group) }}
+</details>
 {% endfor %}
+</details>
 
-{% if chain_struct %}
-<h2>Structure components <span class="muted">— {{ chain_struct|length }} items</span></h2>
-{{ chain_table(chain_struct) }}
-{% endif %}
-
-<h2>Reactions <span class="muted">—
-  {{ chain_reactions|map(attribute='1')|map('length')|sum }} items</span></h2>
+<details class="section" open data-key="reactions">
+<summary><h2>Reactions <span class="muted">— {{ m.job_stats(chain_reaction_rows) }}</span></h2></summary>
 {% for category, group in chain_reactions %}
-<h3 class="subhead">{{ category }}
-  <span class="muted">— {{ group|length }} item{{ 's' if group|length != 1 }}</span></h3>
+<details class="section" open data-key="reactions:{{ category|lower|replace(' ', '-') }}">
+<summary><h3 class="subhead">{{ category }}
+  <span class="muted">— {{ m.job_stats(group) }}</span></h3></summary>
 {{ chain_table(group) }}
+</details>
 {% endfor %}
+</details>
 {% endblock %}

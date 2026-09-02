@@ -112,6 +112,11 @@ STRUCTURE_MARKETS_SCOPE = "esi-markets.structure_markets.v1"
 # ESI industry jobs use activity 9 for reactions in some eras and 11 in
 # others; accept both and map onto the blueprint activity id.
 _REACTION_JOB_ACTIVITIES = {9, 11}
+# v1.23: copying (5) and invention (8) jobs credit their output blueprint
+# into in-progress stock for the Invention tab's netting. They still
+# contend for NO slot pool (decision "T2 invention chain" stands) and
+# research (3/4) stays dropped entirely.
+_LAB_JOB_ACTIVITIES = {config.ACTIVITY_COPYING, config.ACTIVITY_INVENTION}
 _ACTIVE_JOB_STATUSES = {"active", "paused", "ready"}
 
 # v1.9: asset location flags that mean "fitted to / loaded in a ship or
@@ -668,19 +673,47 @@ def refresh_state(conn, ref) -> dict:
                 if job["activity_id"] == 1
                 else None
             )
-            if activity is None:
-                continue  # research/copying/invention: not our pools
+            lab = job["activity_id"] in _LAB_JOB_ACTIVITIES
+            if activity is None and not lab:
+                continue  # research (3/4): not tracked at all
             # Slot counting is location-blind: the line is busy wherever
             # the job runs. The corp feed (processed first, so it claims
             # corp jobs in the dedup) counts every job it pulled — corp
             # ESI carries installer and end date, so corp auth alone
             # suffices (2026-08-25). Character feeds count only their
-            # slot-flagged installer's remaining (personal) jobs.
-            if count_all_slots or job.get("installer_id") in slot_ids:
+            # slot-flagged installer's remaining (personal) jobs. Lab
+            # jobs never touch the pools ("T2 invention chain" decision).
+            if activity is not None and (
+                count_all_slots or job.get("installer_id") in slot_ids
+            ):
                 active_jobs[activity] += 1
                 if job.get("end_date"):
                     job_ends[activity].append(job["end_date"])
-            product_id = job.get("product_type_id")
+            if lab and job["activity_id"] == config.ACTIVITY_COPYING:
+                # A copy job's product IS the copied blueprint. ESI marks
+                # product_type_id optional; blueprint_type_id is always
+                # present, so it is the robust key. Credited in licensed
+                # RUNS (copies × runs per copy — the Invention tab plans
+                # copies at the blueprint's max runs, and an attempt
+                # consumes one run); a record without licensed_runs
+                # counts one run per copy.
+                product_id = (
+                    job.get("blueprint_type_id")
+                    or job.get("product_type_id")
+                )
+                if product_id and ref.is_invention_product(product_id):
+                    # A copy job on a T2/T3 blueprint ORIGINAL shares its
+                    # key with activity-8 attempts on the same invented
+                    # type, and the engine converts that key at the
+                    # invention chance — 100 licensed runs would read as
+                    # 100 attempts (review 2026-09-01). Such copies are
+                    # not modelled: they count once delivered, as stock.
+                    continue
+            else:
+                # Manufacturing/reactions: the built item. Invention: the
+                # invented blueprint type — credited in RAW ATTEMPTS; the
+                # engine converts to expected copies via floor(runs × P).
+                product_id = job.get("product_type_id")
             if not product_id:
                 continue
             # Output delivering into an untracked system will never appear
@@ -698,8 +731,14 @@ def refresh_state(conn, ref) -> dict:
                     )
                     if system_id is not None and system_id not in tracked:
                         continue
-            blueprint = ref.blueprint_for_product(product_id)
-            portion = blueprint.portion_size if blueprint else 1
+            portion = 1
+            if not lab:
+                # Blueprints have no portion — never let a coincidental
+                # product lookup scale a lab credit.
+                blueprint = ref.blueprint_for_product(product_id)
+                portion = blueprint.portion_size if blueprint else 1
+            elif job["activity_id"] == config.ACTIVITY_COPYING:
+                portion = max(1, int(job.get("licensed_runs") or 1))
             in_progress[product_id] = (
                 in_progress.get(product_id, 0)
                 + job.get("runs", 0) * portion

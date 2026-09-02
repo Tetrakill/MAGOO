@@ -14,6 +14,7 @@ planned prices stand in for receipts, one executed bit per run.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from . import config, industry, store
@@ -169,7 +170,7 @@ def net_proceeds_per_hull(
 class CostLine:
     type_id: int
     name: str
-    kind: str  # 'material' | 'install' | 'freight_in' | 'bpc'
+    kind: str  # 'material' | 'install' | 'freight_in' | 'bpc' | 'invention'
     depth: int
     qty_per_hull: float
     unit_cost: float  # snapshot price (material) or per-unit fee (install)
@@ -367,6 +368,313 @@ def _freight_in_lines(settings, ref, lines) -> list:
     return freight
 
 
+# --- invention (v1.22) --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InventionCost:
+    """The computed economics of one pipeline's invention choice — the ONE
+    shared assembly (engine's chain coster and vintage pass, the live
+    profit view and the Invention tab all read this).
+
+    Datacore/decryptor prices are LANDED (venue price + that venue's flat
+    ISK/m³ × packaged m³): invention lines carry their own freight, and
+    _freight_in_lines only aggregates 'material' lines, so nothing
+    double-counts. A missing price counts 0 toward the attempt cost and
+    increments `unpriced` (badged in the UI, like build savings).
+
+    Relic sources (T3, 2026-08-31): the relic rides the `datacores` tuple
+    as one extra per-attempt consumable triple, and `copy_fee` is 0.0 —
+    a relic is consumed outright, there is no T1 copy job."""
+
+    source: object  # refdata.InventionSource
+    decryptor: object | None  # refdata.Decryptor, None = no decryptor
+    probability: float  # clamped, skills applied
+    me: int
+    te: int
+    runs_per_copy: int
+    # ((type_id, qty_per_attempt, landed_price|None), ...) — the relic
+    # consumable included for relic sources.
+    datacores: tuple
+    decryptor_price: float | None  # landed; None = unpriced or no decryptor
+    invention_fee: float  # per attempt
+    copy_fee: float  # per attempt: one 1-run T1 copy (0.0 for relics)
+    unpriced: int  # datacore/relic/decryptor prices missing (counted as 0)
+
+    @property
+    def attempt_cost(self) -> float:
+        cost = self.invention_fee + self.copy_fee
+        for _type_id, qty, price in self.datacores:
+            cost += qty * (price or 0.0)
+        if self.decryptor is not None:
+            cost += self.decryptor_price or 0.0
+        return cost
+
+    @property
+    def cost_per_run(self) -> float:
+        """Expected invention ISK per licensed run of the invented copy."""
+        return industry.invention_cost_per_run(
+            self.attempt_cost, self.probability, self.runs_per_copy
+        )
+
+
+def landed_price(ref, settings, price, venue, type_id: int) -> float | None:
+    """Landed buy price: the venue's raw price plus THAT venue's flat
+    inbound courier rate on packaged m³ (v1.10). None when unpriced. The
+    one formula behind engine._landed_price and the live profit view
+    (review 2026-09-01: current_hull_cost carried its own copy)."""
+    if price is None:
+        return None
+    return (
+        price
+        + settings.freight_in_rate(venue) * ref.type_info(type_id).freight_volume
+    )
+
+
+def resolve_invention(ref, pipeline):
+    """(InventionSource, Decryptor | None) for a pipeline whose invention
+    choice still resolves; None when invention is off OR the config is
+    STALE — the final no longer has its chosen (or single) source, or the
+    stored decryptor id no longer resolves. The one stale-config rule
+    (review 2026-09-01: engine, costing and the Pipelines page each
+    decided this on their own, and a vanished decryptor was silently
+    costed as no-decryptor while the materialised runs/ME/TE kept its
+    modifiers). Stale = the manual bpc_cost_isk fallback everywhere and
+    the Pipelines page's Off control."""
+    if not pipeline["use_invention"]:
+        return None
+    source = ref.invention_source_for_product(
+        pipeline["final_product_type_id"],
+        pipeline["invention_source_blueprint_id"],
+    )
+    if source is None:
+        return None
+    decryptor = None
+    if pipeline["decryptor_type_id"]:
+        decryptor = ref.decryptor(pipeline["decryptor_type_id"])
+        if decryptor is None:
+            return None
+    return source, decryptor
+
+
+def invention_chance(ref, settings, source, decryptor) -> float:
+    """Success chance of one invention choice — the prices-free piece,
+    shared by invention_cost and the Pipelines-page save flash.
+    Each required activity-8 skill resolves through the same name-family
+    router the time math uses: the '…Encryption Methods' skill supplies
+    the /40 term, the (two) datacore sciences the /30 terms."""
+    skills = settings.skill_levels()
+    science_levels = []
+    encryption_level = 0
+    for skill_type_id, _required in ref.blueprint_skills(
+        source.t1_blueprint_id, config.ACTIVITY_INVENTION
+    ):
+        name = ref.type_info(skill_type_id).name
+        level = industry._per_bp_skill_level(name, skills)
+        if name.endswith(config.SKILL_SUFFIX_ENCRYPTION):
+            encryption_level = level
+        else:
+            science_levels.append(level)
+    return industry.invention_probability(
+        source.probability,
+        science_levels,
+        encryption_level,
+        decryptor.prob_mult if decryptor else 1.0,
+    )
+
+
+def invention_cost(
+    ref, settings, class_settings, source, decryptor, price_of, adjusted_of
+) -> InventionCost:
+    """Assemble one invention choice's economics.
+
+    price_of(type_id) -> LANDED unit price or None; adjusted_of(type_id) ->
+    CCP adjusted price or None (missing adjusted counts 0, matching every
+    other fee base). Each fee reads its own lab row — 'invention' and
+    'copying' (split 2026-08-31; copying falls back to the invention row
+    on a not-yet-reseeded database) — and its own activity's structure
+    cost bonus: fee = job_install_cost(2% × EIV_T1, lab, cost mult, scc),
+    where EIV_T1 spans the T1 blueprint's MANUFACTURING materials
+    (PROJECT.md §5)."""
+    probability = invention_chance(ref, settings, source, decryptor)
+    me, te, runs_per_copy = industry.invented_bpc(
+        source.runs,
+        decryptor.me_mod if decryptor else 0,
+        decryptor.te_mod if decryptor else 0,
+        decryptor.run_mod if decryptor else 0,
+    )
+
+    invention_lab = class_settings.get("invention", industry.NPC_STATION)
+    copy_lab = class_settings.get("copying", invention_lab)
+    relic = ref.is_relic_source(source.t1_blueprint_id)
+    eiv_base = sum(
+        base_qty * (adjusted_of(material_id) or 0.0)
+        for material_id, base_qty in ref.materials(
+            # A relic has no manufacturing activity: its attempt's fee
+            # base is 2% of the INVENTED blueprint's product
+            # manufacturing EIV (user decision 2026-08-31 — pending
+            # in-client verification, like JOB_FEE_EIV_FRACTION itself).
+            source.product_blueprint_id if relic else source.t1_blueprint_id,
+            config.ACTIVITY_MANUFACTURING,
+        )
+    )
+    fee_base = config.JOB_FEE_EIV_FRACTION * eiv_base
+    invention_fee = industry.job_install_cost(
+        fee_base,
+        invention_lab,
+        industry.build_multiplier(
+            ref, invention_lab, config.ACTIVITY_INVENTION, "cost"
+        ),
+        scc_surcharge=settings.industry_scc_surcharge,
+    )
+    # A relic is consumed outright — there is no T1 copy job to charge.
+    copy_fee = (
+        0.0
+        if relic
+        else industry.job_install_cost(
+            fee_base,
+            copy_lab,
+            industry.build_multiplier(
+                ref, copy_lab, config.ACTIVITY_COPYING, "cost"
+            ),
+            scc_surcharge=settings.industry_scc_surcharge,
+        )
+    )
+
+    datacores = tuple(
+        (material_id, qty, price_of(material_id))
+        for material_id, qty in ref.materials(
+            source.t1_blueprint_id, config.ACTIVITY_INVENTION
+        )
+    )
+    if relic:
+        # The relic itself is a per-attempt consumable: folding it into
+        # the datacores tuple makes every downstream surface work
+        # untouched — attempt_cost, the buy-row demand loop, the
+        # persisted JSON, the hull-cost replay, the run page's Input
+        # table.
+        datacores += (
+            (source.t1_blueprint_id, 1, price_of(source.t1_blueprint_id)),
+        )
+    decryptor_price = price_of(decryptor.type_id) if decryptor else None
+    unpriced = sum(1 for _t, _q, price in datacores if price is None)
+    if decryptor is not None and decryptor_price is None:
+        unpriced += 1
+    return InventionCost(
+        source=source,
+        decryptor=decryptor,
+        probability=probability,
+        me=me,
+        te=te,
+        runs_per_copy=runs_per_copy,
+        datacores=datacores,
+        decryptor_price=decryptor_price,
+        invention_fee=invention_fee,
+        copy_fee=copy_fee,
+        unpriced=unpriced,
+    )
+
+
+def bpc_divisor(pipeline):
+    """runs_per_bpc as the manual-BPC amortization divisor. While
+    use_invention is on (a stale config included), runs_per_bpc holds the
+    MATERIALIZED invented run count — dividing by it would let the toggle
+    reprice pre-invention realized history — so the stashed
+    manual_runs_per_bpc applies instead (v1.22 review). May be None
+    (uncapped / never set); callers keep their existing None semantics.
+    Both columns are schema-guaranteed (SCHEMA_VERSION >= 4)."""
+    if pipeline["use_invention"]:
+        return pipeline["manual_runs_per_bpc"]
+    return pipeline["runs_per_bpc"]
+
+
+def _bpc_line(pipeline):
+    """The manual-BPC amortization line, or None when the pipeline carries
+    no bpc_cost_isk — the fallback both cost views share (review
+    2026-09-01: each had its own copy)."""
+    bpc_cost = pipeline["bpc_cost_isk"] or 0.0
+    if not bpc_cost:
+        return None
+    return CostLine(
+        type_id=pipeline["final_product_type_id"],
+        name="BPC amortization",
+        kind="bpc",
+        depth=0,
+        qty_per_hull=1.0,
+        unit_cost=bpc_cost / (bpc_divisor(pipeline) or 1),
+        lag_runs=0,
+        clamped=False,
+    )
+
+
+def _invention_cost_lines(
+    ref,
+    probability: float,
+    runs_per_copy: int,
+    portion: int,
+    datacores,
+    decryptor_type_id: int | None,
+    decryptor_price: float | None,
+    invention_fee: float,
+    copy_fee: float,
+) -> list:
+    """kind='invention' CostLines for one pipeline, scaled by the
+    CONTINUOUS expected attempts per hull, 1/(P × runs × portion) — since
+    v1.23 BOTH views price this way, the realized one from the persisted
+    row's vintage figures (the factor lives here, once — review
+    2026-09-01). All lag 0 by design: the invention spend happens AT the
+    run that licenses the copies — there is no deeper vintage to walk
+    back to."""
+    attempts_per_hull = 1.0 / (probability * runs_per_copy * (portion or 1))
+    lines = []
+    for type_id, qty, price in datacores:
+        lines.append(
+            CostLine(
+                type_id=type_id,
+                name=ref.type_info(type_id).name,
+                kind="invention",
+                depth=0,
+                qty_per_hull=qty * attempts_per_hull,
+                unit_cost=price or 0.0,
+                lag_runs=0,
+                clamped=False,
+                missing_price=price is None,
+            )
+        )
+    if decryptor_type_id:
+        lines.append(
+            CostLine(
+                type_id=decryptor_type_id,
+                name=ref.type_info(decryptor_type_id).name,
+                kind="invention",
+                depth=0,
+                qty_per_hull=attempts_per_hull,
+                unit_cost=decryptor_price or 0.0,
+                lag_runs=0,
+                clamped=False,
+                missing_price=decryptor_price is None,
+            )
+        )
+    for name, fee in (
+        ("Invention job fee", invention_fee),
+        ("T1 copy fee", copy_fee),
+    ):
+        if fee:
+            lines.append(
+                CostLine(
+                    type_id=0,
+                    name=name,
+                    kind="invention",
+                    depth=0,
+                    qty_per_hull=attempts_per_hull,
+                    unit_cost=fee,
+                    lag_runs=0,
+                    clamped=False,
+                )
+            )
+    return lines
+
+
 def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
     """Per-hull cost of one pipeline's product as of one completed run,
     built from lagged snapshots. Returns None if the run isn't in the
@@ -470,20 +778,45 @@ def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
 
     lines.extend(_freight_in_lines(settings, ref, lines))
 
-    bpc_cost = pipeline["bpc_cost_isk"] or 0.0
-    if bpc_cost:
-        lines.append(
-            CostLine(
-                type_id=pipeline["final_product_type_id"],
-                name="BPC amortization",
-                kind="bpc",
-                depth=0,
-                qty_per_hull=1.0,
-                unit_cost=bpc_cost / (pipeline["runs_per_bpc"] or 1),
-                lag_runs=0,
-                clamped=False,
+    # v1.22: a persisted invention snapshot supersedes the bpc line — the
+    # realized view reads THAT run's economics, never today's config.
+    invention = conn.execute(
+        "SELECT * FROM index_run_invention "
+        "WHERE index_run_id = ? AND pipeline_id = ?",
+        (index_run_id, pipeline_id),
+    ).fetchone()
+    if invention is not None:
+        # v1.23: the realized replay prices invention at the vintage's
+        # CONTINUOUS expected consumption — qty/attempt ÷ (P ×
+        # runs_per_copy × portion) — so a stockpile-overbuild cycle
+        # doesn't spike the per-hull cost and a stock-covered (or
+        # slot-starved) cycle doesn't dip it to zero. probability/runs
+        # come from THIS row (the vintage), never live config.
+        portion = next(
+            (
+                item["portion_size"]
+                for item in items
+                if item["type_id"] == pipeline["final_product_type_id"]
+            ),
+            1,
+        ) or 1
+        lines.extend(
+            _invention_cost_lines(
+                ref,
+                invention["probability"],
+                invention["runs_per_copy"],
+                portion,
+                json.loads(invention["datacores"]),
+                invention["decryptor_type_id"],
+                invention["decryptor_unit_price"],
+                invention["invention_fee_per_attempt"],
+                invention["copy_fee_per_attempt"],
             )
         )
+    else:
+        bpc = _bpc_line(pipeline)
+        if bpc is not None:
+            lines.append(bpc)
 
     run_number = next(
         row["run_number"] for row in seq if row["index_run_id"] == index_run_id
@@ -630,20 +963,40 @@ def current_hull_cost(
             )
         )
     lines.extend(_freight_in_lines(settings, ref, lines))
-    bpc_cost = pipeline["bpc_cost_isk"] or 0.0
-    if bpc_cost:
-        lines.append(
-            CostLine(
-                type_id=pipeline["final_product_type_id"],
-                name="BPC amortization",
-                kind="bpc",
-                depth=0,
-                qty_per_hull=1.0,
-                unit_cost=bpc_cost / (pipeline["runs_per_bpc"] or 1),
-                lag_runs=0,
-                clamped=False,
+
+    # v1.22: an invention-enabled pipeline gets live invention lines at
+    # continuous expectation (1/(P × runs × portion) attempts per unit)
+    # instead of the bpc line. A stale config (resolve_invention: source
+    # or decryptor no longer resolves) falls back to bpc_cost_isk,
+    # matching the engine.
+    resolved = resolve_invention(ref, pipeline)
+    if resolved is not None:
+        source, decryptor = resolved
+        cost = invention_cost(
+            ref, settings, class_settings, source, decryptor,
+            price_of=lambda t: landed_price(
+                ref, settings, prices.get(t), venues.get(t), t
+            ),
+            adjusted_of=adjusted.get,
+        )
+        final_bp = ref.blueprint_for_product(pipeline["final_product_type_id"])
+        lines.extend(
+            _invention_cost_lines(
+                ref,
+                cost.probability,
+                cost.runs_per_copy,
+                final_bp.portion_size if final_bp else 1,
+                cost.datacores,
+                cost.decryptor.type_id if cost.decryptor else None,
+                cost.decryptor_price,
+                cost.invention_fee,
+                cost.copy_fee,
             )
         )
+    else:
+        bpc = _bpc_line(pipeline)
+        if bpc is not None:
+            lines.append(bpc)
     return HullCost(
         pipeline_id=pipeline["pipeline_id"],
         # REQUESTED scale by ruling 2026-08-27: Units and Margin/cycle count
