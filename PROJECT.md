@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.21 built and live (engine, MILP allocation, sizing feedback
+Status: v1.23 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -2188,6 +2188,61 @@ HiGHS through a dynamic import PyInstaller cannot see, so that failure would
 otherwise surface the first time a user planned a run. Verified end to end on
 the packaged build, including a real migration of the live 65 MB database.
 Tests 327 → 356.
+
+### v1.23 (2026-09-01): T2/T3 invention, the BPC stockpile Invention tab, review fixes
+
+Invention became a first-class cost input (the v1.22 work, folded into this
+stamp). Each pipeline whose final is invention-capable picks a decryptor —
+or none — and, for the 63 multi-source finals (T3 relic tiers, the seven
+targets with several T1 sources), the source. The choice is MATERIALISED at
+config time: `pipeline.runs_per_bpc` and the T2 blueprint's
+`blueprint_setting` ME/TE are written from the invention math, the user's
+own runs stashed in `manual_runs_per_bpc`, so the planning path never
+learned what invention is. Every planned run persists an
+`index_run_invention` VINTAGE — the skill-applied chance, invented stats,
+per-attempt input prices and fees — that lag costing replays at the
+continuous expectation `1 / (P × runs × portion)`; both profit views carry
+invention lines instead of the BPC amortization. The SDE import gained a
+`ref_invention` table (activity 8 kept out of `ref_blueprint`, whose
+products are blueprint types) and the copying/invention structure
+bonuses; Build settings gained Invention Lab and Copy Lab rows with a
+job-cost rig. Relics are consumed one per attempt and ride the datacores
+tuple; their fee base is 2% of the invented blueprint's product EIV,
+pending in-client verification.
+
+The BPC stockpile is then the v1.23 model: two settings, T1 and T2 BPC
+Buffer (default 400%, 100–1000%), drive a live **Invention** tab that
+sizes copy and invention jobs — at the blueprint's max runs, grouped like
+manufacturing jobs — from CURRENT BPC stock (T1 copies as "stack minus the
+BPO"), in-flight lab jobs (ESI activities 5 and 8 now credit
+`in_progress`; labs still occupy no slot pool) and cached prices, with a
+buy list, per-venue Multibuy blocks and the Raw Material Buffer applied
+like any other bought input. Index runs keep only the cost vintage.
+
+The UI followed: collapsible sections (open by default, per-page
+persistence in localStorage) on Planning, Index Runs and Invention only —
+the user declined them elsewhere; every job-table header carries items,
+slots and value; structure components are a Manufacturing group rather
+than their own section; the run pages show no invention information at
+all; the Pipelines page edits runs/ME/TE inline when invention is off and
+keeps its scroll position; Settings gained a "Stockpile Buffer" panel and
+Title Case labels; destructive actions confirm through one in-app
+`<dialog>` — embedded browsers answer `window.confirm()` false instantly,
+which had silently cancelled "Mark executed"; run captions are sentences.
+
+An xhigh recall-mode code review of the whole arc (10 finder angles, one
+verifier per candidate, a gap sweep) produced 15 verified findings and 9
+cleanups, all applied the same day and listed in the decision log. The
+ones that changed numbers: a slot-starved invention final now still gets
+its vintage row (its executed profit view had fallen back to the ignored
+manual bpc figure); `invention_probability` rounds to 12 places and the
+engine rounds away float noise before every ceil/floor (7 copies at 7/16
+had planned 17 attempts); one `costing.resolve_invention` rule makes a
+vanished decryptor STALE everywhere instead of silently "no decryptor";
+materialised runs/ME/TE are re-derived after every SDE import; copy jobs
+on T2/T3 blueprint originals are no longer read as invention attempts.
+Schema 5 drops the never-read `copies_needed`/`attempts` vintage columns.
+Tests 356 → 437.
 
 ### Development environment constraints (historical)
 
