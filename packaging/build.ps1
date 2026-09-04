@@ -124,6 +124,13 @@ This file makes Magoo portable: it keeps your data in the "data" folder
 beside Magoo.exe instead of in %LOCALAPPDATA%\Magoo.
 
 Delete it if you would rather share data with an installed copy of Magoo.
+
+Extract the whole zip before running Magoo.exe - it needs the "_internal"
+folder beside it. Windows marks everything extracted from a downloaded zip
+as "from the Internet", which stops the Magoo window from opening; Magoo
+removes that mark from its own files on first launch. If it still opens in
+your browser instead of its own window, right-click the zip, choose
+Properties, tick "Unblock", and extract it again.
 '@
     $zip = Join-Path $dist "magoo-$version-win64.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }

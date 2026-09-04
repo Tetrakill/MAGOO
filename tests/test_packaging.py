@@ -48,6 +48,66 @@ def test_portable_marker_keeps_data_beside_the_exe(monkeypatch, tmp_path):
     assert config._resolve_data_dir() == tmp_path / "data"
 
 
+def _mark_from_internet(path) -> None:
+    """Stamp a file the way Explorer does when extracting a downloaded zip."""
+    with open(f"{path}:Zone.Identifier", "w") as stream:
+        stream.write("[ZoneTransfer]\nZoneId=3\n")
+
+
+def _is_marked(path) -> bool:
+    try:
+        with open(f"{path}:Zone.Identifier"):
+            return True
+    except FileNotFoundError:
+        return False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS alternate streams")
+def test_frozen_build_unblocks_its_own_files(monkeypatch, tmp_path):
+    """The v1.23 portable zip opened in the browser: Extract All had put
+    the Mark of the Web on every file, and .NET refuses to load
+    pythonnet's Python.Runtime.dll from an Internet-zone file. The first
+    launch strips the mark from the exe and the whole bundle, and a clean
+    bundle is left alone."""
+    from magoo import desktop
+
+    exe = tmp_path / "Magoo.exe"
+    exe.write_bytes(b"MZ")
+    internal = tmp_path / "_internal"
+    (internal / "pythonnet" / "runtime").mkdir(parents=True)
+    dll = internal / "pythonnet" / "runtime" / "Python.Runtime.dll"
+    dll.write_bytes(b"MZ")
+    clean = internal / "clean.dll"
+    clean.write_bytes(b"MZ")
+    for path in (exe, dll):
+        _mark_from_internet(path)
+    assert _is_marked(dll)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.setattr(sys, "_MEIPASS", str(internal), raising=False)
+
+    assert desktop.unblock_bundle() == 2
+    assert not _is_marked(exe)
+    assert not _is_marked(dll)
+    assert dll.read_bytes() == b"MZ"  # the file itself is untouched
+    assert not _is_marked(clean)
+    assert desktop.unblock_bundle() == 0  # already clean: nothing to do
+
+
+def test_unblock_is_a_no_op_in_a_source_checkout(monkeypatch, tmp_path):
+    from magoo import desktop
+
+    marked = tmp_path / "marked.dll"
+    marked.write_bytes(b"MZ")
+    if sys.platform == "win32":
+        _mark_from_internet(marked)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert desktop.unblock_bundle() == 0
+    if sys.platform == "win32":
+        assert _is_marked(marked)  # not frozen: never touches anything
+
+
 def test_all_three_paths_move_together(monkeypatch, tmp_path):
     """SDE_CACHE_DIR and DB_PATH derive from DATA_DIR at import time, so a
     build that relocated DATA_DIR alone would still write the 99 MB SDE zip

@@ -18,12 +18,14 @@ import argparse
 import ctypes
 import json
 import logging
+import os
 import socket
 import sys
 import threading
 import time
 import urllib.request
 import webbrowser
+from pathlib import Path
 
 from magoo import __version__, config, logsetup
 
@@ -155,6 +157,42 @@ def start_server(port: int):
 # ---------------------------------------------------------------------------
 # Showing it
 # ---------------------------------------------------------------------------
+
+
+def unblock_bundle() -> int:
+    """Strip the Mark of the Web from the frozen build's own files.
+
+    A zip downloaded from the internet carries a Zone.Identifier stream,
+    and Explorer's Extract All copies it onto every extracted file. The
+    .NET Framework then refuses to load pythonnet's Python.Runtime.dll
+    from an Internet-zone file, pywebview cannot start, and the app falls
+    back to the browser (v1.23 portable zip, 2026-09-03). Deleting the
+    stream is exactly what the Properties → Unblock checkbox does; doing
+    it here means the first launch heals itself. The installer never
+    needs it (Inno Setup writes unmarked files), so this is a no-op
+    there, and always a no-op outside a frozen Windows build. Returns the
+    number of files unblocked.
+    """
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return 0
+    bundle = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    unblocked = 0
+    for path in [Path(sys.executable), *bundle.rglob("*")]:
+        if not path.is_file():
+            continue
+        try:
+            os.remove(f"{path}:Zone.Identifier")
+        except FileNotFoundError:
+            continue  # no mark on this file
+        except OSError:
+            log.warning("could not unblock %s", path, exc_info=True)
+            continue
+        unblocked += 1
+    if unblocked:
+        log.info(
+            "removed the Mark of the Web from %d bundled file(s)", unblocked
+        )
+    return unblocked
 
 
 def show_window(url: str) -> bool:
@@ -320,6 +358,10 @@ def main(argv=None) -> int:
     port = args.port
     url = f"http://localhost:{port}/"
     log.info("Magoo %s starting; data in %s", __version__, config.DATA_DIR)
+
+    # Before anything imports pythonnet: a portable copy extracted from a
+    # downloaded zip cannot open its window until its files are unblocked.
+    unblock_bundle()
 
     running = probe_health(port)
     if running:
