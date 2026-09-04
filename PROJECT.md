@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.23 built and live (engine, MILP allocation, sizing feedback
+Status: v1.24 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -12,10 +12,12 @@ Slot Planner), ESI tab with per-corp/-character count toggles, runs
 lifecycle with superseded/discard, per-item deficit ledger, first-run
 onboarding with a crash-free fresh install and a one-click game-data
 download with live progress, full web UI restyled, accessibility- and
-audit-hardened; packaged as a Windows desktop application — installer +
-portable zip, native WebView2 window, shared-client-id PKCE login in the
-user's own browser, versioned schema with pre-migration backups)
-Last updated: 2026-08-30
+audit-hardened; packaged as a Windows desktop application — portable
+zip (the only published artifact since v1.24; the installer is still
+buildable), native WebView2 window, shared-client-id PKCE login in the
+user's own browser, versioned schema with pre-migration backups, portable
+zip self-heals the Mark of the Web on first launch)
+Last updated: 2026-09-03
 
 ---
 
@@ -2243,6 +2245,30 @@ materialised runs/ME/TE are re-derived after every SDE import; copy jobs
 on T2/T3 blueprint originals are no longer read as invention attempts.
 Schema 5 drops the never-read `copies_needed`/`attempts` vintage columns.
 Tests 356 → 437.
+
+### v1.24 (2026-09-03): portable zip opens its own window — commit 3737cb8
+
+The first release's portable zip opened Magoo in the browser instead of
+the WebView2 window. Root cause, from the portable copy's log: Explorer's
+Extract All stamps every extracted file with the downloaded zip's Mark of
+the Web (`Zone.Identifier`, ZoneId 3), and the .NET Framework refuses to
+load pythonnet's `Python.Runtime.dll` from an Internet-zone file, so
+pywebview cannot start and `desktop.show_window` takes its browser
+fallback. The installer never hit it — Inno Setup writes unmarked files.
+`desktop.unblock_bundle()` now deletes that stream from the exe and every
+file under `_internal` on launch, before anything imports pythonnet (the
+programmatic twin of Properties → Unblock; a no-op outside a frozen
+Windows build and on an already-clean tree), and the portable marker
+text in the zip explains the extract-everything rule and the manual
+Unblock fallback. Also learned this release: Edge's "virus" warning on
+`MagooSetup-1.23.0.exe` is Defender's `Trojan:Win32/Wacatac.C!ml`
+machine-learning verdict on an unsigned PyInstaller + Inno Setup build
+(the self-extracting installer is the shape the model dislikes; the
+onedir zip was not flagged), and GitHub's automatic "Source code"
+archives sit beside the real assets on the release page. **Decision
+(user, 2026-09-03): releases ship ONLY the portable zip from now on** —
+the installer is still buildable but is not uploaded. Code signing
+remains the durable fix for the reputation warnings. Tests 437 → 439.
 
 ### Development environment constraints (historical)
 

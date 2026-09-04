@@ -27,12 +27,18 @@ The plan is advisory; ESI is the ledger.
 
 Downloads live on the [releases page](https://github.com/Tetrakill/MAGOO/releases).
 
-Two downloads are offered per release:
+One download is offered per release — ignore the "Source code" archives
+GitHub attaches automatically, they contain no application:
 
-| Download | Use it when |
+| Download | What to do with it |
 | --- | --- |
-| `MagooSetup-<version>.exe` | Normal install. No administrator prompt — it installs to your user profile and adds a Start-menu entry and an uninstaller. |
-| `magoo-<version>-win64.zip` | Portable. Extract anywhere and run `Magoo.exe`; data is kept beside the executable. |
+| `magoo-<version>-win64.zip` | Portable. Extract the **whole** zip anywhere (right-click → Extract All) and run `Magoo\Magoo.exe`; data is kept in `data\` beside the executable. Don't run the exe from inside the zip window — it needs the `_internal` folder next to it. |
+
+Windows marks everything extracted from a downloaded zip as "from the
+Internet", which would stop the Magoo window from opening; Magoo removes
+that mark from its own files on first launch. If it still opens in your
+browser instead of its own window, right-click the zip, choose
+Properties, tick **Unblock**, and extract it again.
 
 ### "Windows protected your PC"
 
@@ -97,11 +103,14 @@ reference data from your real `data/magoo.sqlite`, so import the SDE first.
 .\packaging\build.ps1
 ```
 
-That produces both downloads in `dist\` from one PyInstaller onedir tree.
-The installer step needs [Inno Setup](https://jrsoftware.org/isdl.php) (6 or
-newer); the
-script skips it with a warning if it is not installed, so
-`-SkipInstaller` gets you just the portable zip.
+That produces the portable zip and an Inno Setup installer in `dist\`
+from one PyInstaller onedir tree. Only the zip is published: the
+self-extracting installer is the shape antivirus heuristics dislike
+(Defender flagged the unsigned 1.23.0 installer), and the zip was never
+flagged. The installer step needs
+[Inno Setup](https://jrsoftware.org/isdl.php) (6 or newer); the script
+skips it with a warning if it is not installed, and `-SkipInstaller`
+skips it on purpose.
 
 The build runs a self-test against the **frozen** executable before
 packaging it, and refuses to continue if it fails:

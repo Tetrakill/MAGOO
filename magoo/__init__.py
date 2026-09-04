@@ -6,4 +6,4 @@ so this file must stay importable without pulling in Flask or SciPy — a
 release bump is a one-line edit and nothing else.
 """
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
