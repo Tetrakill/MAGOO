@@ -142,14 +142,14 @@
     <input id="compressed_gas_enabled" name="compressed_gas_enabled" type="checkbox" {{ 'checked' if settings.compressed_gas_enabled }}>
     <label for="compressed_ore_yield_pct">Ore Reprocessing Yield
       <small>your refinery's yield for compressed ore and moon ore (structure, rigs, skills) &mdash; the pure yield; the tax has its own field below</small></label>
-    <span class="withunit"><input id="compressed_ore_yield_pct" name="compressed_ore_yield_pct" type="number" step="0.5" min="0" max="100"
+    <span class="withunit"><input id="compressed_ore_yield_pct" name="compressed_ore_yield_pct" type="number" step="0.01" min="0" max="100"
            value="{{ settings.compressed_ore_yield|pct }}">%</span>
     <label for="compressed_gas_yield_pct">Gas Decompression Yield
       <small>your yield when reprocessing compressed gas back into gas &mdash; the pure yield</small></label>
-    <span class="withunit"><input id="compressed_gas_yield_pct" name="compressed_gas_yield_pct" type="number" step="0.5" min="0" max="100"
+    <span class="withunit"><input id="compressed_gas_yield_pct" name="compressed_gas_yield_pct" type="number" step="0.01" min="0" max="100"
            value="{{ settings.compressed_gas_yield|pct }}">%</span>
     <label for="compressed_tax_pct">Reprocessing Tax
-      <small>the refinery owner's (or NPC station's) tax, a percentage of every output's value &mdash; charged on leftovers too</small></label>
+      <small>the refinery owner's (or NPC station's) tax on refining compressed ore and moon ore, a percentage of every output's value &mdash; charged on leftovers too; decompressing gas is untaxed</small></label>
     <span class="withunit"><input id="compressed_tax_pct" name="compressed_tax_pct" type="number" step="0.1" min="0" max="50"
            value="{{ settings.compressed_reprocess_tax|pct }}">%</span>
   </div>

@@ -1517,7 +1517,8 @@ def _sourcing_pass(
 
     Compressed candidates enter one LP (HiGHS) together with the raws'
     own rungs: a column per rung (bounded by its remaining volume, costed
-    landed; compressed rungs carry the tax on every output's value) and a
+    landed; ore and moon ore rungs carry the reprocessing tax on every
+    output's value, gas rungs none — `tax_of`) and a
     remainder column at the raw's marginal landed price. Surplus outputs
     are worth nothing to the LP (only demanded raws have rows), so it can
     never buy ore for minerals nobody needs. Chosen compressed types round
@@ -1605,6 +1606,12 @@ def _sourcing_pass(
         "gas": settings.compressed_gas_yield,
     }
     tax = max(0.0, settings.compressed_reprocess_tax)
+
+    def tax_of(source) -> float:
+        # Refining ore and moon ore pays the facility's reprocessing
+        # tax; decompressing gas is untaxed in the client (user,
+        # 2026-09-06), so a gas candidate carries no tax term.
+        return tax if source.kind == "ore" else 0.0
     demand: dict[int, int] = {}
     landed_raw: dict[int, float] = {}  # single-quote landed price
     # The toggles pick which compressed TYPES are candidates (those
@@ -1703,7 +1710,7 @@ def _sourcing_pass(
             # The most a unit of this type can be worth: every useful
             # output at its raw's marginal (remainder) landed price.
             value_bound = sum(a * marginal_landed(r) for r, a in coeff[c].items())
-            tax_per_unit = tax * sum(
+            tax_per_unit = tax_of(source) * sum(
                 source.per_unit(m, y) * output_price(m) for m, _q in source.outputs
             )
             cap = max(_ceil(demand[r] / a) for r, a in coeff[c].items())
@@ -1804,7 +1811,7 @@ def _sourcing_pass(
                     "fill": fill,
                     "landed_cost": fill.cost
                     + rates[venue] * ref.type_info(c).freight_volume * qty
-                    + tax
+                    + tax_of(source)
                     * sum(
                         source.batch_output(batches, m, y) * output_price(m)
                         for m, _q in source.outputs

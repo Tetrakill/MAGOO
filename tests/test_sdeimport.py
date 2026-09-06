@@ -103,16 +103,18 @@ def test_compressed_outputs_are_not_duplicated_by_a_shared_target(conn):
     assert sources[62516].batch_output(2, 34, 0.75) == 600
 
 
-def test_batch_output_floors_per_batch():
-    """R3 (2026-09-05): the game rounds EACH batch's output down, so a
-    fractional per-batch yield never accumulates — 415 base at 0.55 is
-    228.25 per batch: 4 batches give 4 × 228 = 912, not floor(913.0)."""
+def test_batch_output_floors_once_over_the_job():
+    """2026-09-06 (reversing R3): the client floors a reprocessing run's
+    output ONCE per material over the whole job — 415 base at 0.55 is
+    228.25 per batch, so 4 batches give floor(913.0) = 913, not 4 × 228.
+    The per-batch floor valued every compressed gas (a batch of one
+    yielding one) at zero below a 100% yield."""
     from magoo.refdata import CompressedSource
 
     src = CompressedSource(
         compressed_id=1, kind="ore", portion_size=100, outputs=((34, 415),)
     )
-    assert src.batch_output(4, 34, 0.55) == 912
+    assert src.batch_output(4, 34, 0.55) == 913
     assert src.batch_output(1, 34, 0.55) == 228
     assert src.batch_output(0, 34, 0.55) == 0
     assert src.batch_output(4, 35, 0.55) == 0  # not an output
@@ -121,7 +123,10 @@ def test_batch_output_floors_per_batch():
     # An exactly-integral product survives binary-float noise.
     exact = CompressedSource(1, "ore", 100, ((34, 400),))
     assert exact.batch_output(3, 34, 0.75) == 900
-    assert CompressedSource(1, "gas", 1, ((30375, 1),)).batch_output(7, 30375, 0.55) == 0
+    gas = CompressedSource(1, "gas", 1, ((30375, 1),))
+    assert gas.batch_output(1, 30375, 0.95) == 0  # one unit at 95% is 0.95
+    assert gas.batch_output(100, 30375, 0.95) == 95
+    assert gas.batch_output(7, 30375, 0.55) == 3
 
 
 def _tiny_archive(path, datasets):

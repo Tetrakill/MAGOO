@@ -224,7 +224,8 @@ anywhere, iterates quickly, and owns its own data pipeline.
     ore, compressed moon ore and compressed gas** wherever that is cheaper
     landed, reprocessed at two user-asserted pure yields (refinery yield
     for ore and moon ore, decompression yield for gas) less an explicit
-    reprocessing tax on every output's value. Market
+    reprocessing tax on every output's value (ore and moon ore only —
+    gas decompression is untaxed, v1.25.1). Market
     **depth** is walked, not guessed: the price refresh persists the Jita
     4-4 sell **ladder** for every candidate, and each candidate is costed
     by filling the quantity it would take (the structure market's ladder
@@ -639,15 +640,19 @@ gas decompresses 1:1). Per input unit, at the asserted yield:
 
 ```
 per_unit(c, r)          = base_qty(c, r) / portion_size(c) x yield(kind(c))
-batch_output(c, r, n)   = n x floor(base_qty(c, r) x yield)        -- n whole batches, FLOORED PER BATCH
+batch_output(c, r, n)   = floor(n x base_qty(c, r) x yield)        -- n whole batches, floored ONCE over the job
 ```
 
 `kind` is "ore" (Asteroid category — ore and moon ore alike, the refinery
 yield) or "gas" (the Compressed Gas group, the decompression yield —
-user-asserted, default kept: ruling R1 2026-09-05). The floor is applied
-**per batch** (ruling R3 2026-09-05, conservative): `n × floor(base ×
-yield)`, never `floor(n × base × yield)` — the whole-quantity floor
-credited up to n − 1 phantom units per output.
+user-asserted; ruling R1 2026-09-05 kept it a plain setting, default 0.95
+since v1.25.1). The floor is applied
+**once over the whole job** per material, `floor(n × base × yield)`, as
+the client computes a reprocessing run (2026-09-06, reversing ruling R3's
+per-batch `n × floor(base × yield)`: a compressed gas batch is one unit
+yielding one, so the per-batch floor valued every compressed gas at zero
+below a 100% yield and no gas was ever chosen; for ore the two differ by
+at most n − 1 units per output).
 Candidates are data-derived: `ref_compressible` (compressibleTypes) targets
 that are published, of those two kinds, and carry fixed outputs — ice never
 qualifies (its outputs are ice products, outside the three source groups)
@@ -659,8 +664,10 @@ landed quote p_r (D_r = `recommended_buy_qty`), and C = the candidates
 yielding any of them. Every ladder rung (c, venue v, price, volume) whose
 landed unit cost l = price + rate_v x m3_c is below sum_r per_unit(c, r) p_r
 becomes an LP column (rungs past the volume that could cover the largest
-single demand are dead and dropped). The reprocessing tax rides the rung:
-l also carries tax x sum over ALL outputs of per_unit(c, m) x price(m) -
+single demand are dead and dropped). The reprocessing tax rides the rung
+of ORE and MOON ORE candidates only (decompressing gas is untaxed in the
+client — user, 2026-09-06): l also carries tax x sum over ALL outputs of
+per_unit(c, m) x price(m) -
 charged on leftovers too, at the landed raw price for demanded outputs and
 the cached quote (0 when unpriced) for the rest; the chosen type's landed
 cost carries the same term on its batch outputs:
@@ -888,9 +895,9 @@ Tools blacklisted.
 | `freight_in_isk_per_m3` / `freight_out_isk_per_m3` | 0.0 — flat courier rates: "Courier Highsec Market → Industry Hub" (bought materials in) and "Courier Industry Hub → High Sec Market" (finished products out); freight-in is the Jita leg since v1.10 |
 | `structure_freight_in_isk_per_m3` | 0.0 — "Courier Null Sec Market → Industry Hub": flat ISK/m³ from the structure market (C-J6) to the industry system (v1.10); on an EXISTING database seeded once as a copy of the Jita rate when the column is added, so a configured Jita rate never makes the structure look freight-free by default |
 | `compressed_minerals_enabled`, `compressed_moon_enabled`, `compressed_gas_enabled` | 0 each — v1.25: one toggle per raw group (minerals / moon materials / gas): buy the compressed form and reprocess when cheaper landed (the author's first-run profile turns all three on). Replaced the single `compressed_sourcing_enabled` flag the same day; the migration copies it into all three, then drops it |
-| `compressed_ore_yield` | 0.75 — refinery yield for compressed ore and moon ore; user-asserted, pure yield |
-| `compressed_gas_yield` | 0.60 — decompression yield for compressed gas; user-asserted, pure yield |
-| `compressed_reprocess_tax` | 0.0 — the refinery owner's / NPC station's reprocessing tax as a fraction of every output's value (leftovers included); explicit since 2026-09-05 |
+| `compressed_ore_yield` | 0.9063 — refinery yield for compressed ore and moon ore; user-asserted, pure yield (default was 0.75 until v1.25.1: the maintainer's refinery figure, user 2026-09-06) |
+| `compressed_gas_yield` | 0.95 — decompression yield for compressed gas; user-asserted, pure yield (default was 0.60 until v1.25.1) |
+| `compressed_reprocess_tax` | 0.04 (0.0 until v1.25.1) — the refinery owner's / NPC station's reprocessing tax as a fraction of every output's value (leftovers included) when refining compressed ore and moon ore; gas decompression is untaxed (2026-09-06); explicit since 2026-09-05 |
 | `structure_buy_enabled` | 1 — compare inputs against the structure market's sell ladder; off = every input priced from the hub, as before v1.10 |
 | `capital_market_mode` / `capital_structure_id` | cj6 / NULL (v1.6) |
 | `capital_sales_tax` / `capital_broker_rate` | 0.0337 / 0.01 (v1.6) |
@@ -2576,12 +2583,14 @@ outputs (empty on a pre-v1.25 game-data build — the re-import below
 fills it). Settings gained a Compressed Sourcing panel: one toggle per
 group (Minerals, Moon Materials, Gas), asserted pure yields for ore and
 gas (the user's refinery decides), and an explicit reprocessing tax
-taken from every output's value. The pass runs a sparse HiGHS LP per
+taken from every output's value (ore and moon ore only since v1.25.1 —
+gas decompression is untaxed). The pass runs a sparse HiGHS LP per
 plan over the direct rungs of every demanded raw of the three groups
 plus the candidates' own rungs — a candidate qualifies by yielding a
 demanded raw of an ENABLED group, and all its outputs then displace
 direct purchases, other groups included — rounds to whole batches
-(reprocessing floors per batch, user ruling), credits no surplus,
+(the reprocessing output floored once over the job since v1.25.1),
+credits no surplus,
 ignores hangar stock of compressed items, and badges a compressed buy
 shallow when the LP wanted more than the ladder held. Compressed
 purchases are landed like any other buy, a compressed row keeps one
@@ -2809,7 +2818,8 @@ user's Windows machine against the live database.
 | Remainder at marginal, ~~listed under Jita~~ unsourced (2026-09-05; ruling R5 the same day) | Units beyond every stored ladder cost the last rung walked and stay in the row's quantity. ~~They ride the Jita quantity (the structure's only when the item has no Jita ladder)~~ They ride the Jita quantity ONLY when Jita's stored ladder is TRUNCATED (exactly `HUB_LADDER_MAX_RUNGS` rungs, so the real book continues); a remainder beyond an EXHAUSTED book (shorter than the cap, or no Jita ladder at all) is UNSOURCED — attributed to no venue, listed in no Multibuy block; the shallow badge names the count and says so. Landed cost of the remainder: marginal price + the hub freight rate when the item has a hub ladder, else the structure rate | Conservative — never invents a price cheaper than the book showed, and never tells the user to buy in Jita what Jita's whole stored book could not supply |
 | **Review fixes (2026-09-05)** | | |
 | Reaction run ceiling (R2) | A reaction formula's `maxProductionLimit` is NOT a run cap; the 30-day modified-time rule is the only reaction ceiling | Client-verified: it accepts more runs than the formula's figure — the clamp was under-sizing bulk reactions |
-| Per-batch reprocessing floor (R3) | `batch_output = n × floor(base × yield)` | Conservative; the whole-quantity floor credited up to n − 1 phantom units per output |
+| Per-batch reprocessing floor (R3) | ~~`batch_output = n × floor(base × yield)`~~ 2026-09-06: reversed — `floor(n × base × yield)`, the floor once over the job, as the client computes it | ~~Conservative; the whole-quantity floor credited up to n − 1 phantom units per output~~ The per-batch floor valued every compressed gas (a batch of one yielding one) at zero output below a 100% yield, so no compressed gas was ever chosen (v1.25.0); ore differs by at most n − 1 units |
+| No tax on gas decompression (2026-09-06) | `compressed_reprocess_tax` applies to ore and moon ore candidates only; a gas candidate carries no tax term (`engine.tax_of`) | User: the client charges no reprocessing tax when decompressing gas |
 | Fee constants verified (R4) | SCC surcharge 4%, NPC facility tax 0.25%, invention/copy fee base 2% marked verified in-client | Observed in the client; no longer "pending" |
 | Compressed shallow = shrunk below the wanted quantity (R6) | `index_run_item.compressed_wanted_qty` stores what the LP wanted; the web layer flags `compressed_wanted_qty > recommended_buy_qty` | The old `recommended_buy_qty > compressed_ladder_units` test could never fire after the whole-batch shrink — the badge was dead |
 | Zero-draw intermediates (R7) | A stage with zero realized draw takes its target from that draw — no floor kept | A phantom cycle of stock for a stage nobody consumes this cycle |

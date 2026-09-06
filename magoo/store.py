@@ -531,18 +531,22 @@ _MIGRATIONS = (
     # ore / moon ore / gas and reprocess it when cheaper landed than the
     # raw minerals / moon materials / gas, Jita ladder depth considered.
     # Two user-asserted yields (refinery for ore and moon ore, gas
-    # decompression), reprocessing tax folded in.
+    # decompression), reprocessing tax folded in. Defaults are the
+    # maintainer's refinery figures (user, 2026-09-06): 90.63% ore,
+    # 95% gas, 4% tax — a database that reaches schema 7 later gets
+    # them; one already there keeps whatever it holds.
     "ALTER TABLE settings ADD COLUMN compressed_sourcing_enabled "
     "INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE settings ADD COLUMN compressed_ore_yield "
-    "REAL NOT NULL DEFAULT 0.75",
+    "REAL NOT NULL DEFAULT 0.9063",
     "ALTER TABLE settings ADD COLUMN compressed_gas_yield "
-    "REAL NOT NULL DEFAULT 0.60",
+    "REAL NOT NULL DEFAULT 0.95",
     # The reprocessing tax as its own figure (user request 2026-09-05):
     # a fraction of every output's value, charged per compressed buy;
-    # the two yields above are then PURE yields.
+    # the two yields above are then PURE yields. Ore and moon ore
+    # refining only — gas decompression is untaxed (2026-09-06).
     "ALTER TABLE settings ADD COLUMN compressed_reprocess_tax "
-    "REAL NOT NULL DEFAULT 0.0",
+    "REAL NOT NULL DEFAULT 0.04",
     # One toggle per raw group (user request, same day): minerals, moon
     # materials, gas. The single flag they replace is copied into all
     # three the moment they appear, then dropped — the UPDATE and the
@@ -831,11 +835,14 @@ FIRST_RUN_PROFILE = {
         "capital_broker_rate": 0.015,
         "capital_movement_cost_isk": 25_000_000.0,
         "capital_scc_surcharge": 0.005,
-        # v1.25: compressed sourcing on; the two yields stay at their
-        # schema defaults until the user asserts their own.
+        # v1.25: compressed sourcing on at the maintainer's refinery
+        # figures (user, 2026-09-06): 90.63% ore, 95% gas, 4% tax.
         "compressed_minerals_enabled": 1,
         "compressed_moon_enabled": 1,
         "compressed_gas_enabled": 1,
+        "compressed_ore_yield": 0.9063,
+        "compressed_gas_yield": 0.95,
+        "compressed_reprocess_tax": 0.04,
     },
     # Every class builds in null-sec (-0.5) structures at index 0.14%:
     # Sotiyo with T2 ME/TE rigs for every manufacturing class, Tatara
@@ -1101,9 +1108,9 @@ class Settings:
     compressed_minerals_enabled: bool = False
     compressed_moon_enabled: bool = False
     compressed_gas_enabled: bool = False
-    compressed_ore_yield: float = 0.75
-    compressed_gas_yield: float = 0.60
-    compressed_reprocess_tax: float = 0.0  # fraction of output value
+    compressed_ore_yield: float = 0.9063
+    compressed_gas_yield: float = 0.95
+    compressed_reprocess_tax: float = 0.04  # of output value; ore refining only
 
     def compressed_groups(self) -> frozenset[int]:
         """The raw groups compressed sourcing may cover — one toggle each

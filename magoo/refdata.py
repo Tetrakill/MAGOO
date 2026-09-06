@@ -55,16 +55,18 @@ class CompressedSource:
 
     def batch_output(self, batches: int, material_id: int, yield_: float) -> int:
         """Whole output units from `batches` reprocessing batches:
-        batches × floor(base × yield). The floor is applied PER BATCH
-        (review ruling R3, 2026-09-05 — conservative: the game rounds each
-        batch's output down, so a fractional per-batch yield never
-        accumulates across batches; the previous floor(batches × base ×
-        yield) overstated the output by up to batches − 1 units). The
-        9-decimal round guards a binary-float base × yield that should be
-        exactly integral (e.g. 400 × 0.75)."""
+        floor(batches × base × yield) — the floor taken ONCE over the
+        whole job per material, which is how the client computes a
+        reprocessing run. 2026-09-06: this reverses ruling R3's per-batch
+        floor (batches × floor(base × yield)): a compressed gas batch is
+        one unit yielding one, so floor(1 × 0.95) valued every compressed
+        gas at ZERO below a 100% yield and no gas was ever chosen; for ore
+        the two differ by at most batches − 1 units per output. The
+        9-decimal round guards a binary-float product that should be
+        exactly integral (e.g. 4 × 415 × 0.55 = 913)."""
         for m, base in self.outputs:
             if m == material_id:
-                return batches * math.floor(round(base * yield_, 9))
+                return math.floor(round(batches * base * yield_, 9))
         return 0
 
 

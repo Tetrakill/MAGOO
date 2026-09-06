@@ -452,6 +452,43 @@ def test_reprocessing_tax_is_charged_on_output_value(conn, ref):
     assert not compressed_rows(plan)
 
 
+def test_gas_is_decompressed_untaxed_and_floored_once(conn, ref):
+    """2026-09-06: decompressing gas pays no reprocessing tax in the
+    client, and a reprocessing run's output is floored once over the job.
+    Fulleroferrocene (reaction) consumes 200 Fullerite-C50 a run;
+    Compressed Fullerite-C50 at 8.0 decompresses 1:1 at the 95% yield —
+    8.42 per gas unit against 10 direct. A 50% tax would add 4.75 and
+    lose if it applied to gas; the per-batch floor would value every unit
+    at zero output (floor(0.95)) and drop the candidate entirely."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    add_pipeline(conn, ref, "Fulleroferrocene", 20_000)
+    conn.execute("UPDATE settings SET freight_in_isk_per_m3 = 0")
+    conn.commit()
+    enable_compressed(conn, gas=0.95, tax=0.5)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    demand = baseline.items[FULLERITE_C50].recommended_buy_qty
+    assert demand > 0
+    ladders = {HUB: {COMPRESSED_C50: [(8.0, 1_000_000)]}}
+    plan = engine.plan_index_run(conn, ref, snapshot(ref, ladders), persist=False)
+    gas, = compressed_rows(plan)
+    assert gas.type_id == COMPRESSED_C50
+    (material, out, used), = gas.compressed_outputs
+    assert material == FULLERITE_C50
+    # Whole-job floor: the units bought at 95%, rounded down once.
+    import math
+    assert out == math.floor(gas.recommended_buy_qty * 0.95)
+    assert out >= demand and out - used < 1 / 0.95 + 1
+    raw = plan.items[FULLERITE_C50]
+    assert raw.compressed_covered_qty == used == demand
+    assert raw.recommended_buy_qty == 0
+    # No tax on gas: about 8 / 0.95 per unit, nowhere near 8.42 + 4.75.
+    assert 8.3 < raw.effective_unit_cost < 8.6
+    assert plan.compressed_saving_isk == pytest.approx(
+        demand * 10.0 - gas.recommended_buy_qty * 8.0
+    )
+
+
 def test_group_toggles_limit_the_candidates(conn, ref):
     """Each toggle admits the compressed TYPES that yield its group's raws:
     gas-only sourcing never considers Compressed Veldspar, minerals-only
@@ -696,7 +733,11 @@ def test_run_detail_renders_compressed_section_and_badges(ref):
     assert "Compressed sourcing" in html
     assert "Reprocess <b>500 Compressed Veldspar</b>" in html
     assert "~1,200 Tritanium" in html and "leftover +300 Tritanium" in html
-    assert "75% for ore" in html and "60% for gas" in html
+    # The v1.25.1 defaults, rendered exactly (the pct filter — 90.63, not
+    # a whole-percent rounding): 90.63% ore, 95% gas, 4% tax on refined
+    # ore only.
+    assert "90.63% for ore" in html and "95% for gas" in html
+    assert "4% reprocessing tax on every refined-ore output" in html
     assert ">Compressed Veldspar 500\nTritanium 10</textarea>" in html
 
 
