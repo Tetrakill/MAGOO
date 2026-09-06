@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.25 built and live (engine, MILP allocation, sizing feedback
+Status: v1.25.1 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -1521,7 +1521,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 539 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, SDE import atomicity, schema/settings integrity) |
+| Test suite | 540 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, SDE import atomicity, schema/settings integrity) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -2674,6 +2674,31 @@ migrations remain tolerant re-runs. Tests 439 → 532 in d1fbc90, 539
 with the re-import fix (new `test_invention_compare`,
 `test_compressed`, `test_sourcing`, `test_review_p0`,
 `test_sde_outdated`).
+
+### v1.25.1 (2026-09-06): compressed gas fixes — commit 972f454
+
+Two errors kept compressed gas out of every plan. Ruling R3's per-batch
+floor (`n × floor(base × yield)`) valued a compressed gas unit — a batch
+of one yielding one — at zero output below a 100% yield, so the survival
+loop dropped every gas candidate: the maintainer's copy bought all eleven
+gases compressed at a 100% yield and none at 95%, and dev run 73 (pre-R3
+code) chose Compressed Fullerite-C28 and C60 where run 74 chose nothing
+on the same price cache. `batch_output` is now `floor(n × base ×
+yield)`, the floor once over the job as the client computes a
+reprocessing run (ore differs by at most n − 1 units per output; the
+decision log strikes R3). And the reprocessing tax was charged on gas:
+the client charges no tax when decompressing gas (user, 2026-09-06), so
+`compressed_reprocess_tax` rides ore and moon ore candidates only
+(`engine.tax_of`). On the dev data both changes together restore
+compressed C28, C60 and C84 at the 95% yield, with or without the tax.
+Defaults follow the maintainer's refinery (user, same day): 90.63% ore
+yield, 95% gas yield, 4% reprocessing tax — in the Settings defaults,
+the schema-7 column defaults (a database migrating later gets them; one
+already at schema 7 keeps its values) and `FIRST_RUN_PROFILE`; the
+yield inputs step by 0.01 so 90.63 saves. Settings and run-page wording
+say the tax is on refined ore only. Tests 539 → 540
+(`test_gas_is_decompressed_untaxed_and_floored_once`; the R3 unit test
+now asserts the whole-job floor).
 
 ### Development environment constraints (historical)
 
