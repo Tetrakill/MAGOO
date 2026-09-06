@@ -384,6 +384,25 @@ and hover with the teal Hover Wash.
   hex because a data URI cannot read CSS custom properties — keep it in
   sync if the accent is ever retuned.
 - **Grouping:** stacked in `span.tags` inside the trailing table column.
+- **Compressed sourcing (v1.25):** the accent `compressed` badge marks a
+  compressed ore / moon ore / gas bought to be reprocessed (Buy list, Chain,
+  the Profit breakdown's blended-cost lines); a covered raw carries a neutral
+  "N via compressed" badge; a compressed buy the whole-batch re-fill shrank
+  below what the plan wanted reuses the warn `shallow` badge ("the ladder
+  held only N of the M units the plan wanted" — review 2026-09-05). Each
+  tooltip states what is covered, what is left over and how many orders the
+  fill walked — the Tooltip Ledger Rule.
+- **Fill pricing (v1.25):** a buy split across both markets shows an accent
+  venue badge naming each market's share ("Jita 1,000 · C-J6 500"); the unit
+  price cell's tooltip carries the per-venue fill ledger (units, average,
+  orders walked, units beyond the stored ladders); the warn `shallow` badge
+  reads how many units the stored ladders held and names the rest as
+  **unsourced** — "the remaining N are unsourced (no market held them),
+  priced at the last order walked, X ISK, and listed in no Multibuy block"
+  (review 2026-09-05: a remainder is attributed to Jita only when Jita's
+  stored book was truncated; the strip's "N shallow" tooltip says the
+  same). A row nothing filled at all shows "—" in the Venue column with
+  an unsourced tooltip, never a market name.
 
 ### Status Pills
 - **Style:** 999px chips in 11.5px mono with a 7px status dot — Profit Green
@@ -423,7 +442,10 @@ Native `<dialog class="breakdown">`: Void Panel, 8px radius, 60% black
 backdrop, max `min(64rem, 92vw)`. A `.dialog-head` row (zero-margin h2 +
 `form method="dialog"` mini close button), a dim `·`-separated subtotal line,
 then a sortable cost table. Opened per-row via a mini "breakdown" button and
-`showModal()`.
+`showModal()`. The Pipelines invention comparison (2026-09-05) is the same
+dialog with a `.wide` modifier (`min(84rem, 94vw)` — twelve columns); its
+content is fetched on open behind a dim "computing…" line rather than
+cloned from an inline template, so the page never carries it.
 
 ### Disclosures
 `<details>` does triple duty: `details.muted`/`details.help` tuck methodology

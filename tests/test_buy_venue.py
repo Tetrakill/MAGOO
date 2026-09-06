@@ -47,7 +47,7 @@ def add_pipeline(conn, ref, name, qty):
 
 
 def settings_with(**over):
-    return store.Settings(0.05, 24.0, 8, 1, 10000002, "sell", **over)
+    return store.Settings(0.05, 24.0, 1, 10000002, "sell", **over)
 
 
 # --- costing.choose_buy_venue (pure) ---------------------------------------
@@ -116,7 +116,9 @@ def test_unsorted_ladder_is_sorted_before_use():
 
 def _orders():
     return [
-        {"type_id": 34, "price": 100.0, "is_buy_order": False, "volume_remain": 10},
+        # min_volume (review 2026-09-05) rides the rung; absent = 1.
+        {"type_id": 34, "price": 100.0, "is_buy_order": False, "volume_remain": 10,
+         "min_volume": 5},
         {"type_id": 34, "price": 90.0, "is_buy_order": False, "volume_remain": 25},
         {"type_id": 34, "price": 1.0, "is_buy_order": True, "volume_remain": 99},
         {"type_id": 34, "price": 80.0, "is_buy_order": False, "volume_remain": 0},
@@ -126,7 +128,8 @@ def _orders():
 
 def test_sell_ladders_skip_buys_empties_and_unwanted():
     ladders = market._sell_ladders(_orders(), {34, 36})
-    assert ladders == {34: [(90.0, 25), (100.0, 10)]}  # ascending, buy + 0-vol dropped
+    # ascending, buy + 0-vol dropped; min_volume carried (default 1)
+    assert ladders == {34: [(90.0, 25, 1), (100.0, 10, 5)]}
 
 
 def test_refresh_structure_prices_persists_and_replaces_ladders(conn, monkeypatch):
@@ -139,13 +142,16 @@ def test_refresh_structure_prices_persists_and_replaces_ladders(conn, monkeypatc
     assert market.cached_prices(conn, 999, [34, 35, 36], market.STRUCTURE_SOURCE) == {
         34: 90.0, 35: 5.0,
     }
+    # (price, volume_remain, min_volume) since the 2026-09-05 review.
     assert market.cached_structure_ladders(conn, 999, [34, 35, 36]) == {
-        34: [(90.0, 25), (100.0, 10)],
-        35: [(5.0, 3)],
+        34: [(90.0, 25, 1), (100.0, 10, 5)],
+        35: [(5.0, 3, 1)],
     }
-    # Another structure's ladder is untouched by this one's refresh.
+    # Another structure's ladder is untouched by this one's refresh; a
+    # row stored before the min_volume column reads back as minimum 1.
     conn.execute(
-        "INSERT INTO structure_sell_order VALUES (1000, 34, 1.0, 1)"
+        "INSERT INTO structure_sell_order "
+        "(structure_id, type_id, price, volume_remain) VALUES (1000, 34, 1.0, 1)"
     )
     conn.commit()
     # Wholesale replacement: a thinner book leaves no stale rungs.
@@ -156,9 +162,22 @@ def test_refresh_structure_prices_persists_and_replaces_ladders(conn, monkeypatc
         ],
     )
     market.refresh_structure_prices(conn, 999, [34, 35, 36], character_id=1)
-    assert market.cached_structure_ladders(conn, 999, [34, 35, 36]) == {35: [(7.0, 2)]}
-    assert market.cached_structure_ladders(conn, 1000, [34]) == {34: [(1.0, 1)]}
+    assert market.cached_structure_ladders(conn, 999, [34, 35, 36]) == {35: [(7.0, 2, 1)]}
+    assert market.cached_structure_ladders(conn, 1000, [34]) == {34: [(1.0, 1, 1)]}
     assert market.cached_structure_ladders(conn, 999, []) == {}
+
+
+def test_choose_buy_venue_accepts_min_volume_triples():
+    """The cached ladders carry (price, volume, min_volume) since the
+    2026-09-05 review; the Phase 1 picker reads them like the old pairs
+    (it counts units, it does not walk a quantity)."""
+    q = costing.choose_buy_venue(
+        200.0, [(95.0, 50, 10), (105.0, 30, 1), (300.0, 5, 1)], 1.0, 0.0, 0.0
+    )
+    assert q == costing.BuyQuote(95.0, STRUCT, 80)
+    # Mixed shapes in one ladder are fine too.
+    q = costing.choose_buy_venue(None, [(95.0, 50, 10), (105.0, 30)], 1.0, 0.0, 0.0)
+    assert q == costing.BuyQuote(95.0, STRUCT, 80)
 
 
 def test_orders_without_volume_field_give_no_quote(conn, monkeypatch):
@@ -188,8 +207,10 @@ def _seed_hub(conn, type_id, price, hub=1):
 
 
 def _seed_ladder(conn, structure_id, type_id, ladder):
+    # Named columns: min_volume (review 2026-09-05) takes its DEFAULT 1.
     conn.executemany(
-        "INSERT INTO structure_sell_order VALUES (?, ?, ?, ?)",
+        "INSERT INTO structure_sell_order "
+        "(structure_id, type_id, price, volume_remain) VALUES (?, ?, ?, ?)",
         [(structure_id, type_id, p, v) for p, v in ladder],
     )
     conn.commit()

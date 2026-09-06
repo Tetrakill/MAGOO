@@ -8,6 +8,7 @@ seeded price cache + ESI snapshot, one Hulk x 8 pipeline) — see the fixture
 docstring for the wiring.
 """
 
+import json
 import sqlite3
 
 from magoo import config, costing, store
@@ -216,7 +217,6 @@ def _settings_form(**over) -> dict:
         "buffer_pct": "5",
         "purchase_margin_pct": "5",
         "duration": "48",
-        "batch": "8",
         "extra_runs": "1",
         "region": "10000002",
         "source": "sell",
@@ -251,6 +251,9 @@ def _settings_form(**over) -> dict:
         "skill_encryption": "5",
         "t1_overbuild_pct": "400",
         "t2_overbuild_pct": "400",
+        "compressed_ore_yield_pct": "75",
+        "compressed_gas_yield_pct": "60",
+        "compressed_tax_pct": "0",
     }
     for cls in config.ITEM_CLASSES:
         form[f"{cls}_structure"] = ""
@@ -291,3 +294,278 @@ def test_settings_post_locale_comma_decimal_saves(seeded_client):
     c.close()
     assert saved.freight_in_isk_per_m3 == 1.5  # "1,5" read as 1.5
     assert saved.max_run_duration_hours == 48.0  # the rest saved too
+
+
+# --- review 2026-09-05: buy-side badges, the unsourced remainder, the ----------
+# --- compressed shallow flag, the newer-database page, hub_prices -------------
+
+
+def _fill_row(name, type_id, qty, **extra):
+    """A Buy-list row as _buy_context / run_detail see it (the sqlite row
+    shape, every v1.25 column present)."""
+    row = {
+        "name": name, "type_id": type_id, "group_id": 18, "category": "Mineral",
+        "category_id": 4, "depth": 5, "blueprint_id": None, "activity_id": None,
+        "recommended_buy_qty": qty, "price_snapshot": 10.0, "capacity_limited": 0,
+        "runs_allocated": 0, "jobs_allocated": 0, "max_runs_per_job": 1,
+        "recommended_build_qty": 0, "time_per_run": 0.0, "low_stock": 0,
+        "savings_unpriced_inputs": 0, "deficit_qty": qty,
+        "target_stock_qty": qty, "merged_min_qty": qty, "on_hand_qty": 0,
+        "in_progress_qty": 0, "buy_venue": store.BUY_VENUE_HUB,
+        "structure_units_cheaper": None, "price_region_wide": 0,
+        "compressed_outputs": None, "compressed_ladder_units": None,
+        "compressed_fill_orders": None, "compressed_wanted_qty": None,
+        "compressed_covered_qty": 0, "effective_unit_cost": None,
+        "hub_buy_qty": qty, "hub_fill_price": 10.0, "hub_fill_orders": 1,
+        "structure_buy_qty": 0, "structure_fill_price": None,
+        "structure_fill_orders": 0, "unfilled_qty": 0, "unfilled_price": None,
+    }
+    row.update(extra)
+    return row
+
+
+def _detail_ctx(rows, bc, **over):
+    """run_detail.html context over synthetic rows + a _buy_context."""
+    run = {"run_number": 7, "status": "planned", "planned_start": "2026-09-05",
+           "index_run_id": 1, "wallet_character_isk": 1e9,
+           "wallet_corporation_isk": 2e9, "completed_at": None,
+           "compressed_saving_isk": None}
+    ctx = dict(
+        run=run, items=rows, final_ids=set(), final_net_margin={},
+        buys=bc["buys"], builds=[], reactions=[], builds_grouped=[],
+        reactions_grouped=[], struct_builds=[], struct_buys=[], struct_slots=0,
+        chain_struct=[], alchemy=[], alchemy_yield=0.55, chain_rows=[],
+        chain_raws=[], chain_mfg=[], chain_reactions=[],
+        chain_counts={"covered": 0, "buy": 0, "build": 0, "react": 0, "alchemy": 0},
+        unmet=[], low_stock=[], buy_total=bc["buy_total"],
+        buys_unpriced=bc["buys_unpriced"], multibuy_hub=bc["multibuy_hub"],
+        multibuy_structure=bc["multibuy_structure"],
+        structure_buys=bc["structure_buys"], split_buys=bc["split_buys"],
+        venue_qty=bc["venue_qty"], shallow=bc["shallow"],
+        region_wide=bc["region_wide"], compressed=bc["compressed"],
+        compressed_covered=bc["compressed_covered"],
+        compressed_shallow=bc["compressed_shallow"], compressed_section=[],
+        compressed_saving=None, mfg_slots_used=0, reaction_slots_used=0,
+        alchemy_slots_used=0,
+    )
+    ctx.update(over)
+    return ctx
+
+
+def _render_detail(ctx, template="run_detail.html", path="/runs/1"):
+    from flask import render_template
+
+    from conftest import template_app
+
+    app = template_app()
+    with app.test_request_context(path):
+        return render_template(template, **ctx)
+
+
+def _settings():
+    from test_buy_venue import settings_with
+
+    return settings_with(manufacturing_slots=50, reaction_slots=50)
+
+
+def test_unsourced_remainder_is_in_no_venue_and_no_multibuy(ref):
+    """R5: a fill-priced row's remainder beyond an EXHAUSTED book stays in
+    the row's quantity but belongs to no venue — hub + structure + unfilled
+    == recommended_buy_qty, and Multibuy lists the filled parts only. A row
+    nothing filled at all sits in neither block."""
+    from magoo.web import _buy_context
+
+    trit = _fill_row(
+        "Tritanium", 34, 1200, hub_buy_qty=1000, unfilled_qty=200,
+        unfilled_price=12.0,
+    )
+    pyer = _fill_row(
+        "Pyerite", 35, 50, hub_buy_qty=0, hub_fill_price=None,
+        hub_fill_orders=0, unfilled_qty=50, unfilled_price=20.0,
+    )
+    bc = _buy_context([trit, pyer], ref)
+    for row in (trit, pyer):
+        assert (
+            row["hub_buy_qty"] + row["structure_buy_qty"] + row["unfilled_qty"]
+            == row["recommended_buy_qty"]
+        )
+    assert bc["venue_qty"] == {34: (1000, 0), 35: (0, 0)}
+    assert bc["shallow"] == {34, 35}
+    assert bc["structure_buys"] == set() and bc["split_buys"] == set()
+    assert bc["multibuy_hub"] == "Tritanium 1000"  # never the 200 unsourced
+    assert bc["multibuy_structure"] == ""
+    # the totals still carry the whole quantity at the blended price
+    assert bc["buy_total"] == 1200 * 10.0 + 50 * 10.0
+
+    html = _render_detail(_detail_ctx([trit, pyer], bc, settings=_settings()))
+    # B2: a hub-only shallow run keeps its strip badge
+    assert "2 shallow" in html
+    assert "the remainder is unsourced" in html
+    # B9: the row badge names the unsourced units and their price
+    assert "only 1,000 of 1,200 units were on the stored Jita / C-J6 sell ladders" in html
+    assert ("the remaining 200 are unsourced (no market held them), priced at "
+            "the last order walked, 12 ISK") in html
+    assert "listed under Jita" not in html
+    # the fully unsourced row names no venue
+    assert "no stored sell ladder held any of this buy" in html
+    assert ">Tritanium 1000</textarea>" in html
+    assert "Pyerite 50" not in html.split("<textarea", 1)[1]
+
+
+def test_via_structure_count_excludes_split_rows(ref):
+    """B3: "N via C-J6" counts rows bought ONLY at the structure — a split
+    row has its own badge and was counted twice."""
+    from magoo.web import _buy_context
+
+    split = _fill_row(
+        "Tritanium", 34, 1500, buy_venue=store.BUY_VENUE_SPLIT,
+        hub_buy_qty=1000, structure_buy_qty=500, structure_fill_price=8.0,
+        structure_fill_orders=1,
+    )
+    struct = _fill_row(
+        "Pyerite", 35, 40, buy_venue=store.BUY_VENUE_STRUCTURE,
+        hub_buy_qty=0, hub_fill_price=None, hub_fill_orders=0,
+        structure_buy_qty=40, structure_fill_price=9.0, structure_fill_orders=1,
+    )
+    bc = _buy_context([split, struct], ref)
+    assert bc["structure_buys"] == {34, 35} and bc["split_buys"] == {34}
+    html = _render_detail(_detail_ctx([split, struct], bc, settings=_settings()))
+    assert "1 via C-J6" in html and "2 via C-J6" not in html
+    assert "1 split" in html
+    # and a run whose only structure rows are split shows no "via" badge
+    bc = _buy_context([split], ref)
+    html = _render_detail(_detail_ctx([split], bc, settings=_settings()))
+    assert "via C-J6" not in html and "1 split" in html
+
+
+def test_compressed_shallow_flags_a_buy_shrunk_below_the_wanted_qty(ref):
+    """R6: the compressed shallow badge fires when the pass shrank the buy
+    below what the LP wanted (compressed_wanted_qty > recommended_buy_qty);
+    a row without the figure (pre-column, NULL, or the key absent) is not
+    flagged. The old ladder-units comparison could never fire after the
+    shrink."""
+    from magoo.web import _buy_context
+
+    veld = ref.type_id("Compressed Veldspar")
+    outputs = json.dumps([[34, 1200, 1000]])
+    shrunk = _fill_row(
+        "Compressed Veldspar", veld, 400, compressed_outputs=outputs,
+        compressed_ladder_units=400, compressed_fill_orders=2,
+        compressed_wanted_qty=500,
+    )
+    whole = _fill_row(
+        "Compressed Scordite", ref.type_id("Compressed Scordite"), 300,
+        compressed_outputs=outputs, compressed_ladder_units=300,
+        compressed_fill_orders=1, compressed_wanted_qty=300,
+    )
+    legacy = _fill_row(
+        "Compressed Plagioclase", ref.type_id("Compressed Plagioclase"), 200,
+        compressed_outputs=outputs, compressed_ladder_units=150,
+        compressed_fill_orders=1, compressed_wanted_qty=None,
+    )
+    absent = _fill_row(
+        "Compressed Pyroxeres", ref.type_id("Compressed Pyroxeres"), 200,
+        compressed_outputs=outputs, compressed_ladder_units=150,
+        compressed_fill_orders=1,
+    )
+    del absent["compressed_wanted_qty"]
+    bc = _buy_context([shrunk, whole, legacy, absent], ref)
+    assert bc["compressed_shallow"] == {veld}
+    html = _render_detail(
+        _detail_ctx([shrunk, whole, legacy, absent], bc, settings=_settings())
+    )
+    assert "the ladder held only 400 of the 500 units the plan wanted" in html
+    assert html.count(">shallow</span>") == 1
+    assert "1 shallow" in html
+
+
+def test_deficit_dialog_and_chain_tooltip_carry_the_compressed_covered_leg(ref):
+    """B5/B6: a raw part-covered by compressed purchases states both legs —
+    the Plan tab's deficit dialog reads the covered units off the row
+    (data-covered) and the Chain tab's tooltip no longer says "bought
+    just-in-time: 0" for a fully covered raw."""
+    from magoo.web import _buy_context, _chain_context
+
+    trit = _fill_row(
+        "Tritanium", 34, 100, deficit_qty=1300, compressed_covered_qty=1200,
+        effective_unit_cost=7.0,
+    )
+    covered = _fill_row(
+        "Pyerite", 35, 0, deficit_qty=500, compressed_covered_qty=500,
+        effective_unit_cost=7.0,
+    )
+    bc = _buy_context([trit, covered], ref)
+    html = _render_detail(_detail_ctx([trit, covered], bc, settings=_settings()))
+    assert 'data-covered="1200"' in html
+    assert "come from reprocessing compressed purchases" in html  # openDeficit
+    # the chain tab: buy_qty + compressed_covered, never "just-in-time: 0"
+    rows = [
+        {**i, "alchemy_credit_qty": 0, "alchemy_for_type_id": None,
+         "alchemy_output_qty": 0}
+        for i in (trit, covered)
+    ]
+    chain = _chain_context(ref, rows)
+    by_name = {r["name"]: r for r in chain["chain_rows"]}
+    assert by_name["Pyerite"]["status"] == "buy"
+    chain_ctx = dict(
+        run={"run_number": 7, "status": "planned", "planned_start": "2026-09-05",
+             "index_run_id": 1},
+        settings=_settings(), **chain,
+    )
+    html = _render_detail(chain_ctx, "run_chain.html", "/runs/1?view=chain")
+    assert "bought just-in-time: 0" not in html
+    assert ("500 just-in-time: 0 bought direct + 500 from reprocessing "
+            "compressed purchases") in html
+    assert ("1,300 just-in-time: 100 bought direct + 1,200 from reprocessing "
+            "compressed purchases") in html
+
+
+def test_newer_database_message_reaches_the_user(seeded_client, monkeypatch):
+    """B7: store.ensure_schema refuses a database written by a newer build
+    with a RuntimeError; the message must reach the user on a page, not
+    vanish into a bare 500."""
+
+    def refuse(*_a, **_k):
+        raise RuntimeError("This database was written by a newer version of Magoo")
+
+    monkeypatch.setattr(store, "ensure_schema", refuse)
+    resp = seeded_client.get("/")
+    assert resp.status_code == 500
+    body = resp.get_data(as_text=True)
+    assert "written by a newer version of Magoo" in body
+    assert "Magoo cannot continue" in body
+    # the DB-free health probe is unaffected
+    assert seeded_client.get("/magoo/health").status_code == 200
+
+
+def test_run_post_passes_the_cached_hub_quotes_to_the_snapshot(
+    seeded_client, monkeypatch, ref
+):
+    """C5: /run hands snapshot_from_state hub_prices — the cached Jita quote
+    per demanded type (kept even where the structure venue wins Phase 1) —
+    so the sourcing pass can raise its synthetic hub rung from the hub
+    figure, not the winning venue's."""
+    from magoo import engine, market
+
+    captured = {}
+
+    def capture(conn, **kwargs):
+        captured.update(kwargs)
+        return None  # -> "no ESI data yet" redirect; the plan never runs
+
+    monkeypatch.setattr(engine, "snapshot_from_state", capture)
+    resp = seeded_client.post("/run")
+    assert resp.status_code == 302
+    assert "hub_prices" in captured
+    c = _state()
+    settings_ = store.get_settings(c)
+    expected = {
+        t: price
+        for t, (price, _rw) in market.cached_hub_quotes(
+            c, settings_.price_region_id, engine.demand_type_ids(c, ref),
+            settings_.price_source,
+        ).items()
+    }
+    c.close()
+    assert expected and captured["hub_prices"] == expected
+    assert captured["hub_prices"][ref.type_id("Tritanium")] > 0

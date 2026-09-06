@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from magoo import market, store
+from magoo import config, market, store
 
 
 @pytest.fixture
@@ -319,3 +319,79 @@ def test_sustained_throttle_stops_the_pool(conn, monkeypatch):
     )
     assert (fetched, skipped, fresh) == (0, 3, 0)
     assert len(calls) == 1  # pool-wide stop after the first throttle
+
+
+# --- review 2026-09-05: min_volume on the ladders, buy-side ladder guard ---
+
+
+def test_hub_ladder_carries_min_volume():
+    """Each rung is (price, volume_remain, min_volume): ESI's minimum
+    fill rides along (absent or junk = 1) so the walks can skip an order
+    that cannot be bought in the needed quantity."""
+    station = config.JITA_44_STATION_ID
+    orders = [
+        {"price": 9.0, "location_id": station, "volume_remain": 40, "min_volume": 10},
+        {"price": 8.5, "location_id": station, "volume_remain": 10},
+        {"price": 8.0, "location_id": station, "volume_remain": 0, "min_volume": 3},
+        {"price": 7.0, "location_id": station, "volume_remain": 4, "min_volume": "junk"},
+        {"price": 6.5, "location_id": station, "volume_remain": 4, "min_volume": 0},
+        {"price": 1.0, "location_id": 60000001, "volume_remain": 99, "min_volume": 1},
+    ]
+    assert market._hub_ladder(orders, config.THE_FORGE_REGION_ID) == [
+        (6.5, 4, 1), (7.0, 4, 1), (8.5, 10, 1), (9.0, 40, 10),
+    ]
+
+
+def test_refresh_persists_min_volume_and_reads_it_back(conn, monkeypatch):
+    monkeypatch.setattr(
+        market, "_hub_ladder_quote",
+        lambda *a, **k: (8.5, 1, [(8.5, 10, 1), (9.0, 40, 10)]),
+    )
+    market.refresh_prices(conn, 10000002, [34], "sell", ladder_type_ids=[34])
+    assert market.cached_hub_ladders(conn, 10000002, [34]) == {
+        34: [(8.5, 10, 1), (9.0, 40, 10)]
+    }
+    # A fetcher still handing back (price, volume) pairs stores minimum 1
+    # (the ladder-less fresh row is refetched regardless of age).
+    conn.execute("DELETE FROM hub_sell_order")
+    conn.commit()
+    monkeypatch.setattr(
+        market, "_hub_ladder_quote", lambda *a, **k: (8.0, 1, [(8.0, 5)])
+    )
+    market.refresh_prices(conn, 10000002, [34], "sell", ladder_type_ids=[34])
+    assert market.cached_hub_ladders(conn, 10000002, [34]) == {34: [(8.0, 5, 1)]}
+    # Rows stored before the column read back as minimum 1 too.
+    conn.execute(
+        "INSERT INTO hub_sell_order (region_id, type_id, price, volume_remain) "
+        "VALUES (10000002, 35, 2.0, 7)"
+    )
+    conn.commit()
+    assert market.cached_hub_ladders(conn, 10000002, [35]) == {35: [(2.0, 7, 1)]}
+
+
+def test_sell_ladders_are_empty_for_a_buy_price_source(conn):
+    """No hub SELL ladder is ever pulled for the buy side, so the sourcing
+    pass gets NO ladders at all — never the structure's alone, which would
+    let a dearer C-J6 book fill-price a buy the Jita quote covers
+    (review 2026-09-05, P0)."""
+    conn.execute(
+        "INSERT INTO hub_sell_order (region_id, type_id, price, volume_remain) "
+        "VALUES (10000002, 34, 9.0, 10)"
+    )
+    conn.execute(
+        "INSERT INTO structure_sell_order "
+        "(structure_id, type_id, price, volume_remain, min_volume) "
+        "VALUES (?, 34, 50.0, 100, 2)",
+        (config.CJ6_KEEPSTAR_STRUCTURE_ID,),
+    )
+    conn.commit()
+    both = market.sell_ladders(conn, store.get_settings(conn), [34])
+    assert both == {
+        store.BUY_VENUE_HUB: {34: [(9.0, 10, 1)]},
+        store.BUY_VENUE_STRUCTURE: {34: [(50.0, 100, 2)]},
+    }
+    conn.execute("UPDATE settings SET price_source = 'buy'")
+    conn.commit()
+    assert market.sell_ladders(conn, store.get_settings(conn), [34]) == {
+        store.BUY_VENUE_HUB: {}, store.BUY_VENUE_STRUCTURE: {},
+    }

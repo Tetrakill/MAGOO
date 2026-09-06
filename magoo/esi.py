@@ -860,7 +860,7 @@ def refresh_state(conn, ref) -> dict:
 def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     conn = store.connect()
-    store.ensure_schema(conn)
+    store.ensure_schema(conn, profile=store.FIRST_RUN_PROFILE)
     command = argv[0] if argv else "status"
     if command == "status":
         rows = conn.execute(

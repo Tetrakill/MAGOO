@@ -1,0 +1,66 @@
+{# The invention comparison window's content (2026-09-05): one capable
+   pipeline's source × decryptor options at today's prices, best margin
+   first. Fetched by the Pipelines page into its shared dialog on demand —
+   never inlined, so the page GET carries none of the 9–27 chain walks
+   behind it. Each row re-walks the whole chain at that option's invented
+   ME (the materials bill moves with the decryptor, not just the invention
+   line); the manual BPC cost is never part of these figures. #}
+<div class="dialog-head">
+  <h2 id="cmp-title">{{ name }} — invention comparison</h2>
+  <form method="dialog"><button class="mini">close</button></form>
+</div>
+<p class="muted" style="margin:.4rem 0 .6rem">
+  {% if price is not none %}sell {{ price|isk }} · net {{ net|isk }} / unit after
+  {{ 'capital ' if capital }}sell fees{% else %}no sell quote cached for {{ name }}
+  — margins unavailable, costs still compare{% endif %} ·
+  {{ qty|qty }} / run · quotes {{ prices_at|age }} old ·
+  {% if current %}current choice badged{% else %}invention is off — the manual
+  BPC cost is not in these figures{% endif %}</p>
+<div class="tablewrap">
+<table class="sortable profit compare">
+  <thead><tr>
+    {% if multi %}<th>Source</th>{% endif %}
+    <th>Decryptor</th>
+    <th class="num">Chance</th>
+    <th class="num">Runs</th>
+    <th class="num">ME</th>
+    <th class="num">TE</th>
+    <th class="num">Invention / unit</th>
+    <th class="num">Cost / unit</th>
+    <th class="num">Margin / unit</th>
+    <th class="num">Margin %</th>
+    <th class="num">Margin / cycle</th>
+    <th class="tagcol"></th>
+  </tr></thead>
+  {% for row in rows %}
+  {% set neg = row.margin is not none and row.margin < 0 %}
+  <tr class="{% if neg %}neg{% elif row.best %}top{% endif %}">
+    {% if multi %}<td>{{ row.source_name }}</td>{% endif %}
+    <td>{{ row.decryptor_name }}</td>
+    <td class="num" data-sort="{{ row.chance }}">{{ "%.1f"|format(row.chance * 100) }}%</td>
+    <td class="num" title="licensed runs per invented copy{% if batches and row.runs > 1 %} — a ship final builds in whole {{ row.runs }}-hull batches{% endif %}">{{ row.runs }}</td>
+    <td class="num">{{ row.me }}</td>
+    <td class="num">{{ row.te }}</td>
+    <td class="num" title="{{ row.invention_per_unit|isk }} ISK per unit — {{ row.cost_per_run|isk }} per licensed run: (datacores + decryptor + fees) ÷ (chance × runs per copy)">{{ row.invention_per_unit|isk_short }}</td>
+    <td class="num" title="{{ row.cost.total|isk }} ISK — materials {{ row.cost.subtotal('material')|isk }} · job fees {{ row.cost.subtotal('install')|isk }} · freight {{ row.cost.subtotal('freight_in')|isk }} · invention {{ row.invention_per_unit|isk }}">{{ row.cost.total|isk_short }}</td>
+    <td class="num {% if neg %}bad{% elif row.margin %}good{% endif %}"
+        title="{{ row.margin|isk }}">{{ row.margin|isk_short }}</td>
+    <td class="num {% if neg %}bad{% elif row.margin %}good{% endif %}">
+      {% if row.margin is not none and row.cost.total %}
+        {{ "%.1f"|format(row.margin / row.cost.total * 100) }}%
+      {% else %}—{% endif %}</td>
+    {% set cyc = (row.margin * qty) if row.margin is not none else none %}
+    <td class="num {% if neg %}bad{% elif row.margin %}good{% endif %}"
+        title="{{ cyc|isk }}">{{ cyc|isk_short }}</td>
+    <td class="tagcol"><span class="tags">
+      {% if row.current %}<span class="badge accent" title="the pipeline's configured choice">current</span>{% endif %}
+      {% if row.best %}<span class="badge good" title="the highest margin per unit at today's prices">best</span>{% endif %}
+      {% if row.unpriced %}<span class="badge warn" title="{{ row.unpriced }} input(s) have no cached price and count as 0 — the cost understates">{{ row.unpriced }} unpriced</span>{% endif %}
+      {% if neg %}<span class="badge fill bad" title="net proceeds after sell fees fall below the chain cost">negative margin</span>{% endif %}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+<p class="muted footnote" style="margin:.4rem 0 0">full ISK on hover ·
+  sorted by margin / unit · every row re-costs the whole chain at its
+  invented ME · pick the choice with the Invention selects on the row</p>

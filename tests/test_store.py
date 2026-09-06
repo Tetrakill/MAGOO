@@ -253,3 +253,65 @@ def test_industry_scc_surcharge_setting_roundtrip(conn):
     conn.execute("UPDATE settings SET industry_scc_surcharge = 0.025")
     conn.commit()
     assert store.get_settings(conn).industry_scc_surcharge == 0.025
+
+
+def test_first_run_profile_applies_to_a_fresh_database_only(tmp_path):
+    """The first-run profile (2026-09-05) seeds a NEW database with the
+    author's working configuration; a database that already has a
+    settings row keeps every value it holds, on every later call."""
+    c = sqlite3.connect(tmp_path / "fresh.sqlite")
+    c.row_factory = sqlite3.Row
+    store.ensure_schema(c, profile=store.FIRST_RUN_PROFILE)
+    s = store.get_settings(c)
+    assert s.stockpile_buffer == 0.01
+    assert s.max_run_duration_hours == 800.0
+    assert s.manufacturing_slots == 540
+    assert s.alchemy_enabled is True
+    assert s.freight_in_isk_per_m3 == 900.0
+    assert s.capital_movement_cost_isk == 25_000_000.0
+    # v1.25 profile turns all three compressed group toggles on.
+    assert (s.compressed_minerals_enabled, s.compressed_moon_enabled, s.compressed_gas_enabled) == (True, True, True)
+    assert s.compressed_sourcing_enabled is True
+    classes = store.get_class_settings(c)
+    assert classes["t2_ships"].structure_type_id == config.STRUCTURE_TYPE_SOTIYO
+    assert (classes["t2_ships"].me_rig, classes["t2_ships"].te_rig) == ("t2", "t2")
+    assert classes["reactions"].structure_type_id == config.STRUCTURE_TYPE_TATARA
+    assert classes["capital_ships"].structure_type_id == config.STRUCTURE_TYPE_SOTIYO
+    assert (classes["invention"].me_rig, classes["invention"].te_rig) == ("t2", "none")
+    assert (classes["other"].me_rig, classes["other"].te_rig) == ("t2", "t2")
+    assert classes["other"].security == -0.5
+    assert classes["other"].system_cost_index == 0.0014
+    assert store.blacklist_categories(c) == {"tools"}
+
+    # The user changes things; an update (ensure_schema again, profile
+    # passed as the app always does) must leave every one of them alone.
+    c.execute(
+        "UPDATE settings SET stockpile_buffer = 0.07, manufacturing_slots = 12, "
+        "alchemy_enabled = 0 WHERE id = 1"
+    )
+    c.execute(
+        "UPDATE class_setting SET structure_type_id = NULL, me_rig = 'none' "
+        "WHERE item_class = 't2_ships'"
+    )
+    store.set_blacklist_categories(c, set())
+    c.commit()
+    store.ensure_schema(c, profile=store.FIRST_RUN_PROFILE)
+    s = store.get_settings(c)
+    assert (s.stockpile_buffer, s.manufacturing_slots, s.alchemy_enabled) == (
+        0.07, 12, False,
+    )
+    assert store.get_class_settings(c)["t2_ships"].structure_type_id is None
+    assert store.blacklist_categories(c) == set()
+    c.close()
+
+
+def test_first_run_profile_skips_a_database_seeded_without_it(conn):
+    """A database that already exists at the neutral defaults (the test
+    fixtures, or a pre-profile install) is an EXISTING database: the
+    profile never lands on it."""
+    store.ensure_schema(conn, profile=store.FIRST_RUN_PROFILE)
+    s = store.get_settings(conn)
+    assert s.stockpile_buffer == 0.05
+    assert s.manufacturing_slots == 10
+    assert store.get_class_settings(conn)["other"].structure_type_id is None
+    assert store.blacklist_categories(conn) == set()

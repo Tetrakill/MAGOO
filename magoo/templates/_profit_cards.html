@@ -47,7 +47,7 @@
       {% endif %}
       {% if card.cost.missing_prices %}
         <span class="badge warn" title="{{ card.cost.missing_prices }}
-        input(s) have no cached price and count as 0 — the cost
+        input(s) or job fees have no cached price and count as 0 — the cost
         understates">{{ card.cost.missing_prices }} unpriced</span>
       {% endif %}
       {% if not lagged and card.cost.region_priced %}
@@ -96,7 +96,9 @@
       <td>{{ line.name }}
         {% if line.missing_price %}<span class="badge warn" title="no price on record for this input — it counts as 0 in the total">no price</span>{% endif %}
         {% if not lagged and line.region_price %}<span class="badge" title="no hub-station order; region-wide best order from the NPC-goods region">region price</span>{% endif %}
-        {% if line.kind == 'material' and line.venue == 'structure' %}<span class="badge accent" title="{% if lagged %}bought at the structure market (cheaper landed than Jita at that run's plan time){% else %}cheaper landed at the structure market than at Jita{% endif %}">{{ settings.structure_market_label() }}</span>{% endif %}</td>
+        {% if line.kind == 'material' and line.venue == 'structure' %}<span class="badge accent" title="{% if lagged %}bought at the structure market (cheaper landed than Jita at that run's plan time){% else %}cheaper landed at the structure market than at Jita{% endif %}">{{ settings.structure_market_label() }}</span>{% endif %}
+        {% if line.kind == 'material' and line.venue == 'split' %}<span class="badge accent" title="bought at both markets at that run's plan time — {{ "%.0f"|format(line.hub_fraction * 100) }}% of the units from Jita, the rest from {{ settings.structure_market_label() }}; freight splits the same way">Jita + {{ settings.structure_market_label() }}</span>{% endif %}
+        {% if line.landed %}<span class="badge accent" title="part-sourced from compressed ore / gas at that run's plan time — the unit cost is the blended landed figure, inbound freight included (so no share of the freight lines below)">compressed</span>{% endif %}</td>
       <td class="muted">{{ line.kind }}</td>
       <td class="num">{{ line.depth }}</td>
       <td class="num">{{ "%.2f"|format(line.qty_per_hull) }}</td>

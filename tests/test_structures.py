@@ -69,7 +69,7 @@ def test_astrahus_pipeline_plans_its_chain(conn, ref):
     plan = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
     assert len(plan.items) == 24  # final + components + minerals/PI (SDE anchor)
     final = plan.items[ref.type_id("Astrahus")]
-    # finals are exact — no ship batch multiple for a structure
+    # finals are exact — no batch rounding for a structure
     assert final.total_runs_needed == 1
     assert final.recommended_build_qty == 1
     assert final.recommended_action == "build"
@@ -88,7 +88,7 @@ def test_keepstar_is_one_exact_single_run_job(conn, ref):
     plan = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
     assert len(plan.items) == 33  # SDE anchor
     final = plan.items[ref.type_id("Keepstar")]
-    assert final.total_runs_needed == 1  # never rounded to ship_batch_multiple (8)
+    assert final.total_runs_needed == 1  # never batch-rounded
     assert final.jobs_allocated == 1
     assert final.recommended_build_qty == 1
     assert final.item_class == "structures"
@@ -162,7 +162,7 @@ def test_rig_pipeline_plans_exact_quantity(conn, ref):
     add_pipeline(conn, ref, name, 10)
     plan = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
     final = plan.items[ref.type_id(name)]
-    assert final.total_runs_needed == 10  # exact, no batch multiple
+    assert final.total_runs_needed == 10  # exact, never batch-rounded
     assert final.item_class == "structures"
 
 
@@ -328,7 +328,7 @@ def test_run_detail_template_renders_structure_components_section(ref):
         buys_unpriced=0,
         multibuy_hub="Tritanium 5000\nStructure Construction Parts 12",
         multibuy_structure="", structure_buys=set(), shallow=set(),
-        settings=store.Settings(0.05, 24.0, 8, 1, 10000002, "sell",
+        settings=store.Settings(0.05, 24.0, 1, 10000002, "sell",
                                 manufacturing_slots=50, reaction_slots=50),
         mfg_slots_used=3, reaction_slots_used=0, alchemy_slots_used=0,
         region_wide={trit["type_id"]},

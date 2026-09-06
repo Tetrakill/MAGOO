@@ -19,7 +19,7 @@ from magoo import config, sdeimport, store, web
 
 def test_job_runs_reports_progress_and_done():
     def runner(force=False, progress=None):
-        progress({"stage": "import", "dataset": "types", "step": 3, "steps": 8})
+        progress({"stage": "import", "dataset": "types", "step": 3, "steps": 9})
         return True
 
     job = sdeimport.ImportJob(runner)
@@ -111,7 +111,11 @@ _DATASET_RECORDS = {
     "types": [
         {"_key": 587, "groupID": 25, "name": {"en": "Rifter"}, "published": True},
         {"_key": 687, "groupID": 25, "name": {"en": "Rifter Blueprint"}, "published": True},
+        # v1.25: a compression pair carrying the SDE's portionSize.
+        {"_key": 1230, "groupID": 462, "name": {"en": "Veldspar"}, "published": True, "portionSize": 100},
+        {"_key": 62516, "groupID": 462, "name": {"en": "Compressed Veldspar"}, "published": True, "portionSize": 100},
     ],
+    "compressibleTypes": [{"_key": 1230, "compressedTypeID": 62516}],
     "blueprints": [
         {
             "_key": 687,
@@ -149,7 +153,8 @@ _DATASET_RECORDS = {
         {"_key": 4, "name": {"en": "All"}, "categoryIDs": [6], "groupIDs": []}
     ],
     "typeMaterials": [
-        {"_key": 587, "materials": [{"materialTypeID": 34, "quantity": 10}]}
+        {"_key": 587, "materials": [{"materialTypeID": 34, "quantity": 10}]},
+        {"_key": 62516, "materials": [{"materialTypeID": 34, "quantity": 400}]},
     ],
 }
 
@@ -187,8 +192,8 @@ def test_run_import_emits_ordered_progress_events(offline_sde):
     assert stages[0] == "check"
     assert {"stage": "resolved", "build": 999, "had": None} in events
     imports = [e for e in events if e["stage"] == "import"]
-    assert [e["step"] for e in imports] == list(range(1, 9))
-    assert all(e["steps"] == 8 for e in imports)
+    assert [e["step"] for e in imports] == list(range(1, 10))
+    assert all(e["steps"] == 9 for e in imports)
     assert imports[0]["dataset"] == "categories"
     assert imports[-1]["dataset"] == "solar systems"
     assert stages[-1] == "finalize"
@@ -197,6 +202,14 @@ def test_run_import_emits_ordered_progress_events(offline_sde):
     assert conn.execute("SELECT build_number FROM ref_sde_build").fetchone() == (
         999,
     )
+    # v1.25: the compression pair and the portion size landed too.
+    assert conn.execute(
+        "SELECT compressed_type_id FROM ref_compressible WHERE type_id = 1230"
+    ).fetchone() == (62516,)
+    assert conn.execute(
+        "SELECT portion_size FROM ref_type WHERE type_id IN (587, 62516) "
+        "ORDER BY type_id"
+    ).fetchall() == [(1,), (100,)]
     conn.close()
 
 
@@ -285,7 +298,9 @@ def test_ensure_schema_runs_once_per_app(tmp_path, monkeypatch):
     calls = []
     real = store.ensure_schema
     monkeypatch.setattr(
-        store, "ensure_schema", lambda c: (calls.append(1), real(c))[1]
+        store,
+        "ensure_schema",
+        lambda c, **kw: (calls.append(1), real(c, **kw))[1],
     )
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "fresh.sqlite")
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
@@ -307,7 +322,7 @@ def test_start_polls_and_finishes(fresh_app, fresh_client, monkeypatch):
         progress({"stage": "download", "done": 5_000_000, "total": 10_000_000})
         started.set()
         release.wait(5)
-        progress({"stage": "import", "dataset": "types", "step": 3, "steps": 8})
+        progress({"stage": "import", "dataset": "types", "step": 3, "steps": 9})
         return True
 
     monkeypatch.setattr(sdeimport, "run_import", fake_run)

@@ -55,26 +55,23 @@ def fetch_adjusted_prices() -> dict[int, float]:
     }
 
 
-def _order_prices(
+def _order_book(
     client: httpx.Client,
     region_id: int,
     type_id: int,
     source: str,
     low_budget: threading.Event,
-) -> tuple[float | None, float | None]:
-    """(hub price, region-wide price) for one type in one region from ONE
-    paged pull: min sell or max buy at the region's hub station where one
-    is configured (The Forge -> Jita 4-4), and the same over every station
-    in the region. Either is None when no such orders exist. Regions with
-    no configured hub return the same value twice.
+) -> list[dict] | None:
+    """Every order of one type in one region from ONE paged pull (the
+    region's whole book for that type and side). None when the type has
+    no orders at all (404 on page 1); a 404 mid-pull (the book shrank
+    between pages) keeps the pages already collected.
 
     Runs on worker threads: network only, no database access. Raises
     _Throttled when ESI keeps answering 420/429 through esi_request's own
     Retry-After handling; flags low_budget when the rate-limit bucket runs
     low so the pool stops starting new work."""
-    station = config.PRICE_STATION_FILTERS.get(region_id)
-    prices: list[float] = []
-    region_prices: list[float] = []
+    orders: list[dict] = []
     page = 1
     while True:
         resp = esi_request(
@@ -86,7 +83,7 @@ def _order_prices(
             raise _Throttled
         if resp.status_code == 404:
             if page == 1:
-                return None, None  # no orders for this type at all
+                return None  # no orders for this type at all
             break  # book shrank mid-pull: keep the pages already collected
         resp.raise_for_status()
         try:
@@ -95,19 +92,113 @@ def _order_prices(
             remaining = 10**6
         if remaining < RATELIMIT_STOP_THRESHOLD:
             low_budget.set()
-        orders = resp.json()
-        for o in orders:
-            region_prices.append(o["price"])
-            if station is None or o.get("location_id") == station:
-                prices.append(o["price"])
+        orders.extend(resp.json())
         if page >= _int_header(resp.headers, "X-Pages", 1):
             break
         page += 1
+    return orders
+
+
+def _reduce_prices(
+    orders: list[dict] | None, region_id: int, source: str
+) -> tuple[float | None, float | None]:
+    """(hub price, region-wide price) from one pulled book: min sell or
+    max buy at the region's hub station where one is configured (The
+    Forge -> Jita 4-4), and the same over every station in the region.
+    Either is None when no such orders exist. Regions with no configured
+    hub return the same value twice."""
+    if orders is None:
+        return None, None
+    station = config.PRICE_STATION_FILTERS.get(region_id)
+    prices: list[float] = []
+    region_prices: list[float] = []
+    for o in orders:
+        region_prices.append(o["price"])
+        if station is None or o.get("location_id") == station:
+            prices.append(o["price"])
     best = min if source == "sell" else max
     return (
         best(prices) if prices else None,
         best(region_prices) if region_prices else None,
     )
+
+
+def _order_prices(
+    client: httpx.Client,
+    region_id: int,
+    type_id: int,
+    source: str,
+    low_budget: threading.Event,
+) -> tuple[float | None, float | None]:
+    """(hub price, region-wide price) for one type in one region from ONE
+    paged pull — _order_book reduced by _reduce_prices (the volume of each
+    order is discarded here; the compressed-sourcing ladder pull keeps
+    it, see _hub_ladder_quote)."""
+    return _reduce_prices(
+        _order_book(client, region_id, type_id, source, low_budget),
+        region_id,
+        source,
+    )
+
+
+def _min_volume(order: dict) -> int:
+    """An order's minimum fill from ESI's min_volume (review 2026-09-05):
+    a rung that cannot be bought in a smaller quantity is skipped by the
+    ladder walks when the need is below it. Absent or junk = 1."""
+    try:
+        return max(1, int(order.get("min_volume") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _hub_ladder(orders: list[dict] | None, region_id: int) -> list:
+    """The hub station's ascending sell ladder [(price, volume_remain,
+    min_volume), ...] from one pulled book (v1.25 compressed sourcing) —
+    region-wide where the region has no configured hub, empty-volume
+    orders dropped, truncated to config.HUB_LADDER_MAX_RUNGS cheapest
+    rungs (a stored ladder of EXACTLY that many rungs is therefore the
+    only proof the book continues — costing.fill_merged's R5 rule)."""
+    if not orders:
+        return []
+    station = config.PRICE_STATION_FILTERS.get(region_id)
+    ladder = sorted(
+        (o["price"], int(o.get("volume_remain") or 0), _min_volume(o))
+        for o in orders
+        if (station is None or o.get("location_id") == station)
+        and int(o.get("volume_remain") or 0) > 0
+    )
+    return ladder[: config.HUB_LADDER_MAX_RUNGS]
+
+
+def _hub_ladder_quote(
+    client: httpx.Client,
+    region_id: int,
+    type_id: int,
+    source: str,
+    low_budget: threading.Event,
+    fallback_region_id: int | None,
+) -> tuple[float | None, int, list]:
+    """(price, hub flag, ladder) for a compressed sourcing candidate from
+    ONE pull: the same quote _fallback_price would cache (hub best order,
+    else the region-wide fallback) plus the hub sell ladder the
+    compressed pass walks. A candidate is a raw leaf, so the v1.9
+    fallback applies to it like any other."""
+    orders = _order_book(client, region_id, type_id, source, low_budget)
+    hub, region_wide = _reduce_prices(orders, region_id, source)
+    ladder = _hub_ladder(orders, region_id) if source == "sell" else []
+    if hub is not None:
+        return hub, 1, ladder
+    if fallback_region_id is None:
+        # Not a fallback type (a buildable input): the hub quote only,
+        # exactly like _best_order_price.
+        return None, 1, ladder
+    if fallback_region_id != region_id:
+        _, region_wide = _order_prices(
+            client, fallback_region_id, type_id, source, low_budget
+        )
+    if region_wide is None:
+        return None, 1, ladder
+    return region_wide, 0, ladder
 
 
 def _best_order_price(
@@ -224,6 +315,7 @@ def refresh_prices(
     workers: int = FETCH_WORKERS,
     fallback_type_ids=(),
     fallback_region_id: int | None = None,
+    ladder_type_ids=(),
 ) -> tuple[int, int, int]:
     """Refetch every requested type whose cached price is older than
     max_age_seconds (default: ESI's own 300s server cache — anything fresher
@@ -235,20 +327,43 @@ def refresh_prices(
     order from fallback_region_id when they have no hub-station quote;
     such rows are cached with hub = 0 (see region_wide_types).
 
+    ladder_type_ids (v1.25): every input the plan may buy — fill pricing
+    walks the ladder of each; compressed candidates included — whose hub
+    SELL ladder is persisted too (hub_sell_order, replaced per type). A ladder
+    type with a fresh price but no ladder rows yet (the toggle was turned
+    on inside the cache window) is refetched regardless of age.
+
     Returns (fetched, skipped, already_fresh)."""
     type_ids = list(type_ids)
     fallback = set(fallback_type_ids) if fallback_region_id else set()
+    ladder_types = set(ladder_type_ids) if source == "sell" else set()
     now = datetime.now(timezone.utc)
     stale: list[int] = []
     for type_id in type_ids:
         row = conn.execute(
-            "SELECT fetched_at FROM market_price "
+            "SELECT fetched_at, hub, price FROM market_price "
             "WHERE type_id = ? AND region_id = ? AND source = ?",
             (type_id, region_id, source),
         ).fetchone()
         if row is not None:
             age = (now - datetime.fromisoformat(row["fetched_at"])).total_seconds()
-            if age < max_age_seconds:
+            # A HUB-priced type necessarily has at least one rung: a fresh
+            # price with no ladder rows means the ladder was never pulled
+            # (fill pricing / the toggle came on inside the cache window)
+            # — refetch. Region-wide and unpriced types have no rungs by
+            # nature and must not refetch every time.
+            missing_ladder = (
+                type_id in ladder_types
+                and row["hub"]
+                and row["price"] is not None
+                and conn.execute(
+                    "SELECT 1 FROM hub_sell_order "
+                    "WHERE region_id = ? AND type_id = ? LIMIT 1",
+                    (region_id, type_id),
+                ).fetchone()
+                is None
+            )
+            if age < max_age_seconds and not missing_ladder:
                 continue
         stale.append(type_id)
     already_fresh = len(type_ids) - len(stale)
@@ -257,12 +372,18 @@ def refresh_prices(
 
     low_budget = threading.Event()
     fetched: dict[int, tuple[float | None, int]] = {}
+    ladders: dict[int, list] = {}
     skipped = 0
 
-    def fetch_one(client: httpx.Client, type_id: int) -> tuple[float | None, int]:
+    def fetch_one(client: httpx.Client, type_id: int) -> tuple:
         if low_budget.is_set():
             raise _Throttled
         try:
+            if type_id in ladder_types:
+                return _hub_ladder_quote(
+                    client, region_id, type_id, source, low_budget,
+                    fallback_region_id if type_id in fallback else None,
+                )
             if type_id in fallback:
                 return _fallback_price(
                     client, region_id, type_id, source, low_budget,
@@ -289,7 +410,13 @@ def refresh_prices(
             for future in as_completed(futures):
                 type_id = futures[future]
                 try:
-                    fetched[type_id] = future.result()
+                    result = future.result()
+                    if type_id in ladder_types:
+                        price, hub, ladder = result
+                        fetched[type_id] = (price, hub)
+                        ladders[type_id] = ladder
+                    else:
+                        fetched[type_id] = result
                 except (_Throttled, ValueError, httpx.HTTPError):
                     # ValueError covers a junk 200 body (JSONDecodeError
                     # subclasses it) — one bad type skips like a throttled
@@ -307,20 +434,101 @@ def refresh_prices(
             "VALUES (?, ?, ?, ?, ?, ?)",
             (type_id, region_id, source, price, now_iso, hub),
         )
+    for type_id, ladder in ladders.items():
+        # Replaced per type: a candidate the pull answered with no hub
+        # orders leaves no rows (an empty ladder = not on the ladder).
+        conn.execute(
+            "DELETE FROM hub_sell_order WHERE region_id = ? AND type_id = ?",
+            (region_id, type_id),
+        )
+        conn.executemany(
+            "INSERT INTO hub_sell_order "
+            "(region_id, type_id, price, volume_remain, min_volume) "
+            "VALUES (?, ?, ?, ?, ?)",
+            # costing._rung: a (price, volume) pair from a pre-review
+            # fetcher (tests monkeypatch _hub_ladder_quote) stores min 1.
+            [
+                (region_id, type_id, *costing._rung(order))
+                for order in ladder
+            ],
+        )
     conn.commit()
     return len(fetched), skipped, already_fresh
+
+
+def cached_hub_ladders(
+    conn, region_id: int, type_ids
+) -> dict[int, list[tuple[float, int, int]]]:
+    """{type_id: ascending [(price, volume_remain, min_volume), ...]}
+    from the last hub ladder pull (v1.25 compressed sourcing candidates)
+    — only types with at least one rung appear. Cache-only; never touches
+    the network. min_volume (review 2026-09-05) is 1 for rungs stored
+    before the column existed."""
+    wanted = list(set(type_ids))
+    if not wanted:
+        return {}
+    ladders: dict[int, list[tuple[float, int, int]]] = {}
+    for start in range(0, len(wanted), 500):  # SQLite variable limit
+        chunk = wanted[start:start + 500]
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            "SELECT type_id, price, volume_remain, min_volume "
+            "FROM hub_sell_order "
+            f"WHERE region_id = ? AND type_id IN ({marks}) "
+            "ORDER BY type_id, price",
+            (region_id, *chunk),
+        ):
+            ladders.setdefault(row["type_id"], []).append(
+                (row["price"], row["volume_remain"], row["min_volume"])
+            )
+    return ladders
+
+
+def sell_ladders(conn, settings, type_ids) -> dict[str, dict[int, list]]:
+    """The sell ladders the sourcing pass walks, per venue
+    ({store.BUY_VENUE_HUB: {...}, store.BUY_VENUE_STRUCTURE: {...}}):
+    the hub ladders cached for every bought input and compressed
+    candidate (v1.25 fill pricing), plus the structure market's ladders
+    when the structure buy comparison is on (they arrive with every
+    structure refresh). Cache-only.
+
+    Both EMPTY when settings.price_source is not 'sell' (review
+    2026-09-05, P0): no hub SELL ladder is ever pulled for the buy side,
+    and handing the pass the structure ladders alone would let a dearer
+    C-J6 book fill-price a buy the Jita quote already covers — the pass
+    must leave every Phase 1 quote alone instead."""
+    type_ids = list(type_ids)
+    if settings.price_source != "sell":
+        return {store.BUY_VENUE_HUB: {}, store.BUY_VENUE_STRUCTURE: {}}
+    ladders = {
+        store.BUY_VENUE_HUB: cached_hub_ladders(
+            conn, settings.price_region_id, type_ids
+        ),
+        store.BUY_VENUE_STRUCTURE: {},
+    }
+    if settings.structure_buy_enabled:
+        ladders[store.BUY_VENUE_STRUCTURE] = cached_structure_ladders(
+            conn, settings.structure_market(), type_ids
+        )
+    return ladders
+
+
+compressed_ladders = sell_ladders  # v1.25 name, kept for callers
 
 
 STRUCTURE_SOURCE = "structure"
 
 
-def _sell_ladders(orders, wanted: set[int]) -> dict[int, list[tuple[float, int]]]:
-    """Ascending (price, volume_remain) sell ladder per wanted type from a
-    structure order dump — the one filter over the book (v1.10): buy
-    orders, unwanted types and orders with nothing left to sell are
-    dropped; the best price is the first rung. ESI always sends
-    volume_remain; a dump without it yields no ladder and no quote."""
-    ladders: dict[int, list[tuple[float, int]]] = {}
+def _sell_ladders(
+    orders, wanted: set[int]
+) -> dict[int, list[tuple[float, int, int]]]:
+    """Ascending (price, volume_remain, min_volume) sell ladder per wanted
+    type from a structure order dump — the one filter over the book
+    (v1.10): buy orders, unwanted types and orders with nothing left to
+    sell are dropped; the best price is the first rung. ESI always sends
+    volume_remain; a dump without it yields no ladder and no quote.
+    min_volume (review 2026-09-05) defaults to 1 when absent."""
+    ladders: dict[int, list[tuple[float, int, int]]] = {}
     for order in orders:
         if order.get("is_buy_order"):
             continue
@@ -330,7 +538,9 @@ def _sell_ladders(orders, wanted: set[int]) -> dict[int, list[tuple[float, int]]
         volume = int(order.get("volume_remain") or 0)
         if volume <= 0:
             continue
-        ladders.setdefault(type_id, []).append((order["price"], volume))
+        ladders.setdefault(type_id, []).append(
+            (order["price"], volume, _min_volume(order))
+        )
     for ladder in ladders.values():
         ladder.sort(key=lambda o: o[0])
     return ladders
@@ -381,11 +591,12 @@ def refresh_structure_prices(
     )
     conn.executemany(
         "INSERT INTO structure_sell_order "
-        "(structure_id, type_id, price, volume_remain) VALUES (?, ?, ?, ?)",
+        "(structure_id, type_id, price, volume_remain, min_volume) "
+        "VALUES (?, ?, ?, ?, ?)",
         [
-            (structure_id, type_id, price, volume)
+            (structure_id, type_id, price, volume, min_volume)
             for type_id, ladder in ladders.items()
-            for price, volume in ladder
+            for price, volume, min_volume in ladder
         ],
     )
     conn.commit()
@@ -394,22 +605,24 @@ def refresh_structure_prices(
 
 def cached_structure_ladders(
     conn, structure_id: int, type_ids
-) -> dict[int, list[tuple[float, int]]]:
-    """{type_id: ascending [(price, volume_remain), ...]} from the last
-    structure refresh — only types with at least one sell order appear.
-    Cache-only; never touches the network."""
+) -> dict[int, list[tuple[float, int, int]]]:
+    """{type_id: ascending [(price, volume_remain, min_volume), ...]}
+    from the last structure refresh — only types with at least one sell
+    order appear. Cache-only; never touches the network. min_volume
+    (review 2026-09-05) is 1 for rungs stored before the column."""
     wanted = set(type_ids)
     if not wanted:
         return {}
-    ladders: dict[int, list[tuple[float, int]]] = {}
+    ladders: dict[int, list[tuple[float, int, int]]] = {}
     for row in conn.execute(
-        "SELECT type_id, price, volume_remain FROM structure_sell_order "
+        "SELECT type_id, price, volume_remain, min_volume "
+        "FROM structure_sell_order "
         "WHERE structure_id = ? ORDER BY type_id, price",
         (structure_id,),
     ):
         if row["type_id"] in wanted:
             ladders.setdefault(row["type_id"], []).append(
-                (row["price"], row["volume_remain"])
+                (row["price"], row["volume_remain"], row["min_volume"])
             )
     return ladders
 

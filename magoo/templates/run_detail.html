@@ -72,14 +72,21 @@
     <span class="label">Low stock</span>
     <span class="value {% if low_stock %}warn{% endif %}" title="won't sustain the next run">{{ low_stock|length }}</span>
   </div>
-  {% if exceeds or buys_unpriced or structure_buys %}
+  {# Review 2026-09-05: `shallow` joins the gate (a hub-only shallow run
+     used to lose its strip badge), and "N via C-J6" counts rows bought
+     ONLY there — split rows have their own badge and were double-counted. #}
+  {% set structure_only = structure_buys|length - (split_buys|length if split_buys is defined else 0) %}
+  {% if exceeds or buys_unpriced or structure_buys or compressed or split_buys or shallow %}
   <div class="stat">
     <span class="label">&nbsp;</span>
     <span class="tags">
       {% if exceeds %}<span class="badge fill bad" title="buy total {{ buy_total|isk }} vs {{ wallets|isk }} in wallets at plan time">exceeds wallets</span>{% endif %}
       {% if buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — total understates">{{ buys_unpriced }} unpriced</span>{% endif %}
-      {% if structure_buys %}<span class="badge accent" title="inputs cheaper landed (price + freight-in) at the structure market than at Jita">{{ structure_buys|length }} via {{ settings.structure_market_label() }}</span>{% endif %}
-      {% if shallow %}<span class="badge warn" title="structure-market buys whose sell ladder has fewer units beating the Jita landed price than the plan buys — the rest cost Jita money">{{ shallow|length }} shallow</span>{% endif %}
+      {% if structure_only > 0 %}<span class="badge accent" title="inputs cheaper landed (price + freight-in) at the structure market than at Jita — bought there in full">{{ structure_only }} via {{ settings.structure_market_label() }}</span>{% endif %}
+      {% if split_buys %}<span class="badge accent" title="buys split across Jita and {{ settings.structure_market_label() }} by walking both sell ladders together, cheapest landed rung first — Multibuy lists each market's share">{{ split_buys|length }} split</span>{% endif %}
+      {% if shallow %}<span class="badge warn" title="buys whose stored sell ladders (Jita's 300 cheapest orders, the whole {{ settings.structure_market_label() }} book) held fewer units than the plan buys — the remainder is unsourced: no market held it at plan time, it is priced at the last order walked and belongs to no Multibuy block">{{ shallow|length }} shallow</span>{% endif %}
+      {% if compressed %}<span class="badge accent" title="compressed ore / moon ore / gas bought and reprocessed instead of {{ compressed_covered|length }} raw type{{ 's' if compressed_covered|length != 1 }} — saves {{ compressed_saving|isk }} ISK landed vs buying those raws direct at plan time (the cheaper market's sell ladder walked to depth — Jita and {{ settings.structure_market_label() }} compete)">{{ compressed|length }} via compressed</span>{% endif %}
+      {% if compressed_shallow %}<span class="badge warn" title="compressed buys the sell ladder could not fill in whole batches for the quantity the plan wanted at plan time — bought smaller; the raws they cover keep a larger direct buy">{{ compressed_shallow|length }} shallow</span>{% endif %}
     </span>
   </div>
   {% endif %}
@@ -121,12 +128,14 @@
 {{ m.item_cell(i) }}
     <td class="cat muted">{{ i.category }}</td>
     <td class="num">{{ i.recommended_buy_qty|qty }}</td>
-    <td class="num">{{ i.price_snapshot|isk }}</td>
+{{ m.price_cell(i) }}
     {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
     <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
 {{ m.venue_cell(i) }}
     <td class="flags">{% if i.capacity_limited %}<span class="badge warn">capacity</span>{% endif %}
         {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
+        {{ m.compressed_badge(i) }}
+        {{ m.covered_badge(i) }}
         {{ m.shallow_badge(i) }}
         {% if i.type_id in region_wide %}<span class="badge" title="priced at plan time from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
   </tr>
@@ -180,7 +189,7 @@
   <tr>
 {{ m.item_cell(i) }}
     <td class="num">{{ i.recommended_buy_qty|qty }}</td>
-    <td class="num">{{ i.price_snapshot|isk }}</td>
+{{ m.price_cell(i) }}
     {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
     <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
 {{ m.venue_cell(i) }}
@@ -263,6 +272,33 @@
 </details>
 {% endif %}
 
+{% if compressed %}
+<details class="section" open data-key="compressed">
+<summary><h2>Compressed sourcing <span class="muted">— {{ compressed|length }}
+  compressed buy{{ 's' if compressed|length != 1 }} cover {{ compressed_covered|length }}
+  raw type{{ 's' if compressed_covered|length != 1 }},
+  <span title="{{ compressed_saving|isk }} ISK landed vs buying those raws direct at plan time">saves {{ compressed_saving|isk_short }}</span></span></h2></summary>
+<p class="muted">Cheaper landed than the raw minerals, moon materials or gas
+  at plan time, walking the cheaper market's sell ladder for the quantity
+  bought — Jita and {{ settings.structure_market_label() }} compete, as for
+  every buy (a thin cheap order never wins alone). Reprocess at your asserted yields —
+  {{ (settings.compressed_ore_yield * 100)|round(0)|int }}% for ore and moon
+  ore, {{ (settings.compressed_gas_yield * 100)|round(0)|int }}% for gas{% if settings.compressed_reprocess_tax %},
+  after a {{ (settings.compressed_reprocess_tax * 100)|round(1) }}% reprocessing tax on every output{% endif %}
+  (Settings → Compressed Sourcing). Outputs beyond this cycle's need are
+  leftover stock; they were worth nothing in the decision.</p>
+<div class="panel">
+  <h3 class="subhead" style="margin-top:0">After buying — reprocess:</h3>
+  <ul style="margin:.4rem 0 0 1.2rem">
+    {% for cs in compressed_section %}
+    <li>Reprocess <b>{{ cs.item.recommended_buy_qty|qty }} {{ cs.item.name }}</b>
+        → {% for o in cs.outputs if o.used %}~{{ o.used|qty }} {{ o.name }}{{ ', ' if not loop.last }}{% endfor %}{% for o in cs.outputs if o.leftover %}; leftover +{{ o.leftover|qty }} {{ o.name }}{% endfor %}</li>
+    {% endfor %}
+  </ul>
+</div>
+</details>
+{% endif %}
+
 <dialog id="deficit" class="breakdown" aria-labelledby="deficit-name">
   <div class="dialog-head">
     <h2 id="deficit-name"></h2>
@@ -291,6 +327,15 @@ function openDeficit(btn) {
       rows = [
         ["cycle quantity (incl. other pipelines' draw)", qty(target)],
         ["− covered by stock / in-flight jobs", qty(target - deficit)],
+        ["= to build", qty(deficit)],
+      ];
+    } else if (deficit > target) {
+      // Review 2026-09-05 (A1): a dual-role final's component share is
+      // re-sized to what the consumers' allocated jobs actually draw, so
+      // from empty stock the build can exceed the cycle quantity.
+      rows = [
+        ["cycle quantity — your request", qty(target)],
+        ["+ other pipelines' jobs draw beyond stock", qty(deficit - target)],
         ["= to build", qty(deficit)],
       ];
     } else {
@@ -351,10 +396,16 @@ function openDeficit(btn) {
   const parts = [];
   if (Number(d.buy)) parts.push("buys " + qty(d.buy));
   if (Number(d.build)) parts.push("builds " + qty(d.build));
+  // Review 2026-09-05: a raw part-covered by compressed purchases used to
+  // read "buys N" for the direct remainder only — the covered leg was
+  // missing, so the answer never summed to the deficit.
+  if (Number(d.covered)) parts.push(
+    (parts.length ? "" : "buys nothing direct — ")
+    + qty(d.covered) + " come from reprocessing compressed purchases");
   document.getElementById("deficit-answer").textContent =
     d.kind === "final"
-      ? (deficit < target
-          ? "Finals build their requested quantity every run; the share other pipelines consume is netted against stock and in-flight jobs."
+      ? (deficit !== target
+          ? "Finals build their requested quantity every run; the share other pipelines' jobs draw is netted against stock and in-flight jobs."
           : "Finals build the full cycle quantity every run — stock on hand is the previous wave, bound for sale.")
       : Number(d.deficit) > 0
         ? (parts.length ? "The plan " + parts.join(" and ") + "."

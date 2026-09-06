@@ -127,6 +127,7 @@ SDE_ZIP_URL_TEMPLATE = (
 # and industryTargetFilters names the category/group sets they apply to).
 SDE_DATASETS = (
     "blueprints",
+    "compressibleTypes",
     "types",
     "groups",
     "categories",
@@ -258,8 +259,8 @@ BASIC_CAPITAL_COMPONENT_GROUPS = frozenset({873})  # Capital Construction Comp.
 # Components (913), Hybrid Tech Components (964, T3).
 ADVANCED_COMPONENT_GROUPS = frozenset({334, 913, 964})
 
-# Ships built in EXACT quantities — never rounded up to the ship batch
-# multiple: capitals, Freighters (513), Jump Freighters (902).
+# Ships built in EXACT quantities — never rounded up to whole blueprint
+# copies: capitals, Freighters (513), Jump Freighters (902).
 EXACT_QTY_SHIP_GROUPS = CAPITAL_SHIP_GROUPS | {513, 902}
 
 # v1.6 capital pricing: hulls sell-priced from the secondary (structure)
@@ -294,6 +295,23 @@ ATTR_TECH_LEVEL = "techLevel"
 JITA_44_STATION_ID = 60003760
 THE_FORGE_REGION_ID = 10000002
 PRICE_STATION_FILTERS = {THE_FORGE_REGION_ID: JITA_44_STATION_ID}
+
+# Compressed sourcing (v1.25): the raw groups a compressed purchase may
+# stand in for — Mineral (18), Moon Materials (427), Harvestable Cloud
+# gas (711). Ice products (423) are deliberately out of scope for now.
+COMPRESSED_SOURCE_GROUPS = frozenset({18, 427, 711})
+# The three groups behind the Settings toggles (2026-09-05).
+COMPRESSED_MINERALS_GROUP = 18
+COMPRESSED_MOON_GROUP = 427
+COMPRESSED_GAS_SOURCE_GROUP = 711
+# Compressed gas lives in its own group; compressed ore and moon ore sit
+# in their raw ore's group under the Asteroid category.
+COMPRESSED_GAS_GROUP = 4168
+CATEGORY_ASTEROID = 25
+# Cheapest Jita 4-4 sell orders kept per compressed candidate: the
+# fill-cost ladder the compressed pass walks. A fill that would need more
+# orders than this counts as "not on the ladder".
+HUB_LADDER_MAX_RUNGS = 300
 
 # Composite reaction product groups (CCP's "Composite Reactions" target
 # filter): their INPUTS get composite_reaction_extra_runs of extra buffer.
@@ -424,9 +442,10 @@ ATTR_NULLSEC_MODIFIER = "nullSecModifier"
 # 29d 23:21:59 -> a 544th is allowed (tpr 4,769.28s), alchemy 272 = ceil at
 # 9,538.56s/run. Skills/structure/rig bonuses increase the fit. Note: the
 # SDE's maxProductionLimit is the max licensed runs per blueprint COPY (a
-# copying concept) and does NOT cap manufacturing jobs; whether it caps
-# reaction jobs (formulas: 1000/100) is still unverified in client — it is
-# kept as an additional reaction ceiling where lower.
+# copying concept) and caps NEITHER manufacturing NOR reaction jobs — the
+# client accepts more runs than a reaction formula's maxProductionLimit
+# (user-verified in client 2026-09-05, review ruling R2); the 30-day rule
+# is the only per-job ceiling.
 MAX_JOB_SECONDS = 30 * 24 * 3600
 
 # The ceiling scales with the formula's BASE time, not per formula: alchemy
@@ -434,14 +453,16 @@ MAX_JOB_SECONDS = 30 * 24 * 3600
 # cap at 272 runs — user-verified in game 2026-08-18, exactly half of 544.
 # --- Job installation cost -------------------------------------------------
 
-SCC_SURCHARGE = 0.04  # 4% (EVE University wiki)
-NPC_STATION_FACILITY_TAX = 0.0025  # 0.25% (EVE University wiki)
+# Both user-verified in client 2026-09-05 (review ruling R4) against a live
+# job-install dialog; they were EVE University wiki figures until then.
+SCC_SURCHARGE = 0.04  # 4%
+NPC_STATION_FACILITY_TAX = 0.0025  # 0.25%
 
 # --- Invention (v1.22) -----------------------------------------------------
 
 # Invention and copying job fees use 2% of the T1 blueprint's manufacturing
-# EIV as the fee base (EVE University wiki; pending in-client verification
-# like SCC_SURCHARGE) — the caller scales EIV before job_install_cost.
+# EIV as the fee base — user-verified in client 2026-09-05 (review ruling
+# R4), like SCC_SURCHARGE — the caller scales EIV before job_install_cost.
 JOB_FEE_EIV_FRACTION = 0.02
 
 # An invented copy starts at ME 2 / TE 4; the decryptor's modifiers add to
@@ -463,3 +484,13 @@ ATTR_INVENTION_RUN_MOD = "inventionMaxRunModifier"
 # (datacore sciences weigh /30) and get their own user-entered level;
 # industry._per_bp_skill_level routes them by this name suffix.
 SKILL_SUFFIX_ENCRYPTION = "Encryption Methods"
+
+# The Science skill group: every datacore science AND the encryption skills
+# live here. An invention activity can additionally require a PRODUCTION-
+# group (268) gate skill — Capital Ship Construction on capital modules
+# (bp 3617), Outpost Construction on Standup modules (bp 37020) — which
+# contributes NOTHING to the success chance (review 2026-09-05, P0:
+# costing.invention_chance counted it as a third /30 science term).
+# Verified against the live SDE: activity-8 skill rows span exactly groups
+# 270 and 268.
+SKILL_GROUP_SCIENCE = 270

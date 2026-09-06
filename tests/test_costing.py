@@ -66,7 +66,7 @@ def plan_completed_run(conn, ref, price) -> int:
 
 
 def test_broker_and_tax_rates():
-    s = store.Settings(0.05, 24.0, 8, 1, 10000002, "sell")
+    s = store.Settings(0.05, 24.0, 1, 10000002, "sell")
     # All defaults: Broker Relations V, zero standings, Accounting V.
     assert costing.broker_fee_rate(s) == pytest.approx(0.03 - 0.015)
     assert costing.sales_tax_rate(s) == pytest.approx(0.075 * 0.45)
@@ -74,7 +74,7 @@ def test_broker_and_tax_rates():
 
 def test_broker_rate_standings_floor():
     s = store.Settings(
-        0.05, 24.0, 8, 1, 10000002, "sell",
+        0.05, 24.0, 1, 10000002, "sell",
         standing_broker_faction=10.0, standing_broker_corp=10.0,
     )
     assert costing.broker_fee_rate(s) == pytest.approx(0.01)
@@ -84,7 +84,7 @@ def test_broker_rate_standings_floor():
 
 def test_net_proceeds():
     s = store.Settings(
-        0.05, 24.0, 8, 1, 10000002, "sell", freight_out_isk_per_m3=100.0
+        0.05, 24.0, 1, 10000002, "sell", freight_out_isk_per_m3=100.0
     )
     # SCC surcharge applies to subcap sales too (decision 2026-08-20).
     rate = (
@@ -459,14 +459,28 @@ def test_alchemy_route_rows_are_excluded(conn, ref):
 
 
 def test_bpc_cost_without_runs_per_bpc(conn, ref):
-    """No runs-per-BPC (BPO-style) still amortizes sanely: whole cost per
-    hull rather than a crash or silent skip."""
+    """No runs-per-BPC (BPO-style, NULL divisor) charges NO bpc line —
+    matching engine._chain_coster, which only amortizes when
+    costing.bpc_divisor is set (review 2026-09-05: the realized and
+    current views used to charge the WHOLE bpc cost per hull while the
+    plan's chain cost charged nothing). Both views agree, no crash."""
     pid = add_pipeline(conn, ref, "Hulk", 8, runs_per_bpc=None, bpc_cost=8e6)
     settings = store.get_settings(conn)
     run_id = plan_completed_run(conn, ref, 10.0)
     cost = costing.hull_cost(conn, ref, settings, run_id, pid)
+    assert [l for l in cost.lines if l.kind == "bpc"] == []
+    assert costing._bpc_line(get_pipeline(conn, pid)) is None
+    live = costing.current_hull_cost(
+        conn, ref, settings, get_pipeline(conn, pid), UniformDict(10.0),
+        UniformDict(10.0),
+    )
+    assert [l for l in live.lines if l.kind == "bpc"] == []
+    # A divisor restores the amortized line in both views.
+    conn.execute("UPDATE pipeline SET runs_per_bpc = 4 WHERE pipeline_id = ?", (pid,))
+    conn.commit()
+    cost = costing.hull_cost(conn, ref, settings, run_id, pid)
     bpc = [l for l in cost.lines if l.kind == "bpc"]
-    assert len(bpc) == 1 and bpc[0].cost_per_hull == pytest.approx(8e6)
+    assert len(bpc) == 1 and bpc[0].cost_per_hull == pytest.approx(2e6)
 
 
 def test_hull_cost_unknown_pipeline(conn, ref):
@@ -679,7 +693,7 @@ def test_structure_freight_out_exemption(ref):
                  "Structure Construction Parts"):
         assert not costing.freight_out_exempt(ref.type_id(name)), name
     s = store.Settings(
-        0.05, 24.0, 8, 1, 10000002, "sell",
+        0.05, 24.0, 1, 10000002, "sell",
         skill_accounting=5, skill_broker_relations=5,
         freight_out_isk_per_m3=750.0,
     )
@@ -704,7 +718,7 @@ def test_broker_fee_never_negative():
     # Absurd inputs (rates beyond any real standings) must clamp at the
     # NPC floor, never below zero.
     s_npc = store.Settings(
-        0.05, 24.0, 8, 1, 10000002, "sell",
+        0.05, 24.0, 1, 10000002, "sell",
         skill_broker_relations=5,
         standing_broker_faction=10.0,
         standing_broker_corp=10.0,
@@ -713,7 +727,7 @@ def test_broker_fee_never_negative():
 
 
 def test_sales_tax_at_zero_accounting():
-    s = store.Settings(0.05, 24.0, 8, 1, 10000002, "sell", skill_accounting=0)
+    s = store.Settings(0.05, 24.0, 1, 10000002, "sell", skill_accounting=0)
     assert costing.sales_tax_rate(s) == pytest.approx(costing.SALES_TAX_BASE)
 
 
@@ -746,7 +760,7 @@ def test_min_sell_by_type_edge_inputs():
 
 def test_net_proceeds_capital_branch():
     s = store.Settings(
-        0.05, 24.0, 8, 1, 10000002, "sell",
+        0.05, 24.0, 1, 10000002, "sell",
         freight_out_isk_per_m3=750.0,  # must be ignored for capitals
         capital_sales_tax=0.02,
         capital_broker_rate=0.01,
@@ -767,16 +781,16 @@ def test_net_proceeds_capital_branch():
 
 
 def test_capital_structure_toggle():
-    s = store.Settings(0.05, 24.0, 8, 1, 10000002, "sell")
+    s = store.Settings(0.05, 24.0, 1, 10000002, "sell")
     assert s.capital_structure() == config.CJ6_KEEPSTAR_STRUCTURE_ID
     s2 = store.Settings(
-        0.05, 24.0, 8, 1, 10000002, "sell",
+        0.05, 24.0, 1, 10000002, "sell",
         capital_market_mode="custom", capital_structure_id=12345,
     )
     assert s2.capital_structure() == 12345
     # Custom mode without an ID falls back to the preset.
     s3 = store.Settings(
-        0.05, 24.0, 8, 1, 10000002, "sell", capital_market_mode="custom"
+        0.05, 24.0, 1, 10000002, "sell", capital_market_mode="custom"
     )
     assert s3.capital_structure() == config.CJ6_KEEPSTAR_STRUCTURE_ID
 
@@ -926,3 +940,238 @@ def test_null_sec_market_share_per_hull_and_per_cycle():
     assert t.materials == 80 * 2 + 100
     assert t.structure_materials == 20 * 2
     assert t.structure_share_pct == pytest.approx(40 / 260 * 100)
+
+
+# -- review 2026-09-05: fill walks, split-line share, badges, vintages ---
+
+HUB, STRUCT = store.BUY_VENUE_HUB, store.BUY_VENUE_STRUCTURE
+
+
+def test_fill_merged_remainder_is_unsourced_unless_hub_ladder_truncated(monkeypatch):
+    """R5: units beyond every stored rung ride the hub ONLY when the Jita
+    ladder was truncated at HUB_LADDER_MAX_RUNGS (the real book goes on);
+    a shorter ladder WAS the whole book, so the remainder has no venue —
+    it stays priced at the last rung walked and still lands at the hub
+    rate when the item has a Jita ladder, the structure rate otherwise."""
+    monkeypatch.setattr(config, "HUB_LADDER_MAX_RUNGS", 2)
+    # Whole book (1 rung < cap): 3 unsourced units, landed at the hub rate.
+    fill = costing.fill_merged([(10.0, 5)], None, 8, 1.0, 100.0, 2.0)
+    assert (fill.hub_units, fill.structure_units, fill.unfilled) == (5, 0, 3)
+    assert fill.remainder_venue is None
+    assert fill.marginal_price == 10.0
+    assert fill.landed_cost == pytest.approx(5 * 12 + 3 * 12)
+    assert fill.raw_average == pytest.approx(10.0)
+    # Truncated (exactly cap rungs): the hub carries the remainder.
+    fill = costing.fill_merged([(10.0, 5), (11.0, 1)], None, 8, 1.0, 100.0, 2.0)
+    assert (fill.unfilled, fill.remainder_venue, fill.marginal_price) == (2, HUB, 11.0)
+    assert fill.landed_cost == pytest.approx(5 * 12 + 1 * 13 + 2 * 13)
+    assert fill.raw_average == pytest.approx((50 + 11 + 22) / 8)
+    # No Jita ladder at all: never the hub — unsourced, at the STRUCTURE rate.
+    fill = costing.fill_merged(None, [(10.0, 5)], 8, 1.0, 100.0, 2.0)
+    assert (fill.structure_units, fill.unfilled, fill.remainder_venue) == (5, 3, None)
+    assert fill.landed_cost == pytest.approx(5 * 210 + 3 * 210)
+    assert fill.raw_average == pytest.approx(10.0)
+    # A structure ladder beside a truncated hub ladder: still the hub.
+    fill = costing.fill_merged([(10.0, 5), (11.0, 1)], [(9.0, 2)], 20, 1.0, 1.0, 0.0)
+    assert (fill.hub_units, fill.structure_units, fill.unfilled) == (6, 2, 12)
+    assert fill.remainder_venue == HUB
+    # Longer than the cap (never stored by the cache): not "exactly".
+    fill = costing.fill_merged([(10.0, 1), (11.0, 1), (12.0, 1)], None, 5, 0.0, 0.0, 0.0)
+    assert fill.unfilled == 2 and fill.remainder_venue is None
+
+
+def test_fill_walks_skip_rungs_below_their_minimum_fill():
+    """A rung whose min_volume exceeds what the walk would take from it
+    is skipped and the walk continues to the next rung; (price, volume)
+    pairs read as minimum 1 (review 2026-09-05)."""
+    # Need 7: (10, 5, min 1) takes 5; (11, 100, min 10) would take 2 < 10
+    # -> skipped; (12, 3, min 2) takes 2.
+    fill = costing.fill_ladder([(12.0, 3, 2), (10.0, 5, 1), (11.0, 100, 10)], 7)
+    assert (fill.units, fill.orders, fill.marginal_price) == (7, 2, 12.0)
+    assert fill.cost == pytest.approx(5 * 10 + 2 * 12)
+    # Nothing fillable: an empty fill, not a crash.
+    empty = costing.fill_ladder([(11.0, 100, 10)], 4)
+    assert (empty.units, empty.cost, empty.orders, empty.marginal_price) == (
+        0, 0.0, 0, None
+    )
+    # A large enough need takes the minimum-fill rung normally.
+    assert costing.fill_ladder([(11.0, 100, 10)], 15).units == 15
+    # fill_merged: the same rule across venues, mixed row shapes.
+    fill = costing.fill_merged(
+        [(10.0, 5), (11.0, 100, 10)], [(12.0, 3, 2)], 7, 0.0, 0.0, 0.0
+    )
+    assert (fill.hub_units, fill.structure_units, fill.unfilled) == (5, 2, 0)
+    assert (fill.hub_orders, fill.structure_orders) == (1, 1)
+    assert fill.landed_cost == pytest.approx(50 + 24)
+    # A remainder beyond every FILLABLE rung: priced at the last rung walked.
+    fill = costing.fill_merged([(10.0, 5), (11.0, 100, 10)], None, 7, 0.0, 0.0, 0.0)
+    assert (fill.hub_units, fill.unfilled, fill.marginal_price) == (5, 2, 10.0)
+
+
+def test_merged_rungs_accepts_triples_and_keeps_the_four_element_shape():
+    """The engine's LP columns unpack four elements; min_volume stays
+    internal to the walk."""
+    rungs = costing.merged_rungs([(10.0, 5, 3)], [(9.5, 2)], 1.0, 1.0, 1.0)
+    assert rungs == [(10.5, 9.5, 2, STRUCT), (11.0, 10.0, 5, HUB)]
+    assert costing.merged_rungs(None, [(9.5, 0, 1)], 1.0, 1.0, 1.0) == []
+
+
+def test_null_sec_share_of_a_split_line_uses_the_structure_fill_price():
+    """A split buy's structure share is its structure units x the
+    STRUCTURE fill price (review 2026-09-05), not the blended average
+    — 60 @ 5 + 40 @ 10 blends to 7, which understated C-J6's 400 ISK."""
+    line = costing.CostLine(
+        type_id=34, name="Tritanium", kind="material", depth=1,
+        qty_per_hull=100.0, unit_cost=7.0, lag_runs=0, clamped=False,
+        venue=store.BUY_VENUE_SPLIT, hub_fraction=0.6,
+        hub_fill_price=5.0, structure_fill_price=10.0,
+    )
+    assert line.structure_share() == pytest.approx(0.4)
+    assert line.structure_cost_per_hull() == pytest.approx(40 * 10.0)
+    cost = costing.HullCost(1, 1, [line])
+    assert cost.structure_material_cost == pytest.approx(400.0)
+    assert cost.structure_material_share_pct == pytest.approx(400 / 700 * 100)
+    # Rows priced before the fill prices existed keep the blended share.
+    legacy = costing.CostLine(
+        type_id=34, name="Tritanium", kind="material", depth=1,
+        qty_per_hull=100.0, unit_cost=7.0, lag_runs=0, clamped=False,
+        venue=store.BUY_VENUE_SPLIT, hub_fraction=0.6,
+    )
+    assert legacy.structure_cost_per_hull() == pytest.approx(700 * 0.4)
+    whole = costing.CostLine(
+        type_id=34, name="Tritanium", kind="material", depth=1,
+        qty_per_hull=100.0, unit_cost=7.0, lag_runs=0, clamped=False,
+        venue=STRUCT, structure_fill_price=10.0,
+    )
+    assert whole.structure_cost_per_hull() == pytest.approx(700.0)
+    assert costing.CostLine(
+        type_id=0, name="fee", kind="install", depth=0, qty_per_hull=1.0,
+        unit_cost=7.0, lag_runs=0, clamped=False, structure_fill_price=10.0,
+    ).structure_cost_per_hull() == 0.0
+
+
+def test_hull_cost_carries_persisted_fill_prices_onto_split_lines(conn, ref):
+    pid = add_pipeline(conn, ref, "Hulk", 8)
+    settings = store.get_settings(conn)
+    run_id = plan_completed_run(conn, ref, 10.0)
+    first = costing.hull_cost(conn, ref, settings, run_id, pid)
+    material = next(l for l in first.lines if l.kind == "material")
+    conn.execute(
+        "UPDATE index_run_item SET hub_buy_qty = 600, structure_buy_qty = 400, "
+        "hub_fill_price = 5.0, structure_fill_price = 10.0, "
+        "price_snapshot = 7.0, buy_venue = 'split' "
+        "WHERE index_run_id = ? AND type_id = ?",
+        (run_id, material.type_id),
+    )
+    conn.commit()
+    cost = costing.hull_cost(conn, ref, settings, run_id, pid)
+    line = next(l for l in cost.lines if l.type_id == material.type_id)
+    assert line.venue == store.BUY_VENUE_SPLIT
+    assert line.hub_fraction == pytest.approx(0.6)
+    assert (line.hub_fill_price, line.structure_fill_price) == (5.0, 10.0)
+    assert line.structure_cost_per_hull() == pytest.approx(
+        line.qty_per_hull * 0.4 * 10.0
+    )
+    assert cost.structure_material_cost == pytest.approx(
+        line.structure_cost_per_hull()
+    )
+    assert cost.structure_priced == 1
+
+
+def test_null_persisted_install_fee_is_badged_missing(conn, ref):
+    """A NULL unit_install_fee (no adjusted price at plan time) costs 0
+    and used to hide behind a clean total; it now counts as a missing
+    price like a material's (review 2026-09-05)."""
+    pid = add_pipeline(conn, ref, "Hulk", 8)
+    settings = store.get_settings(conn)
+    run_id = plan_completed_run(conn, ref, 10.0)
+    before = costing.hull_cost(conn, ref, settings, run_id, pid)
+    assert before.missing_prices == 0
+    assert [l for l in before.lines if l.kind == "install"]
+    conn.execute(
+        "UPDATE index_run_item SET unit_install_fee = NULL "
+        "WHERE index_run_id = ? AND blueprint_id IS NOT NULL",
+        (run_id,),
+    )
+    conn.commit()
+    after = costing.hull_cost(conn, ref, settings, run_id, pid)
+    installs = [l for l in after.lines if l.kind == "install"]
+    assert installs and all(l.missing_price and l.unit_cost == 0.0 for l in installs)
+    assert after.missing_prices == len(installs)
+    assert all(not l.missing_price for l in after.lines if l.kind != "install")
+
+
+def test_realized_freight_keeps_the_plan_time_rates(conn, ref):
+    """The realized view hauls at the rates the run was PLANNED at
+    (index_run.freight_in_isk_per_m3 / structure_freight_in_isk_per_m3),
+    so changing the setting never reprices history; a run persisted
+    before the columns (NULL) and the current-prices view use the live
+    rate (review 2026-09-05)."""
+    pid = add_pipeline(conn, ref, "Hulk", 8)
+    conn.execute("UPDATE settings SET freight_in_isk_per_m3 = 500")
+    conn.commit()
+    run_id = plan_completed_run(conn, ref, 10.0)
+    # Pin the persisted vintage explicitly (the engine writes it at plan
+    # time; this test holds whatever it wrote).
+    conn.execute(
+        "UPDATE index_run SET freight_in_isk_per_m3 = 500, "
+        "structure_freight_in_isk_per_m3 = 50 WHERE index_run_id = ?",
+        (run_id,),
+    )
+    conn.execute(
+        "UPDATE settings SET freight_in_isk_per_m3 = 900, "
+        "structure_freight_in_isk_per_m3 = 90"
+    )
+    conn.commit()
+    settings = store.get_settings(conn)
+    assert settings.freight_in_isk_per_m3 == 900
+
+    def freight_rates(cost):
+        return {l.name: l.unit_cost for l in cost.lines if l.kind == "freight_in"}
+
+    assert freight_rates(costing.hull_cost(conn, ref, settings, run_id, pid)) == {
+        "Inbound freight (Jita)": 500
+    }
+    # A structure-bought line at that run hauls at the vintage's C-J6 rate.
+    material = next(
+        l for l in costing.hull_cost(conn, ref, settings, run_id, pid).lines
+        if l.kind == "material"
+    )
+    conn.execute(
+        "UPDATE index_run_item SET buy_venue = 'structure' "
+        "WHERE index_run_id = ? AND type_id = ?",
+        (run_id, material.type_id),
+    )
+    conn.commit()
+    rates = freight_rates(costing.hull_cost(conn, ref, settings, run_id, pid))
+    assert rates["Inbound freight (C-J6)"] == 50
+    assert rates.get("Inbound freight (Jita)", 500) == 500
+    # Pre-column run (NULL): the live rates.
+    conn.execute(
+        "UPDATE index_run SET freight_in_isk_per_m3 = NULL, "
+        "structure_freight_in_isk_per_m3 = NULL WHERE index_run_id = ?",
+        (run_id,),
+    )
+    conn.commit()
+    rates = freight_rates(costing.hull_cost(conn, ref, settings, run_id, pid))
+    assert rates["Inbound freight (C-J6)"] == 90
+    assert rates.get("Inbound freight (Jita)", 900) == 900
+    # The current-prices view always hauls at the live rate.
+    live = costing.current_hull_cost(
+        conn, ref, settings, get_pipeline(conn, pid), UniformDict(10.0),
+        UniformDict(10.0),
+    )
+    assert freight_rates(live) == {"Inbound freight (Jita)": 900}
+    # The helper itself: a rate given wins, None falls back per leg.
+    hub_line = costing.CostLine(
+        type_id=material.type_id, name="x", kind="material", depth=1,
+        qty_per_hull=10.0, unit_cost=1.0, lag_runs=0, clamped=False, venue=HUB,
+    )
+    plan_time = costing._freight_in_lines(
+        settings, ref, [hub_line], rates={HUB: 1.0, STRUCT: None}
+    )
+    assert {l.name: l.unit_cost for l in plan_time} == {"Inbound freight (Jita)": 1.0}
+    live_leg = costing._freight_in_lines(
+        settings, ref, [hub_line], rates={HUB: None, STRUCT: 1.0}
+    )
+    assert {l.name: l.unit_cost for l in live_leg} == {"Inbound freight (Jita)": 900}

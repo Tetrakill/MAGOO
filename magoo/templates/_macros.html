@@ -12,12 +12,41 @@
     <span class="badge" title="a newer run exists — this plan is out of date">superseded</span>{% endif %}
 {%- endmacro %}
 
+{# Venue: the FILLED parts decide (split / structure-only / Jita). A
+   fill-priced row nothing filled at all (review 2026-09-05, R5: every unit
+   is an unsourced remainder) names no venue — it sits in no Multibuy block. #}
 {% macro venue_cell(i, plan_time=true) -%}
-    <td class="cat">{% if i.type_id in structure_buys %}<span class="badge accent" title="cheaper landed (price + freight-in) at the structure market than at Jita{{ ' at plan time' if plan_time }}">{{ settings.structure_market_label() }}</span>{% elif i.price_snapshot is not none %}<span class="muted">Jita</span>{% endif %}</td>
+    <td class="cat">{% if i.hub_buy_qty is defined and i.hub_buy_qty is not none and not i.hub_buy_qty and not i.structure_buy_qty and i.unfilled_qty %}<span class="muted" title="no stored sell ladder held any of this buy{{ ' at plan time' if plan_time }} — unsourced; priced at the last order walked">—</span>{% elif split_buys is defined and i.type_id in split_buys %}<span class="badge accent" title="split across both markets by walking their sell ladders together, cheapest landed rung first{{ ' at plan time' if plan_time }}: Jita {{ venue_qty[i.type_id][0]|qty }} · {{ settings.structure_market_label() }} {{ venue_qty[i.type_id][1]|qty }}">Jita {{ venue_qty[i.type_id][0]|qty }} · {{ settings.structure_market_label() }} {{ venue_qty[i.type_id][1]|qty }}</span>{% elif i.type_id in structure_buys %}<span class="badge accent" title="cheaper landed (price + freight-in) at the structure market than at Jita{{ ' at plan time' if plan_time }}">{{ settings.structure_market_label() }}</span>{% elif i.price_snapshot is not none %}<span class="muted">Jita</span>{% endif %}</td>
 {%- endmacro %}
 
+{# Unit price with the fill ledger (v1.25 fill pricing): a row walked on
+   its sell ladders shows the per-venue average fill, the orders taken and
+   any units beyond the stored ladders; a legacy row shows the price. #}
+{% macro price_cell(i, plan_time=true) -%}
+    <td class="num"{% if i.hub_buy_qty is defined and i.hub_buy_qty is not none %} title="average raw price over the sell orders walked{{ ' at plan time' if plan_time }}{% if i.hub_buy_qty %} — Jita: {{ i.hub_buy_qty|qty }} units at {{ i.hub_fill_price|isk }} avg over {{ i.hub_fill_orders|qty }} order{{ 's' if i.hub_fill_orders != 1 }}{% endif %}{% if i.structure_buy_qty %} — {{ settings.structure_market_label() }}: {{ i.structure_buy_qty|qty }} units at {{ i.structure_fill_price|isk }} avg over {{ i.structure_fill_orders|qty }} order{{ 's' if i.structure_fill_orders != 1 }}{% endif %}{% if i.unfilled_qty %} — {{ i.unfilled_qty|qty }} units beyond the stored ladders (unsourced — no market held them) at the last order walked, {{ i.unfilled_price|isk }}{% endif %}"{% endif %}>{{ i.price_snapshot|isk }}</td>
+{%- endmacro %}
+
+{# shallow (review 2026-09-05, R5/R6): a fill-priced row's remainder beyond
+   the stored ladders is UNSOURCED — no market held those units at plan
+   time; they stay in the row's quantity at the last order walked but
+   belong to no venue and no Multibuy block. A compressed buy is shallow
+   when the pass shrank it below what the LP wanted (whole batches the
+   ladder could fill vs compressed_wanted_qty). #}
 {% macro shallow_badge(i, plan_time=true) -%}
-    {% if i.type_id in shallow %}<span class="badge warn" title="only {{ i.structure_units_cheaper|qty }} of {{ i.recommended_buy_qty|qty }} units on the structure's sell ladder land at or below the Jita landed price (every listed unit counts when Jita has no order){{ ' at plan time' if plan_time }} — the rest must come from elsewhere">shallow</span>{% endif %}
+    {% if i.type_id in shallow and i.hub_buy_qty is defined and i.hub_buy_qty is not none %}<span class="badge warn" title="only {{ (i.recommended_buy_qty - i.unfilled_qty)|qty }} of {{ i.recommended_buy_qty|qty }} units were on the stored Jita / {{ settings.structure_market_label() }} sell ladders{{ ' at plan time' if plan_time }} — the remaining {{ i.unfilled_qty|qty }} are unsourced (no market held them), priced at the last order walked, {{ i.unfilled_price|isk }} ISK, and listed in no Multibuy block">shallow</span>{% elif i.type_id in shallow %}<span class="badge warn" title="only {{ i.structure_units_cheaper|qty }} of {{ i.recommended_buy_qty|qty }} units on the structure's sell ladder land at or below the Jita landed price (every listed unit counts when Jita has no order){{ ' at plan time' if plan_time }} — the rest must come from elsewhere">shallow</span>{% endif %}
+    {% if compressed_shallow is defined and i.type_id in compressed_shallow %}{% set wanted = i.compressed_wanted_qty if (i.compressed_wanted_qty is defined and i.compressed_wanted_qty is not none) else none %}<span class="badge warn" title="the ladder held only {{ i.recommended_buy_qty|qty }} of the {{ wanted|qty }} units the plan wanted{{ ' at plan time' if plan_time }} — the raws it covers keep a larger direct buy">shallow</span>{% endif %}
+{%- endmacro %}
+
+{# Compressed sourcing (v1.25). compressed_badge: a compressed ore / moon
+   ore / gas bought to be reprocessed — the tooltip names what it covers
+   and what is left over. covered_badge: a raw whose purchase the
+   compressed buys part-cover — this row is the direct remainder. #}
+{% macro compressed_badge(i, plan_time=true) -%}
+    {% if compressed is defined and i.type_id in compressed %}{% set outs = compressed[i.type_id] %}<span class="badge accent" title="bought compressed and reprocessed at the {{ 'plan-time ' if plan_time }}yield — covers {% for m, name, out, used in outs if used %}{{ used|qty }} {{ name }}{{ ', ' if not loop.last }}{% endfor %}{% for m, name, out, used in outs if out > used %}; leftover {{ (out - used)|qty }} {{ name }}{% endfor %}; unit price is the average of the {{ i.compressed_fill_orders|qty }} cheapest sell order{{ 's' if i.compressed_fill_orders != 1 }} walked{{ ' at plan time' if plan_time }}">compressed</span>{% endif %}
+{%- endmacro %}
+
+{% macro covered_badge(i, plan_time=true) -%}
+    {% if compressed_covered is defined and i.type_id in compressed_covered %}<span class="badge" title="{{ compressed_covered[i.type_id]|qty }} of {{ (compressed_covered[i.type_id] + (i.recommended_buy_qty or 0))|qty }} units this cycle come from reprocessing compressed purchases{{ ' (plan time)' if plan_time }} — this row is the direct remainder">{{ compressed_covered[i.type_id]|qty }} via compressed</span>{% endif %}
 {%- endmacro %}
 
 {% macro item_cell(i) -%}
@@ -33,6 +62,7 @@
         data-deficit="{{ i.deficit_qty }}"
         data-buy="{{ i.recommended_buy_qty or 0 }}"
         data-build="{{ i.recommended_build_qty or 0 }}"
+        data-covered="{{ (i.compressed_covered_qty or 0) if i.compressed_covered_qty is defined else 0 }}"
         onclick="openDeficit(this)">{{ i.name }}</button></td>
 {%- endmacro %}
 
@@ -74,7 +104,7 @@
         {% if execution and i.low_stock %}<span class="badge warn"
           title="current stock and in-flight jobs won't sustain the next run">low stock</span>{% endif %}
         {% if execution and i.savings_unpriced_inputs %}<span class="badge warn"
-          title="chain-cost figure understates: this many raw inputs have no price on record">{{ i.savings_unpriced_inputs }} unpriced</span>{% endif %}
+          title="chain-cost figure understates: this many inputs (raw leaves, datacores, relics or decryptors) have no price on record">{{ i.savings_unpriced_inputs }} unpriced</span>{% endif %}
         {% if execution and final_net_margin.get(i.type_id) is not none and final_net_margin[i.type_id] < 0 %}
           <span class="badge fill bad" title="net proceeds (after sell fees) minus integrated chain cost at today's prices: {{ final_net_margin[i.type_id]|isk }} ISK/unit">negative margin</span>
         {% endif %}</td>

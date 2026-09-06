@@ -2,6 +2,7 @@
 restock-and-replan) plus the /planning context builders and template.
 Same fixture pattern as test_engine."""
 
+import math
 import sqlite3
 
 import pytest
@@ -65,17 +66,19 @@ def _decisions(plan):
 
 
 @pytest.mark.parametrize(
-    "qty,built",
+    "qty,runs_per_bpc",
     [
-        (8, 8),  # already a batch multiple
-        (6, 8),  # ship_batch_multiple rounds the line's output up
+        (8, None),  # no runs per BPC: exact (the ship batch multiple is gone)
+        (6, 5),  # runs per BPC 5 rounds the line's output up to whole copies
     ],
 )
-def test_finals_build_the_batch_rounded_line_output(conn, ref, qty, built):
-    """Steady state is defined on what the line PRODUCES: batching builds
-    8 Hulks per cycle whether 6 or 8 were requested, and the whole chain
-    scales to the built quantity."""
-    add_pipeline(conn, ref, "Hulk", qty)
+def test_finals_build_the_batch_rounded_line_output(conn, ref, qty, runs_per_bpc):
+    """Steady state is defined on what the line PRODUCES: a 5-run copy
+    builds 10 Hulks per cycle when 6 were requested, and the whole chain
+    scales to the built quantity; with no runs per BPC the request is
+    exact (the global ship batch multiple was removed 2026-09-05)."""
+    built = math.ceil(qty / runs_per_bpc) * runs_per_bpc if runs_per_bpc else qty
+    add_pipeline(conn, ref, "Hulk", qty, runs_per_bpc)
     plan = engine.plan_steady_state(conn, ref, base_snapshot(ref))
     hulk = plan.items[ref.type_id("Hulk")]
     assert hulk.recommended_build_qty == built
@@ -91,7 +94,7 @@ def test_finals_build_the_batch_rounded_line_output(conn, ref, qty, built):
     "qty,runs_per_bpc",
     [
         (8, None),  # no rounding
-        (6, None),  # ship batch multiple rounds 6 -> 8
+        (6, None),  # exact: no ship batch multiple since 2026-09-05
         (8, 5),  # BPC run cap rounds 8 -> 10
     ],
 )
@@ -442,7 +445,7 @@ _app = template_app
 
 
 def settings_with(**over):
-    return store.Settings(0.05, 24.0, 8, 1, 10000002, "sell", **over)
+    return store.Settings(0.05, 24.0, 1, 10000002, "sell", **over)
 
 
 def _ctx(**over):

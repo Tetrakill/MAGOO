@@ -296,7 +296,7 @@ def selftest() -> int:
         from magoo import store
 
         conn = store.connect()
-        store.ensure_schema(conn)
+        store.ensure_schema(conn, profile=store.FIRST_RUN_PROFILE)
         conn.execute("SELECT 1 FROM settings WHERE id = 1").fetchone()
         conn.close()
         log.info("database OK at %s", config.DB_PATH)

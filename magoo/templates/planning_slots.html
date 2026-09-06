@@ -7,7 +7,8 @@
   <h1>Planning</h1>
   <span class="cap">Your line at cruising speed: every stockpile at target,
     each cycle rebuilding what it consumed. This is a what-if — it ignores
-    your current stock and jobs, assumes alchemy off, and saves nothing.</span>
+    your current stock and jobs, assumes alchemy and compressed sourcing
+    off (raws are bought direct), and saves nothing.</span>
 </div>
 <div class="subnav">
   <a href="{{ url_for('planning') }}">Profit</a>
@@ -80,7 +81,7 @@
     <td>{{ i.name }}</td>
     <td class="cat muted">{{ i.category }}</td>
     <td class="num">{{ i.recommended_buy_qty|qty }}</td>
-    <td class="num">{{ i.price_snapshot|isk }}</td>
+{{ m.price_cell(i, plan_time=false) }}
     {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
     <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
 {{ m.venue_cell(i, plan_time=false) }}

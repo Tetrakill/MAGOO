@@ -154,13 +154,24 @@ anywhere, iterates quickly, and owns its own data pipeline.
 15. **Two-venue buying (v1.10)** — Every bought input is priced at whichever
     of the Jita hub and the structure market (C-J6MT, the same market that
     sell-quotes capitals) is cheaper **landed** — order price plus that
-    venue's flat freight-in on packaged volume. The structure's best price
+    venue's flat freight-in on packaged volume. ~~The structure's best price
     is used when it wins, and its sell ladder is judged for depth: a buy is
     flagged *shallow* when fewer units land at or below the Jita landed
-    price than the plan buys. Venue is stamped per item, the Buy list shows
-    it, Multibuy exports one block per market, freight splits per venue in
-    both profit views. Finals are never compared (their quote is a sell
-    reference).
+    price than the plan buys.~~ **Fill pricing (v1.25, 2026-09-05):** every
+    buy is priced by walking BOTH markets' sell ladders together, cheapest
+    landed order first (Jita's 300 cheapest orders are stored on every
+    refresh; the structure's whole book already was), so a buy may **split**
+    across the two markets; units beyond every stored order are priced at
+    the last order walked and — unless Jita's stored book was truncated,
+    so its real book continues — are **unsourced**: attributed to no
+    market and listed in no Multibuy block; the row is flagged *shallow*
+    with that count (ruling 2026-09-05). The Buy list's unit price is the blended fill
+    average (per-venue fills in the tooltip); Multibuy lists each market's
+    share; freight splits by the venue quantities in the realized profit
+    view. Phase 1's single best-price quote remains the starting point (the
+    MILP's savings objective, the alchemy comparison and the Planning tab's
+    live views still use it). Finals are never compared (their quote is a
+    sell reference).
 
 16. **T2/T3 invention (v1.22)** — Per pipeline whose final is
     invention-capable (its manufacturing blueprint has at least one
@@ -169,7 +180,19 @@ anywhere, iterates quickly, and owns its own data pipeline.
     inline nine-option comparison was removed 2026-08-31 as clutter; the
     chosen option's economics show on the save flash and both profit
     views; the run pages carry no invention information — user ruling
-    2026-09-01). Multi-source finals — T3 subsystems/hulls invented
+    2026-09-01). A **compare** button on each capable row's action edge
+    (2026-09-05) opens the **invention comparison window**: every source
+    × decryptor option (relic tier × decryptor for T3 — 27 rows; the 9
+    decryptor options for T2) costed end to end at today's prices — the
+    whole chain re-walked at that option's invented ME, since a
+    decryptor's ME modifier moves the materials bill and not just the
+    invention line — with chance, runs/ME/TE, invention ISK per unit,
+    cost per unit, margin per unit / % / per cycle against the final's
+    net proceeds, sorted best margin first, the current choice and the
+    best row badged. Fetched into a shared dialog on demand
+    (`GET /pipelines/<id>/compare`), so the page GET carries none of it;
+    works with invention on, off or stale, and never includes the manual
+    BPC cost. Multi-source finals — T3 subsystems/hulls invented
     from relic tiers (Intact/Malfunctioning/Wrecked), and the seven T2
     targets with several T1 sources — add a **source select** beside the
     decryptor; relics are consumed one per attempt (bought like datacores,
@@ -189,6 +212,28 @@ anywhere, iterates quickly, and owns its own data pipeline.
     lab jobs, and lists the datacores/decryptors/relics to buy (with
     Multibuy) plus the copy jobs to install — recomputed from current
     stock on every load, never persisted. Lab jobs consume no slot pool.
+
+17. **Compressed sourcing (v1.25)** — Behind three Settings toggles (one
+    each for minerals, moon materials and gas), the plan's raw mineral
+    (group 18), moon material (427) and gas (711) purchases are re-sourced from **compressed
+    ore, compressed moon ore and compressed gas** wherever that is cheaper
+    landed, reprocessed at two user-asserted pure yields (refinery yield
+    for ore and moon ore, decompression yield for gas) less an explicit
+    reprocessing tax on every output's value. Market
+    **depth** is walked, not guessed: the price refresh persists the Jita
+    4-4 sell **ladder** for every candidate, and each candidate is costed
+    by filling the quantity it would take (the structure market's ladder
+    competes too when that comparison is on). One LP over every ladder
+    rung decides the mix; chosen types round up to whole reprocessing
+    batches (100 units for ore and moon ore, 1 for gas) and stand only if
+    strictly cheaper than the raws they cover. Surplus outputs are
+    leftover stock and worth nothing in the decision; compressed items
+    already in the hangar are ignored. The run page lists the compressed
+    buys (badged, in Multibuy), badges the covered raws, adds a
+    "Compressed sourcing" section with the reprocess checklist and the
+    landed saving, and the realized costing prices a covered raw at its
+    blended landed cost. Ice products are out of scope. Requires an SDE
+    download made since v1.25 (`ref_compressible`, `ref_type.portion_size`).
 
 ---
 
@@ -283,7 +328,11 @@ encoded with `_key` and `_value` fields. The importer must handle this.
 last two added 2026-08-15 — see Rig applicability in §5), `typeMaterials`
 (added 2026-08-17 for alchemy — reprocessing outputs; records carrying only
 `randomizedMaterials`, i.e. mineral alchemy with min/max ranges, are skipped
-at import).
+at import), `compressibleTypes` (added v1.25 for compressed sourcing — the
+raw -> compressed type map; `types` now also yields `portionSize`).
+
+After a successful import the cache keeps the current build's archive plus
+one previous and deletes older ones (review 2026-09-05).
 
 Archive members are matched by **exact basename**: the archive also carries
 `shipTreeGroups.jsonl`, `marketGroups.jsonl`, `metaGroups.jsonl`, … which a
@@ -293,7 +342,7 @@ suffix match would wrongly hit.
 
 | Table | Contents |
 |---|---|
-| `ref_type` | type_id, name, group_id, category_id, volume, packaged_volume, published |
+| `ref_type` | type_id, name, group_id, category_id, volume, packaged_volume, published, portion_size (v1.25: units per reprocessing batch) |
 | `ref_group` / `ref_category` | names and hierarchy |
 | `ref_blueprint` | blueprint_id, product_id, activity_id, portion_size, base_time, max_runs |
 | `ref_blueprint_material` | blueprint_id, activity_id, material_id, quantity, consumed |
@@ -303,7 +352,8 @@ suffix match would wrongly hit.
 | `ref_dogma_attribute` | attribute_id, name, default_value — dogma attribute definitions |
 | `ref_industry_modifier` | source_type_id, activity_id, kind, dogma_attribute_id, filter_id |
 | `ref_industry_target_filter` | filter_id, name, kind (category/group), ref_id |
-| `ref_type_material` | type_id, material_id, quantity — reprocessing outputs (alchemy) |
+| `ref_type_material` | type_id, material_id, quantity — reprocessing outputs (alchemy; v1.25 compressed sourcing) |
+| `ref_compressible` | type_id -> compressed_type_id (v1.25: compression targets, the compressed sourcing candidate set) |
 | `ref_solar_system` | system_id, name, security, region_id |
 | `ref_sde_build` | build number and import timestamp |
 
@@ -385,7 +435,7 @@ Reactions −4%/lvl instead (user-entered levels, v1.1).
 | Engineering rig security mult, nullsec/WH | `nullSecModifier` | 2.1 |
 | Reaction rig security mult, lowsec | `lowSecModifier` (refinery rigs) | 1.0 |
 | Reaction rig security mult, nullsec/WH | `nullSecModifier` (refinery rigs) | 1.1 — no highsec band; refineries cannot deploy there (corrected 2026-08-20) |
-| Per-job run ceiling (both activities) | user-verified in client 2026-08-21 | ceil(30 days of modified time / time per run) — last run may overhang; single-run exception applies |
+| Per-job run ceiling (both activities) | user-verified in client 2026-08-21; re-verified 2026-09-05 that a reaction formula's `maxProductionLimit` is NOT a run ceiling (ruling R2) | ceil(30 days of modified time / time per run) — last run may overhang; single-run exception applies; the only reaction cap |
 | Thukker rig ME, capital components (873/913) | `attributeThukkerEngRigMatBonus` | −3.7% |
 | Thukker rig ME, other components (334/964) | `attributeEngRigMatBonus` | −2.0% |
 | Thukker rig TE | `attributeEngRigTimeBonus` | −20% |
@@ -396,8 +446,9 @@ Reactions −4%/lvl instead (user-entered levels, v1.1).
 | Tatara reaction time multiplier | `strReactionTimeMultiplier` | 0.75 |
 | Athanor reaction time | (no attribute) | 1.0 |
 | Engineering complex ME role bonus | EVE University wiki | 1% |
-| SCC surcharge (job cost) | EVE University wiki; NOT in the SDE or ESI — a settings value since 2026-08-21 (`industry_scc_surcharge`, default 0.04) pending in-client verification | 4% |
-| NPC station facility tax | EVE University wiki | 0.25% |
+| SCC surcharge (job cost) | NOT in the SDE or ESI — a settings value since 2026-08-21 (`industry_scc_surcharge`, default 0.04); **verified in-client 2026-09-05** | 4% |
+| NPC station facility tax | **verified in-client 2026-09-05** | 0.25% |
+| Invention / copy job fee base | `JOB_FEE_EIV_FRACTION`; **verified in-client 2026-09-05** | 2% of the T1 blueprint's manufacturing EIV |
 
 ### Rig applicability
 
@@ -492,8 +543,8 @@ which BPO you own. Each lab fee reads its own class row — `invention` and `cop
 (split 2026-08-31: copying has its own per-system cost index in game; on an
 existing database the copying row seeds from the invention row it used to
 share) — and the standard fee formula with the base scaled to **2% of the
-T1 blueprint's manufacturing EIV** (`JOB_FEE_EIV_FRACTION`, pending
-in-client verification like the SCC surcharge), each with its own
+T1 blueprint's manufacturing EIV** (`JOB_FEE_EIV_FRACTION`, verified
+in-client 2026-09-05 along with the SCC surcharge), each with its own
 activity's structure cost bonus and its class's asserted **cost-rig tier**
 (2026-08-31): every Standup Invention / Blueprint Copy / Laboratory
 Optimization rig, M/L/XL alike, carries `attributeEngRigCostBonus` −10%
@@ -567,6 +618,139 @@ Verified against the live SDE and CCP/forum sources (2026-08-17):
   no route ever forms — the formulas themselves import like any other
   reaction blueprint.
 
+### Compressed sourcing mechanics (v1.25)
+
+A compressed type's SDE `typeMaterials` are the base outputs per
+`portionSize` input units — 100 for ore and moon ore, 1 for gas (compressed
+gas decompresses 1:1). Per input unit, at the asserted yield:
+
+```
+per_unit(c, r)          = base_qty(c, r) / portion_size(c) x yield(kind(c))
+batch_output(c, r, n)   = n x floor(base_qty(c, r) x yield)        -- n whole batches, FLOORED PER BATCH
+```
+
+`kind` is "ore" (Asteroid category — ore and moon ore alike, the refinery
+yield) or "gas" (the Compressed Gas group, the decompression yield —
+user-asserted, default kept: ruling R1 2026-09-05). The floor is applied
+**per batch** (ruling R3 2026-09-05, conservative): `n × floor(base ×
+yield)`, never `floor(n × base × yield)` — the whole-quantity floor
+credited up to n − 1 phantom units per output.
+Candidates are data-derived: `ref_compressible` (compressibleTypes) targets
+that are published, of those two kinds, and carry fixed outputs — ice never
+qualifies (its outputs are ice products, outside the three source groups)
+and Compressed Prismaticite (no outputs) drops out.
+
+**The pass (Phase 7.5)** runs once after the feedback loop has converged,
+over R = the demanded raws of groups {18, 427, 711} with a direct buy and a
+landed quote p_r (D_r = `recommended_buy_qty`), and C = the candidates
+yielding any of them. Every ladder rung (c, venue v, price, volume) whose
+landed unit cost l = price + rate_v x m3_c is below sum_r per_unit(c, r) p_r
+becomes an LP column (rungs past the volume that could cover the largest
+single demand are dead and dropped). The reprocessing tax rides the rung:
+l also carries tax x sum over ALL outputs of per_unit(c, m) x price(m) -
+charged on leftovers too, at the landed raw price for demanded outputs and
+the cached quote (0 when unpriced) for the rest; the chosen type's landed
+cost carries the same term on its batch outputs:
+
+```
+variables   d_r >= 0 (direct units, cost p_r)     x_{c,v,j} in [0, volume] (cost l)
+minimise    sum_r p_r d_r + sum l x
+subject to  d_r + sum_{c,v,j} per_unit(c, r) x_{c,v,j} >= D_r     for every r
+```
+
+(`scipy.optimize.linprog`, HiGHS.) Surplus is uncounted by construction —
+outputs outside R have no column and over-coverage is slack — so the LP can
+never buy ore for minerals nobody needs. A moon ore covering a mineral and a
+moon material is one column with two coefficients: one LP spans all three
+groups. Then, per chosen type: batches = ceil(sum x / portion) on the venue
+that took the larger share, re-filled on that venue's ladder
+(`costing.fill_ladder`, shrinking to whole filled batches when the ladder
+runs out); coverage is allocated per raw cheapest-first up to D_r; a type
+survives only while its landed fill cost is **strictly** below sum used x
+p_r (the worst offender is dropped and coverage re-allocated until every
+survivor earns its place — a tie goes to the raw). Covered raws keep their
+demand figures, drop `recommended_buy_qty` to the direct remainder, and carry
+
+```
+effective_unit_cost = (direct x p_r + sum_c alloc_{c,r}) / D_r
+alloc_{c,r}         = landed_c x used_{c,r} p_r / sum_{r'} used_{c,r'} p_{r'}
+```
+
+— each compressed buy's landed cost split across the demand it covers pro
+rata by market value; leftovers carry none. The compressed row's
+`price_snapshot` is the fill's AVERAGE raw price (sum price x take / units),
+so qty x price is the ISK the ladder walk costs and Multibuy, buy totals and
+the run snapshot need nothing new. The saving reported is sum covered x p_r
+- sum landed_c. Depth is therefore a **fill cost** here — as it is for
+every buy (see *Buy fill pricing* below; the "one exception, scoped to
+compressed types" clause was struck 2026-09-05 review: fill pricing had
+already been extended to every direct buy the same day it was written).
+
+### Buy fill pricing (v1.25, 2026-09-05)
+
+Every bought item's direct quantity is filled by ONE walk over the merged
+Jita + structure sell ladder sorted by `(landed, venue)` — landed = price +
+that venue's freight-in × m³, hub first on a tie — the remainder last:
+
+```
+rungs      = sort(hub rungs at price + hub_rate x m3, structure rungs at price + structure_rate x m3)
+fill       = take rungs in order until qty is met
+unfilled   = qty - units on the stored ladders        -- priced at the LAST rung walked
+             TRUNCATED Jita book (exactly HUB_LADDER_MAX_RUNGS stored rungs,
+             so the real book continues): the remainder rides the Jita
+             quantity. Otherwise (the whole book was stored, or there is no
+             Jita ladder) the remainder is UNSOURCED: no venue, no Multibuy
+             block; the shallow badge says so (ruling R5, 2026-09-05)
+price_snapshot = (hub cost + structure cost + unfilled x marginal) / qty   -- raw average
+```
+
+A rung is skipped when its ESI `min_volume` exceeds the units the walk
+would take from it (both ladders store `min_volume` since 2026-09-05; a
+10,000-minimum order cannot fill a 300-unit buy). The remainder's landed
+cost is the marginal price plus the hub freight rate when the item has a
+hub ladder, else the structure rate. The engine folds a remainder into the
+Jita quantity ONLY when `fill_merged` names the hub (truncated book);
+otherwise `hub_buy_qty` / `structure_buy_qty` stay as filled,
+`unfilled_qty` / `unfilled_price` record the rest, and `buy_venue` is
+decided from the filled parts alone (nothing filled at all keeps the
+Phase 1 venue). Invariant: `hub_buy_qty + structure_buy_qty +
+unfilled_qty == recommended_buy_qty`. The freight rates the fill landed
+with are persisted on the run (`index_run.freight_in_isk_per_m3`,
+`structure_freight_in_isk_per_m3`, 2026-09-05) so the realized view
+prices inbound freight at the plan-time vintage, not today's setting
+(pre-column runs fall back to live settings).
+
+For one item the direct sub-problem is a fractional covering problem with
+independent rung bounds, whose optimum is exactly this greedy walk — so
+items with no compressed candidate never enter the LP. Raws that do have
+candidates carry their own rung columns (capped at the demand) and one
+remainder column at the marginal landed price; the value of covering `q`
+units of a raw is what its MOST expensive direct units cost —
+`direct_cost(D) − direct_cost(D − q)` on the merged walk — which drives
+rung pruning (bound: the raw's remainder landed price), coverage
+allocation, the strict-cheaper survival test (each candidate judged last
+in, on top of the others' coverage), the saving and `effective_unit_cost =
+(direct_cost(direct) + Σ alloc) / D`. Invariant per row: `hub_buy_qty ×
+hub_fill_price + structure_buy_qty × structure_fill_price ==
+recommended_buy_qty × price_snapshot`. Buildable items flipped to buy
+(capacity losers, the savings rule) are fill-priced like raws on the Buy
+list, so the build-value section stats read the fill average too — but
+the REALIZED view does not follow: `costing.hull_cost` still costs a
+capacity-limited item partially flipped to buy as BUILT (its docstring's
+stated simplification), so that row's fill figure never enters lag
+costing. Stated approximation: a remainder whose last rung walked was a
+structure rung carries that structure price under the hub freight rate
+whenever the item has a hub ladder. An item with no ladder anywhere keeps
+the single quote unbadged.
+
+**Compressed shallow (ruling R6, 2026-09-05):** a compressed buy is
+badged *shallow* when the whole-batch re-fill SHRANK it below what the LP
+wanted — the engine stores the wanted quantity
+(`index_run_item.compressed_wanted_qty`) and the web layer flags
+`compressed_wanted_qty > recommended_buy_qty`. (The earlier test compared
+the buy against `compressed_ladder_units`, which the shrink makes true
+never.)
+
 ### Worked verification
 
 Hulk, ME10 / TE20, in a Sotiyo in nullsec, with a Large Ship ME rig fitted:
@@ -613,7 +797,10 @@ invented ME/TE/runs-per-copy, copies_needed, attempts, the datacores JSON
 (`[[type_id, qty_per_attempt, landed_price|null], …]` — carries the relic
 consumable triple for relic sources), decryptor price,
 both per-attempt fees (copy fee 0 for relics), and cost_per_run (schema 5
-dropped the never-read `copies_needed`/`attempts` sizing figures). Nothing
+dropped the never-read `copies_needed`/`attempts` sizing figures;
+`cost_per_run` itself is persisted but UNREAD — the replay recomputes the
+figure from the row's inputs; noted 2026-09-05 review, kept as a
+human-readable audit column). Nothing
 on the run pages renders it (user ruling 2026-09-01: no invention
 information inside Index Runs); it exists to give lag costing a stable
 vintage — the realized `hull_cost` reads THIS row (suppressing the `bpc`
@@ -652,13 +839,26 @@ when every member has left the pool.
 
 ### Settings
 
-**`settings`** — single row.
+**`settings`** — single row. The column DEFAULTs below are the neutral
+engine baseline (the tests run on them). A NEW install does not start
+there: `store.FIRST_RUN_PROFILE` (2026-09-05) — the author's working
+configuration — is layered onto the freshly seeded settings row, class
+rows and blacklist by `ensure_schema(conn, profile=…)` exactly once, on a
+database that had no settings row yet; the three app-path callers (web,
+desktop preflight, ESI CLI) pass it. An existing database is never touched,
+so a user's own settings survive every update. The profile: 1% stockpile
+buffer and purchase margin, 800 h run window, 544 composite extra runs,
+540/540 slot pools, alchemy on at 65 jobs per type, broker standings
+4.82/8.09, freight in/out 900/750 ISK/m³, capital broker 1.5% / movement
+25 M / SCC 0.5%; every class in a −0.5 system at index 0.14% — Sotiyo with
+T2 ME/TE rigs for every manufacturing class, Tatara T2 for reactions,
+the lab classes on the Sotiyo with a T2 cost rig;
+Tools blacklisted.
 
 | Column | Default |
 |---|---|
 | `stockpile_buffer` | 0.05 — fraction (0.001–0.1); renamed/rescaled from stockpile_buffer_percent |
 | `max_run_duration_hours` | 24.0 |
-| `ship_batch_multiple` | 8 |
 | `composite_reaction_extra_runs` | 1 |
 | `price_region_id` | 10000002 (The Forge) — hub quotes come from its hub station, and (since 2026-08-23) raw leaves with no hub-station order take this same region's region-wide best order (the v1.9 `npc_goods_region_id` column was merged into it and dropped) |
 | `price_source` | sell |
@@ -674,6 +874,10 @@ when every member has left the pool.
 | `standing_broker_faction` / `standing_broker_corp` | 0.0 — NPC broker fee |
 | `freight_in_isk_per_m3` / `freight_out_isk_per_m3` | 0.0 — flat courier rates: "Courier Highsec Market → Industry Hub" (bought materials in) and "Courier Industry Hub → High Sec Market" (finished products out); freight-in is the Jita leg since v1.10 |
 | `structure_freight_in_isk_per_m3` | 0.0 — "Courier Null Sec Market → Industry Hub": flat ISK/m³ from the structure market (C-J6) to the industry system (v1.10); on an EXISTING database seeded once as a copy of the Jita rate when the column is added, so a configured Jita rate never makes the structure look freight-free by default |
+| `compressed_minerals_enabled`, `compressed_moon_enabled`, `compressed_gas_enabled` | 0 each — v1.25: one toggle per raw group (minerals / moon materials / gas): buy the compressed form and reprocess when cheaper landed (the author's first-run profile turns all three on). Replaced the single `compressed_sourcing_enabled` flag the same day; the migration copies it into all three, then drops it |
+| `compressed_ore_yield` | 0.75 — refinery yield for compressed ore and moon ore; user-asserted, pure yield |
+| `compressed_gas_yield` | 0.60 — decompression yield for compressed gas; user-asserted, pure yield |
+| `compressed_reprocess_tax` | 0.0 — the refinery owner's / NPC station's reprocessing tax as a fraction of every output's value (leftovers included); explicit since 2026-09-05 |
 | `structure_buy_enabled` | 1 — compare inputs against the structure market's sell ladder; off = every input priced from the hub, as before v1.10 |
 | `capital_market_mode` / `capital_structure_id` | cj6 / NULL (v1.6) |
 | `capital_sales_tax` / `capital_broker_rate` | 0.0337 / 0.01 (v1.6) |
@@ -749,6 +953,8 @@ Structure bonuses are read from the structure type's own attributes via
 | `index_run_id` | PK |
 | `run_number` | Sequential, UNIQUE-indexed (2026-08-20, vs the duplicate-number race) |
 | `planned_start`, `actual_start`, `planned_end` | |
+| `compressed_saving_isk` | v1.25: landed ISK the compressed sourcing pass saved vs buying the covered raws direct at plan time (NULL when it changed nothing) |
+| `freight_in_isk_per_m3`, `structure_freight_in_isk_per_m3` | 2026-09-05 review: the plan-time freight-in rates (Jita leg, structure leg) the fill landed with — `costing.hull_cost` prices inbound freight at this vintage; NULL on pre-column runs falls back to live settings |
 | `status` | planned / active / complete |
 | `completed_at` | v1.5: stamped on "Mark executed" — lag costing walks completed runs only |
 | `wallet_character_isk`, `wallet_corporation_isk` | ISK snapshot at plan time (buying-power check) |
@@ -764,7 +970,7 @@ The core output table.
 | `on_hand_qty` | ESI assets in tracked systems |
 | `in_progress_qty` | Output of active jobs — counts as stock |
 | `target_stock_qty` | Merged minimum × (1 + buffer) |
-| `deficit_qty` | `max(0, target + merged_min − on_hand − in_progress)`; final products: `= target` (see Phase 4) |
+| `deficit_qty` | `max(0, target + merged_min − on_hand − in_progress)`; final products: Phase 4 seeds `= target`, and the feedback loop re-sizes a dual-role final to `requested + max(0, other pipelines' allocated draw − on_hand − in_progress)` (review 2026-09-05, A1) |
 | `recommended_action` | buy / build / both |
 | `blueprint_id`, `activity_id` | Activity selects the slot pool |
 | `time_per_run` | ME/TE/facility adjusted |
@@ -778,10 +984,10 @@ The core output table.
 | `build_savings_per_unit` | MILP objective coefficient |
 | `capacity_limited` | Allocation < need |
 | `low_stock` | Won't sustain next run |
-| `price_snapshot` | Cost basis at this run — the CHOSEN venue's raw best price (v1.10) |
+| `price_snapshot` | Cost basis at this run — the CHOSEN venue's raw best price (v1.10); since v1.25 fill pricing the blended raw fill average over the whole direct quantity (rows with `hub_buy_qty` NULL keep the single quote) |
 | `price_region_wide` | v1.9: price_snapshot was a region-wide fallback quote (hub-quote provenance only) |
-| `buy_venue` | v1.10: `hub` / `structure` / NULL (unpriced; NULL on pre-v1.10 rows = hub) — plan-time venue of price_snapshot |
-| `structure_units_cheaper` | v1.10, structure buys: units of the structure's sell ladder landing at or below the hub landed price; the run page flags the buy *shallow* when `recommended_buy_qty` exceeds it |
+| `buy_venue` | v1.10: `hub` / `structure` / NULL (unpriced; NULL on pre-v1.10 rows = hub); v1.25: `split` when the fill spans both markets — plan-time venue of price_snapshot |
+| `structure_units_cheaper` | v1.10, structure buys: units of the structure's sell ladder landing at or below the hub landed price; the run page flags the buy *shallow* when `recommended_buy_qty` exceeds it — since v1.25 the engine NULLs it on every fill-priced row; the run page reads it for the shallow flag only on legacy rows (`hub_buy_qty` NULL) |
 | `depth`, `item_class`, `merged_min_qty` | Merged chain depth (display), class, one cycle's consumption |
 | `unit_install_fee` | v1.5: hypothetical per-unit install fee snapshotted for every buildable |
 | `savings_unpriced_inputs` | Unpriced raw leaves in the savings chain (UI badge) |
@@ -790,6 +996,14 @@ The core output table.
 | `direct_unit_cost` / `alchemy_unit_cost` | v1.4, composite rows: the route comparison |
 | `alchemy_output_qty` | v1.4: composite units expected from this cycle's alchemy jobs |
 | `alchemy_credit_qty` | v1.4: units credited from unrefined stock/jobs at the yield |
+| `compressed_outputs` | v1.25, compressed buy rows: json `[[material_id, units out at the yield, units used to cover demand], ...]` — what the purchase is for |
+| `compressed_ladder_units`, `compressed_fill_orders` | v1.25, compressed buy rows: units on the chosen venue's ladder at plan time and orders the fill walked (the badge tooltip) |
+| `compressed_wanted_qty` | 2026-09-05 review (R6), compressed buy rows: the quantity the LP wanted before the whole-batch re-fill; the run page badges the row *shallow* when it exceeds `recommended_buy_qty`. NULL on pre-column rows (never flagged) |
+| `compressed_covered_qty` | v1.25, raw rows: units of this cycle's purchase covered by reprocessing compressed buys (`recommended_buy_qty` is the direct remainder) |
+| `effective_unit_cost` | v1.25, raw rows: blended LANDED per-unit cost (direct share at its landed quote + allocated compressed cost) the realized costing prices the raw at; NULL when nothing was covered |
+| `hub_buy_qty`, `hub_fill_price`, `hub_fill_orders` | v1.25 fill pricing: units bought at Jita (the unfilled remainder included ONLY when Jita's stored book was truncated — ruling R5 2026-09-05), their average raw fill price and the orders walked; `hub_buy_qty` NULL = a row priced before fill pricing / with no ladder anywhere (its `buy_venue` says it all) |
+| `structure_buy_qty`, `structure_fill_price`, `structure_fill_orders` | v1.25: the structure market's share of the same buy |
+| `unfilled_qty`, `unfilled_price` | v1.25: units no stored ladder held and the last rung walked they are priced at — the *shallow* flag. Since 2026-09-05 (R5) these units are UNSOURCED unless folded into `hub_buy_qty` (truncated Jita book): `hub_buy_qty + structure_buy_qty + unfilled_qty == recommended_buy_qty`, and Multibuy lists the two venue quantities only |
 
 **`index_run_item_pipeline`** — attributes shared demand back to pipelines.
 
@@ -858,6 +1072,18 @@ wanted type: (structure_id, type_id, price, volume_remain), ascending by
 price, replaced wholesale on every structure refresh (same authed pull as the
 best-price rows; orders with no remaining volume are dropped from both). The
 buy-venue comparison reads it cache-only at plan time.
+
+**`hub_sell_order`** (v1.25) — the Jita hub station's SELL ladder for
+EVERY market input the plan may buy (since fill pricing, 2026-09-05 — not
+the compressed candidates only): (region_id, type_id, price,
+volume_remain, min_volume), ascending, the cheapest `HUB_LADDER_MAX_RUNGS`
+(300) orders, replaced per type on every price refresh (the same paged pull
+that sets the best price; a type with a fresh price but no ladder rows is
+refetched). `min_volume` (review 2026-09-05) is the order's minimum fill —
+a rung the walk would take fewer units from is skipped; `structure_sell_order`
+carries the same column. The sourcing pass walks both ladders at plan
+time for a fill cost. A book shorter than 300 rungs is the WHOLE book
+(so a remainder beyond it is unsourced); exactly 300 means truncated.
 **`esi_snapshot`** — the persisted ESI pull that decouples planning from the
 network: fetched_at, on_hand / in_progress / active_jobs JSON, wallet ISK,
 and `job_ends` (2026-08-20: active-job end dates per activity, for
@@ -938,7 +1164,8 @@ Sum each item's requirement across every pipeline that needs it. Populate
 target_stock_qty = merged_min_required × (1 + stockpile_buffer)   [intermediates/raw]
                  = requested output qty                            [final products]
 
-deficit_qty      = target_stock_qty                                [final products]
+deficit_qty      = target_stock_qty                                [final products, Phase 4 seed]
+                 = requested + max(0, consumers' draw − on_hand − in_progress)  [final products, feedback loop]
                  = max(0, target + merged_min − on_hand − in_progress)  [others]
 ```
 
@@ -986,9 +1213,12 @@ max_runs_per_job          = floor(max_run_duration_hours / time_per_run)
                             ceiling: ceil(30 days / MODIFIED time_per_run) —
                             the last run may overhang, and a single run over
                             30 days still installs as 1 run (user-verified
-                            2026-08-21; see §5). Reaction formulas
+                            2026-08-21; see §5). ~~Reaction formulas
                             additionally clamp to their maxProductionLimit
-                            where lower.
+                            where lower.~~ Struck 2026-09-05 (ruling R2,
+                            client-verified: the client accepts more runs
+                            than a formula's maxProductionLimit) — the
+                            30-day rule is the ONLY reaction ceiling.
 total_runs_needed         = ceil(deficit_qty / portion_size)
 jobs_needed_unconstrained = ceil(total_runs_needed / max_runs_per_job)
 ```
@@ -1107,7 +1337,7 @@ recommended_build_qty  = runs_allocated × portion_size
 
 | Category | Rule |
 |---|---|
-| Subcapital ships | Round up to whole BPCs (`runs_per_bpc`) when set, else to a multiple of `ship_batch_multiple` (default 8). **Capacity wins:** where rounding exceeds allocated slots, build what fits and set `capacity_limited`. |
+| Subcapital ships | Round up to whole BPCs (`runs_per_bpc` — pasted, or materialised from the invention choice) when set; exact quantity otherwise (the global `ship_batch_multiple` was removed 2026-09-05, schema 6). **Capacity wins:** where rounding exceeds allocated slots, build what fits and set `capacity_limited`. |
 | Capitals, Freighters, Jump Freighters | Exact quantities — never batch-rounded (`EXACT_QTY_SHIP_GROUPS`). |
 | Reactions | A slot allocated to a reaction runs `max_runs_per_job` — the full cycle window — even if that overshoots the deficit. **Exception (v1.3):** Hybrid Polymers (974) and Molecular-Forged Materials (4096) size to the deficit like manufactured items (`NON_SATURATING_REACTION_GROUPS`). |
 | Composite reaction inputs | Carry the extra runs buffer (applied in Phase 4; largely superseded for raws by just-in-time purchasing). |
@@ -1138,7 +1368,35 @@ a surviving flag is a genuinely uncoverable shortfall. (Until 2026-08-28
 the pass ran once on the first-order-error-dominates assumption; run 59
 showed heavy multi-tier catch-up breaking it — six processed-material
 low-stock flags, and capacity-starved buy flips sized off the stale draft
-draw.)
+draw.) Review 2026-09-05: a dual-role final's re-sized deficit is its
+REQUESTED quantity plus `max(0, component draw − stock)` — the component
+share is netted against stock, the sale share never is (the 2026-08-27
+rule, which the loop had been overriding); and an intermediate's stockpile
+target is PRORATED each pass by the share of its one-cycle steady draw
+(`_steady_shares`) that comes from consumers holding runs this cycle — a
+stage whose consumers all flipped to buy (or are over-stocked with no
+jobs) has target 0 and is neither bought nor built, no floor kept (ruling
+R7); the composite extra-runs adder applies only to composites holding
+jobs, and `low_stock` judges a stage against `min(merged_min, target)` so
+an idle stage never reads as low. Note the consequence: an over-stocked
+consumer (deficit 0, no jobs) counts as inactive that cycle, so its
+suppliers are not stocked for it until it builds again.
+
+### Phase 7.5 — Sourcing pass: fill pricing + compressed (v1.25)
+
+After the loop converges and before the invention vintage, `_sourcing_pass`
+prices every purchase by walking its Jita and structure sell ladders (§5 Buy
+fill pricing — a buy may split across the markets, the remainder beyond the
+stored ladders costs the last rung walked) and re-sources the raw minerals /
+moon materials / gas from compressed purchases where the ladders make that
+cheaper landed (§5 Compressed sourcing mechanics). Raw sizing never feeds job sizing, so the pass runs ONCE outside
+the loop (whose passes delete non-buildable rows and would only churn the
+injected ones). It reduces covered raws' direct buys, stamps their blended
+`effective_unit_cost`, injects one synthetic buy row per chosen compressed
+type (`recommended_action = 'buy'`, the fill average as `price_snapshot`,
+its venue, the outputs tuple and ladder depth), and reports the landed
+saving on the run. The steady-state planner never runs it (like alchemy):
+the Slot Planner buys raws direct.
 
 ### Invention pass (v1.22; vintage-only since v1.23)
 
@@ -1238,12 +1496,12 @@ confirmed open item (2026-08-20).
 | ME/TE/facility/rig math | Done — Hulk worked example passes; per-class build-settings model |
 | Multi-stage BOM expansion | Done — **reproduces prior anchor exactly: Hulk → 78 items, depth 5** |
 | Own schema (`store.py`) | Done — full state schema, seeded defaults |
-| Engine Phases 2–8 | Done — planning + MILP allocation + FIFO cost lots; Phase 1 snapshot arrives via `Snapshot` from esi/market |
+| Engine Phases 2–8 | Done — planning + MILP allocation; the Phase-8 FIFO lot primitives are DORMANT (dead code kept for a future receipts model — nothing in the app writes them, tests only); Phase 1 snapshot arrives via `Snapshot` from esi/market |
 | ESI integration | **Done — live end-to-end incl. corporation data** (SSO login; corp assets→systems for stock — corp-scope since 2026-08-20; char + corp industry jobs deduped with delivery-location filtering; user-entered slot pools net of multi-cycle jobs; char + corp wallets). Live test: 1,020 types on hand, 129 products in progress, 11.06B corp ISK. Full snapshot ~80s (corp asset pagination dominates) |
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 229 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, SDE import atomicity, schema/settings integrity) |
+| Test suite | 531 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, SDE import atomicity, schema/settings integrity) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -2243,7 +2501,7 @@ had planned 17 attempts); one `costing.resolve_invention` rule makes a
 vanished decryptor STALE everywhere instead of silently "no decryptor";
 materialised runs/ME/TE are re-derived after every SDE import; copy jobs
 on T2/T3 blueprint originals are no longer read as invention attempts.
-Schema 5 drops the never-read `copies_needed`/`attempts` vintage columns.
+Schema 5 drops the never-read `copies_needed`/`attempts` vintage columns; schema 6 (2026-09-05) drops `settings.ship_batch_multiple`; schema 7 (v1.25) adds the compressed sourcing, fill pricing and review columns (`hub_sell_order`, the per-venue fill columns, `compressed_wanted_qty`, the per-run freight rates, ladder `min_volume`).
 Tests 356 → 437.
 
 ### v1.24 (2026-09-03): portable zip opens its own window — commit 3737cb8
@@ -2304,7 +2562,7 @@ user's Windows machine against the live database.
 | ~~Default decrypter~~ | ~~Optimized Augmentation~~ Superseded 2026-08-20: decrypter feature struck from spec ~~(never implemented; invention is out of scope)~~ — reinstated v1.22 as a per-pipeline choice with no default (see "T2 invention" rows below) | |
 | Facility assignment | ~~Per (category, activity)~~ → global settings per item class (2026-08-15) | User asserts structure, ME/TE rig tier, security, index, and tax once per class; simpler and matches practice |
 | Facility math depth | Structure bonuses from data; rig tier asserted per class | Rig-applicability filtering not needed at planning time |
-| Ship batching | Multiples of 8 (configurable), capacity wins; **runs-per-BPC, when set, replaces the multiple** — subcap ships build whole blueprint copies | Revised 2026-08-15 |
+| Ship batching | ~~Multiples of 8 (configurable), capacity wins; **runs-per-BPC, when set, replaces the multiple**~~ 2026-09-05: the global multiple is REMOVED (schema 6 drops `settings.ship_batch_multiple`) — runs-per-BPC is the only batch unit; a sub-capital ship with none set builds its exact quantity | Revised 2026-08-15; removed 2026-09-05: every invention pipeline materialises runs-per-BPC and overrode the multiple, and a BPO-built hull has no copy to fill — the setting only ever misled |
 | Capital vs. non-capital | **Reinstated 2026-08-15**: capitals (incl. supers/titans), Freighters (513), Jump Freighters (902) build in exact quantities — no batch rounding (`EXACT_QTY_SHIP_GROUPS`) | User builds capitals in exact counts |
 | Dual-role finals vs. stock (ruled 2026-08-27) | A final consumed as another pipeline's intermediate nets that component share against on-hand/in-flight stock; the requested share keeps the exact ignore-stock rule. Steady-state drafts seed finals at ZERO stock so the netting stays a no-op there (v1.17) | 20 Covetors on hand shouldn't trigger 13 fresh builds when only 5 are for sale; the exact-requested rule exists for the sale share, not the component share |
 | Profit card cycle basis (ruled 2026-08-27) | Requested scale (Units = configured qty); the Slot Planner keeps the v1.13 built scale | "Units" answers what was configured, the materials bill answers what the line consumes — the two views deliberately differ, documented at the `hulls_per_cycle` site |
@@ -2338,7 +2596,7 @@ user's Windows machine against the live database.
 | Multi-cycle slot netting (2026-08-20) | Active jobs whose end date lies beyond the next index run are netted from the slot pool; single-cycle jobs stay un-netted per v1.1. Amended 2026-08-25: the corp feed runs first and claims corp jobs — they count toward slots under the corp's `count_jobs` toggle; `include_job_slots` gates only the character's remaining personal jobs | The v1.1 "pools as entered" premise assumes all jobs deliver before planning; multi-cycle capital jobs violate it. Corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs |
 | Finals never overbuild (2026-08-20) | Uniform round-up is skipped for pipeline finals incl. EXACT_QTY groups — the last job runs short | Finals ignore stock, so overbuild never nets off; also keeps batch/BPC-rounded totals exact (batch multiple is a hard contract) |
 | ~~Component run caps (2026-08-20)~~ | ~~maxProductionLimit caps manufacturing runs/job~~ Superseded 2026-08-21: maxProductionLimit is the max licensed runs per blueprint COPY and does not cap manufacturing | In-client verification showed the game accepts far more runs |
-| Per-job run ceiling (2026-08-21) | ONE rule for manufacturing AND reactions: runs keep being added while the job's total **modified** time is under 30 days, so the last run may overhang — `ceil(30d / time_per_run)`; a single run over 30 days installs as 1 run. Reaction formulas' maxProductionLimit kept as an extra ceiling where lower (unverified). The earlier verified reaction caps (544, alchemy 272) were this same rule at the user's Tatara (543 runs = 29d 23:21:59, the 544th allowed) | User-verified in client 2026-08-21; supersedes the flat-544/base-time-scaled reaction machinery and the (misread) maxProductionLimit manufacturing cap |
+| Per-job run ceiling (2026-08-21) | ONE rule for manufacturing AND reactions: runs keep being added while the job's total **modified** time is under 30 days, so the last run may overhang — `ceil(30d / time_per_run)`; a single run over 30 days installs as 1 run. ~~Reaction formulas' maxProductionLimit kept as an extra ceiling where lower (unverified)~~ removed 2026-09-05 (ruling R2: client-verified, the client accepts more runs than the formula's maxProductionLimit). The earlier verified reaction caps (544, alchemy 272) were this same rule at the user's Tatara (543 runs = 29d 23:21:59, the 544th allowed) | User-verified in client 2026-08-21; supersedes the flat-544/base-time-scaled reaction machinery and the (misread) maxProductionLimit manufacturing cap |
 | Negative build savings (2026-08-20) | Buy in BOTH branches (contended and idle slots) | Building above market price — the LANDED price since 2026-08-23 — wastes ISK regardless of slot pressure; removes the one-slot build/buy flip-flop |
 | Unpriced inputs in savings (2026-08-20) | Keep MILP weighting; badge the savings figure as incomplete ("N inputs unpriced") in the UI | Ranking-last could starve good builds on a stale price cache; flagging is honest and cheap |
 | Alchemy 1-job minimum (2026-08-20) | Kept — a zero-residual swap still installs one alchemy job | Confirmed intended: the token job's output is cheap extra buffer |
@@ -2367,14 +2625,14 @@ user's Windows machine against the live database.
 | Outpost Construction level (2026-08-22) | Own settings column routed by exact name in `_per_bp_skill_level`; Tech I structure rigs and structure components need only Industry, Tech II Standup rigs add T2 science skills (science level) | Was silently riding on the Tech 2 Science level for the 118 blueprints that require it (13 Upwell structures, 63 Standup modules, 41 Standup fighters, the Orbital Skyhook) |
 | Non-ship final ME/TE default (2026-08-22) | Omitted ME/TE in the paste: ships 0/0 (unchanged contract), any other product takes `default_intermediate_me/te`; a pipeline's blueprint_setting pin is deleted with the pipeline | A component pasted as a final without ME/TE pinned its blueprint at ME0 inside every structure chain, and the pin outlived the pipeline |
 | Type lookup by name (2026-08-22) | `Refdata.type_id` is case-insensitive (exact-case match first), then prefers the published type, then lowest id; the paste stores the canonical name | 'astrahus' should be the Astrahus; 'Azbel' names both the Engineering Complex and an unpublished celestial; rowid order was an accident |
-| Two-venue buying (v1.10, 2026-08-22) | Inputs priced at the cheaper LANDED of the Jita hub quote and the structure market's best sell order (price + that venue's flat ISK/m³ freight-in on packaged volume); `price_snapshot` stays the venue's RAW price with freight a separate line; tie → hub; finals excluded (always hub) | Every purchase is a Jita-vs-C-J6 decision; raw price keeps buy totals, Multibuy and lag costing as market prices; finals' price_snapshot is the run page's sell reference |
-| Structure depth rule (2026-08-22) | Best price + flag, never a fill price: shallow = units of the structure's sell ladder landing ≤ the Jita landed price < quantity to buy; no order splitting across venues | User choice — a thin cheap order still sets the quote; the flag tells the user to buy the remainder in Jita |
+| Two-venue buying (v1.10, 2026-08-22) | ~~Inputs priced at the cheaper LANDED of the Jita hub quote and the structure market's best sell order (price + that venue's flat ISK/m³ freight-in on packaged volume); `price_snapshot` stays the venue's RAW price with freight a separate line; tie → hub; finals excluded (always hub)~~ 2026-09-05: a buy MAY split across the two markets — every purchase walks both sell ladders together (fill pricing); Phase 1's single-quote venue choice survives only as the starting point | Every purchase is a Jita-vs-C-J6 decision; raw price keeps buy totals, Multibuy and lag costing as market prices; finals' price_snapshot is the run page's sell reference |
+| Structure depth rule (2026-08-22) | ~~Best price + flag, never a fill price: shallow = units of the structure's sell ladder landing ≤ the Jita landed price < quantity to buy; no order splitting across venues~~ 2026-09-05: superseded by fill pricing — every buy pays its fill (both ladders merged, cheapest landed rung first), shallow = units beyond the STORED ladders (priced at the last rung walked, ~~listed under Jita~~ unsourced unless Jita's book was truncated — 2026-09-05 review, see below) | User choice — a thin cheap order still sets the quote; the flag tells the user the remainder has no market at plan time |
 | One structure market (2026-08-22) | The v1.6 capital-pricing structure (C-J6MT preset / custom ID) is also the buy venue; a second flat freight-in rate for its leg | One authed order-book pull serves both; no second structure setting |
 | Alchemy comparison landed (2026-08-24) | Both routes' materials and the recovered credit price LANDED (venue raw + that venue's courier rate × packaged m³, the same `_landed_price` leg as build savings); the comparison stays single-stage | Freight does not cancel between the routes — at 55% yield the unrefined route hauls ~1.8× the m³ per composite unit, so raw prices overstated alchemy by ~500–1,250 ISK/unit at 900 ISK/m³ and flipped marginal routes (run 49: Hexite +1,304 raw → −130 landed) |
 | T2 invention: materialize at config time (v1.22) | Choosing a decryptor writes the derived values THEN — runs into `pipeline.runs_per_bpc` (the user's own value stashed in `manual_runs_per_bpc` on the OFF→ON edge), invented ME/TE into the T2 blueprint's `blueprint_setting`; disabling restores the stashed runs and the paste-default ME/TE; the paste updates only qty while invention is on | The resolver chain, `_size_jobs` batch rounding and the `bpc_runs_limit` flow stay untouched; the only plan-time addition is the cost math and the buy rows. The stash exists because the manual-BPC fallback reads the live `runs_per_bpc` — without it the toggle silently repriced every pre-invention executed run's realized BPC line (review find, 2026-08-31) |
 | T2 invention: stale-config escape (v1.22) | A `use_invention=1` pipeline whose source no longer resolves keeps a reduced control on the Pipelines page (current-stale + Off); the BPC-cost input re-enables since costing falls back to it | The Off POST deliberately runs before the capability check; without the control the materialized runs/ME/TE were unfixable short of deleting the pipeline (and its profit history) |
 | T2 invention: capability rule (v1.22) | ~~A final is invention-capable when its manufacturing blueprint has EXACTLY ONE `ref_invention` source; T3 deferred~~ 2026-08-31: capable = AT LEAST one source; multi-source finals (T3 relic tiers, and the seven multi-T1-source T2 targets) store a chosen source (`pipeline.invention_source_blueprint_id`) picked via a source select beside the decryptor; single-source stays auto (column NULL, heals multi→single drift) | Every T2 target has one source in live data (verified, build 3484357); the source picker generalizes to all 63 multi-source targets with one mechanism |
-| T3 relic fee base (2026-08-31) | A relic attempt's invention fee base = 2% of the INVENTED blueprint's product manufacturing EIV; copy fee 0 (a relic is consumed outright — no copy job) | Relics have no manufacturing activity, so the T2 base (source's act-1 EIV) is undefined; user decision, pending in-client verification like the other fee constants |
+| T3 relic fee base (2026-08-31) | A relic attempt's invention fee base = 2% of the INVENTED blueprint's product manufacturing EIV; copy fee 0 (a relic is consumed outright — no copy job) | Relics have no manufacturing activity, so the T2 base (source's act-1 EIV) is undefined; user decision, still pending in-client verification (the T2 2% base itself was verified 2026-09-05) |
 | Relic as consumable-in-JSON (2026-08-31) | The relic rides the `datacores` tuple/JSON as one extra per-attempt triple — no schema change, and the buy-row demand loop, stock netting (wormhole loot), hull-cost replay and run-page Input table all work untouched | One representation for every per-attempt consumable beats a parallel relic column set |
 | Subsystem classification (2026-08-31) | Category 32 (T3 subsystems) classifies `t2_ships`, joining the techLevel-3 hulls already there | CCP's "Medium T2 Ships" rig target filter (8) spans category 32 — the user's T2-ship rigs bonus subsystem jobs in game, so pricing them under `other` understated ME/TE bonuses |
 | BPC stockpile overbuild (v1.23) | Two settings, `t1_bpc_overbuild` / `t2_bpc_overbuild` (default 400%, clamp 100–1000%): the Invention tab targets ceil(one cycle's copies × mult), netted against BPC stock and in-flight lab jobs | User request 2026-09-01: BPCs stocked like any other input material; the flat-multiplier alternative was rejected for netting |
@@ -2394,7 +2652,37 @@ user's Windows machine against the live database.
 | T2 invention: expected-value sizing (v1.22) | `attempts = ceil(copies / P)` buys datacores/decryptors at expected quantities, rounded up; per-run cost amortizes at the continuous expectation | The plan is advisory (ESI is the ledger); variance of a binomial across a cycle doesn't warrant a safety-stock model |
 | T2 invention: landed invention lines (v1.22) | Datacore/decryptor prices inside the invention cost are landed; the buy-list rows keep venue raw prices like every other buy | Same freight stance as build savings and the alchemy comparison; `_freight_in_lines` only aggregates `material` lines so nothing double-counts |
 | Compare-decryptors table removed (2026-08-31) | The Pipelines page keeps only the decryptor dropdown — the per-row nine-option economics table was struck as clutter (user request). The refresh list still covers datacores + all decryptors for every capable pipeline, so switching choices prices immediately; per-option numbers live on the run and profit pages | The comparison was the page's heaviest element (9 costings + ~30 cache reads per capable row per GET) for a decision made once per pipeline |
+| Invention comparison window (2026-09-05) | The comparison returns as an on-demand WINDOW, not a page element: a `compare` mini button on each capable row's action edge fetches `GET /pipelines/<id>/compare` into one shared `dialog.breakdown.wide` — every source × decryptor option (relic tier × decryptor for T3) costed end to end via `costing.current_hull_cost(..., invention=(source, decryptor))`, a what-if pair that overrides the stored choice AND resolves the final's blueprint to that copy's invented ME/TE for the chain walk; rows sort best margin per unit first, `current`/`best`/`unpriced` badged; the pipeline's own chain is expanded for the price ids so an inactive pipeline compares too; invention on, off or stale alike; the manual BPC cost never enters | User request 2026-09-05. Fetched on open, the 9–27 chain walks cost the Pipelines GET nothing — the very weight that struck the inline table; a decryptor's ME modifier moves the whole materials bill, so a per-line invention cost alone would misrank options |
+| First-run profile (2026-09-05) | `store.FIRST_RUN_PROFILE` (the author's working settings, class facilities and Tools blacklist) is applied by `ensure_schema(conn, profile=…)` only to a database with no settings row yet; the schema DEFAULTs stay the neutral baseline the tests run on; existing databases are never touched | User request: new installs start from a configuration that plans sensibly out of the box, and a user's own settings must survive every update — which the fresh-row guard guarantees by construction |
 | T2 invention: lag semantics (v1.22) | The realized view reads the per-run `index_run_invention` snapshot at lag 0; the what-if view computes live. **v1.23:** the replay prices the CONTINUOUS expected consumption (1/(P × runs × portion)) from the vintage row, never `attempts` — production volume belongs to the Invention tab's stockpile, so a 4× overbuild cycle and a stock-covered cycle cost the same per hull | The invention spend happens AT the run that licenses the copies — there is no deeper vintage to walk back to; per-hull cost stays amortized (user decision) |
+| Compressed sourcing (v1.25, 2026-09-05) | Raw minerals / moon materials / gas may be bought as compressed ore / moon ore / gas and reprocessed: one LP over every candidate's ladder rungs (landed) plus a direct-buy variable per raw; whole reprocessing batches; strictly cheaper or the raw stays; two user-asserted PURE yields (ore/moon ore, gas) and an explicit reprocessing tax on output value (same day: first folded into the yields like alchemy's, then made its own figure at the user's request); one Settings toggle | User request. Compressed goods are often cheaper per output unit and haul at 1/100 the volume; a per-line "is compressed cheaper" check would misrank ores that yield several materials, so one LP spans the three groups |
+| Compressed depth = fill cost (2026-09-05) | ~~The Jita sell LADDER is persisted for compressed candidates (`hub_sell_order`) and each candidate is costed by filling the quantity it would take — the one exception to the 2026-08-22 "best price + flag, never a fill price" rule, scoped to compressed types; every direct buy keeps the single best-price quote~~ same day, later: fill pricing extended to EVERY buy (see below); the Jita ladder is now stored for every input | Compressed books are thin: a 1-unit cheap order must not win the whole demand. The exception is bounded (candidates only) so the buy list's meaning is unchanged everywhere else |
+| Compressed surplus uncounted (2026-09-05) | Outputs beyond the cycle's demand are leftover stock and worth nothing in the decision (only demanded raws have LP rows) | Crediting surplus at market value invites buy-ore-to-sell-minerals loops and recommends ore for minerals nobody needs |
+| Compressed hangar stock ignored (2026-09-05) | Compressed ore / gas already in tracked hangars credits nothing; only purchases are planned from compressed | The user reprocesses hangar ore on their own schedule; a credit would assume it |
+| One venue per compressed row (2026-09-05) | The LP sees both venues' rungs; a chosen type is assigned the venue holding the larger share and re-filled there | One `buy_venue`, one Multibuy block per market — the "no order splitting" spirit at row level |
+| Compressed pass once, after convergence; Planning tab excluded (2026-09-05) | `_sourcing_pass` (née `_compressed_pass`) runs after the feedback loop and before the invention vintage; `plan_steady_state` passes `compressed=False` | Raw sizing never feeds job sizing; the Slot Planner's live views are single-quote and must reconcile with the Profit view's what-if, which has no depth model |
+| Compressed candidates imported, not ruled (2026-09-05) | `compressibleTypes` -> `ref_compressible`; `portionSize` -> `ref_type.portion_size`; candidates = targets joined to fixed reprocess outputs of the two kinds. Inert (empty) on a pre-v1.25 database | Data-derived like alchemy routes; a group/name rule would guess portion sizes and mis-catch legacy and weapon types named "Compressed ..." |
+| Compressed toggles per group (2026-09-05) | Three Settings toggles — minerals, moon materials, gas — replace the single flag; the toggles pick the candidate TYPES (those yielding a raw of an enabled group); every demanded raw of the three groups still counts and is covered by whatever the candidates yield (same day, user ruling: moon ore on / minerals off still covers the Pyerite a moon ore yields); the profile turns all three on | User request: the three markets behave differently (compressed gas carries a Jita premium the freight saving rarely beats), so each is a separate decision |
+| Whole copies whatever the window (2026-09-05, review A8 ruling) | The whole-copy batch rounding of a sub-capital final stands even when the cycle window caps the runs per job below the copy's runs; per-job runs stay capped by window / 30-day rule / copy | In game a copy keeps its unused runs, so parallel jobs on separate copies leave reusable runs for the next cycle; the alternative ("the copy defines the job", a multi-cycle job, or exact quantities when the copy exceeds the 30-day rule) broke the T3 whole-copies contract and the cycle-window rule |
+| Null-sec share at the fill price (2026-09-05) | A split line's structure share is valued at `structure_fill_price`, not the blended average (`CostLine.structure_cost_per_hull`) | The two venues' prices differ by construction; the Null Sec Market Share figure is displayed ISK |
+| SDE zip cache retention (2026-09-05) | After a successful import the cache keeps the current build's archive plus one previous; older archives are deleted | Every other accumulating store is pruned; ~99 MB per build was kept forever |
+| Fill pricing for every buy (2026-09-05) | Every bought input walks its Jita and structure sell ladders (merged, cheapest landed first); `price_snapshot` = the blended raw fill average; Jita's 300 cheapest orders are stored for every priced input on each refresh | User request after seeing 5.1B Tritanium "available" at C-J6's single best order with no freight — a fiction that also tilted the compressed comparison |
+| Split buys across venues (2026-09-05) | A buy may split across Jita and C-J6 by venue quantity on one row (`buy_venue = split`); Multibuy lists each market's share; realized freight splits by the hub fraction | The 2026-08-22 "no order splitting" rule is withdrawn at the user's request: a shallow C-J6 ladder should call for the rest in Jita, not a flag |
+| Remainder at marginal, ~~listed under Jita~~ unsourced (2026-09-05; ruling R5 the same day) | Units beyond every stored ladder cost the last rung walked and stay in the row's quantity. ~~They ride the Jita quantity (the structure's only when the item has no Jita ladder)~~ They ride the Jita quantity ONLY when Jita's stored ladder is TRUNCATED (exactly `HUB_LADDER_MAX_RUNGS` rungs, so the real book continues); a remainder beyond an EXHAUSTED book (shorter than the cap, or no Jita ladder at all) is UNSOURCED — attributed to no venue, listed in no Multibuy block; the shallow badge names the count and says so. Landed cost of the remainder: marginal price + the hub freight rate when the item has a hub ladder, else the structure rate | Conservative — never invents a price cheaper than the book showed, and never tells the user to buy in Jita what Jita's whole stored book could not supply |
+| **Review fixes (2026-09-05)** | | |
+| Reaction run ceiling (R2) | A reaction formula's `maxProductionLimit` is NOT a run cap; the 30-day modified-time rule is the only reaction ceiling | Client-verified: it accepts more runs than the formula's figure — the clamp was under-sizing bulk reactions |
+| Per-batch reprocessing floor (R3) | `batch_output = n × floor(base × yield)` | Conservative; the whole-quantity floor credited up to n − 1 phantom units per output |
+| Fee constants verified (R4) | SCC surcharge 4%, NPC facility tax 0.25%, invention/copy fee base 2% marked verified in-client | Observed in the client; no longer "pending" |
+| Compressed shallow = shrunk below the wanted quantity (R6) | `index_run_item.compressed_wanted_qty` stores what the LP wanted; the web layer flags `compressed_wanted_qty > recommended_buy_qty` | The old `recommended_buy_qty > compressed_ladder_units` test could never fire after the whole-batch shrink — the badge was dead |
+| Zero-draw intermediates (R7) | A stage with zero realized draw takes its target from that draw — no floor kept | A phantom cycle of stock for a stage nobody consumes this cycle |
+| Freight-rate vintage per run (C2) | `index_run.freight_in_isk_per_m3` / `structure_freight_in_isk_per_m3` persisted at plan time; `hull_cost` lands inbound freight at the run's own rates (live settings for pre-column runs) | Editing the freight setting must not silently reprice executed history |
+| Ladders carry `min_volume` (C3) | Both sell-order tables store ESI `min_volume`; the merged walk skips a rung whose minimum exceeds the units it would take | A 10,000-minimum order cannot fill a 300-unit buy; the walk was pricing buys off orders it could never hit |
+| Hub quote kept beside the winner (C5) | `Snapshot.hub_prices` carries the cached Jita quote per type even where the structure won Phase 1; the sourcing pass's synthetic hub rung reads it | An item with a hub price but no stored hub ladder was given the WINNING venue's price as its Jita rung |
+| No sell ladders off the sell source (C6) | `market.sell_ladders` returns empty ladders when `price_source != 'sell'`, so the pass leaves every Phase 1 quote alone | No sell ladder was ever pulled for a buy-side price source; walking a stale one mispriced the plan |
+| Hub ladder for every input | `hub_sell_order` is stored for every market input on each refresh, not the compressed candidates only | Fill pricing walks every buy; the candidates-only pull left most rows with a single quote and no depth |
+| Paste keeps blank interior columns (B1) | `_parse_pipeline_line` drops trailing empties only; an interior blank is an omitted column | "Ishtar\t40\t\t4\t8" (blank runs/BPC) used to shift ME 4 into runs/BPC and TE 8 into ME |
+| Newer-database page (B7) | An `errorhandler(RuntimeError)` renders the message on a plain page (no template — base.html would reopen the database) | `ensure_schema`'s refusal of a newer-build database fired inside `conn()` as a bare 500 |
+| Strip and badge wording (B2–B6, B9) | `shallow` joins the strip's gate; "N via C-J6" counts structure-only rows (split rows have their own badge); the Compressed section names the cheaper market's ladder; the deficit dialog and Chain tooltip state the compressed-covered leg | Each was a truthful-tooltip lapse found in review |
 | T2 invention: skills (v1.22) | One new setting (`skill_encryption`, /40 term); the datacore sciences reuse `skill_starship_engineering` / `skill_science` through the existing `_per_bp_skill_level` name families | The families already route every science skill correctly; only Encryption Methods had no home (and its formula weight differs) |
 
 ---
@@ -2417,13 +2705,23 @@ user's Windows machine against the live database.
   their output blueprint into in-progress, and the Invention tab nets BPC
   stock and in-flight attempts before sizing; lab jobs still contend for
   no slot pool.
-- **Invention fee constants** — the 2% EIV fee base
-  (`JOB_FEE_EIV_FRACTION`), the relic fee base (2% of the invented
-  blueprint's product manufacturing EIV — decision 2026-08-31), and the
-  lab cost indices await in-client verification, like the SCC surcharge.
+- **Invention fee constants** — ~~the 2% EIV fee base
+  (`JOB_FEE_EIV_FRACTION`)~~ verified in-client 2026-09-05 (with the SCC
+  surcharge and the NPC facility tax); the relic fee base (2% of the
+  invented blueprint's product manufacturing EIV — decision 2026-08-31)
+  and the lab cost indices still await in-client verification.
 - **ETag/Expires response caching** — confirmed open (2026-08-20); would
   speed refreshes and cut the error-limit budget draw.
 - **Deployment** — how the user runs it day to day (local script, service,
   packaged executable).
+- **Compressed sourcing scope** (v1.25) — ice products are not covered; the
+  Planning tab's what-if views and the Invention tab stay single-quote (no
+  ladder depth); realized cost of a covered raw is the plan-time blend, not
+  the executed fill.
+- **Fill pricing edges** (v1.25) — the merged walk takes stored (expensive)
+  C-J6 rungs before Jita's unstored 301st order; a remainder whose last rung
+  was a C-J6 rung is priced at that rung under the Jita freight rate when
+  the item has a Jita ladder (2026-09-05: settled, see the R5 decision —
+  the remainder is unsourced unless Jita's stored book was truncated).
 - **Aggregate profit reporting** (ISK/hour across pipelines over time) —
   deferred from v1.

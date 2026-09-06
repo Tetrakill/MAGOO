@@ -6,6 +6,7 @@ blueprints (ME/TE overrides), characters (pool + in-app SSO login), index
 runs (list + detail with buy/build lists and multibuy export).
 """
 
+import json
 import logging
 import os
 import secrets as pysecrets
@@ -27,12 +28,14 @@ from flask import (
     request,
     url_for,
 )
+from markupsafe import escape
 
 import httpx
 
 from magoo import __version__
 
 from . import (
+    bom,
     config,
     costing,
     engine,
@@ -163,7 +166,9 @@ def _chain_status(x) -> str:
         return "covered"
     if x["build_qty"] > 0:
         return "react" if x["activity_id"] == 11 else "build"
-    if x["buy_qty"] > 0:
+    if x["buy_qty"] > 0 or x.get("compressed_covered", 0) > 0:
+        # v1.25: a raw fully covered by compressed purchases is still a
+        # purchase, not unmet demand.
         return "buy"
     if x["alchemy_out"] > 0:
         return "alchemy"
@@ -255,6 +260,22 @@ def _steady_rows(ref, plan) -> list[dict]:
                 "alchemy_for_type_id": item.alchemy_for_type_id,
                 "direct_unit_cost": item.direct_unit_cost,
                 "alchemy_unit_cost": item.alchemy_unit_cost,
+                # v1.25: the steady-state path never runs the compressed
+                # pass; the keys exist so _buy_context sees one shape.
+                "compressed_outputs": None,
+                "compressed_ladder_units": None,
+                "compressed_fill_orders": None,
+                "compressed_wanted_qty": None,
+                "compressed_covered_qty": 0,
+                "effective_unit_cost": None,
+                "hub_buy_qty": None,
+                "hub_fill_price": None,
+                "hub_fill_orders": None,
+                "structure_buy_qty": None,
+                "structure_fill_price": None,
+                "structure_fill_orders": None,
+                "unfilled_qty": 0,
+                "unfilled_price": None,
             }
         )
     return rows
@@ -275,7 +296,7 @@ def _steady_demand(rows, activity_id) -> int:
     )
 
 
-def _buy_context(rows) -> dict:
+def _buy_context(rows, ref=None) -> dict:
     """The buy-side derivations run_detail and _planning_context share:
     the buy list and its total, plan-time venue provenance (structure vs
     hub, shallow ladders, region-wide fallbacks), the structure-component
@@ -292,16 +313,91 @@ def _buy_context(rows) -> dict:
         builds_mfg_all, buys
     )
     # v1.10: plan-time buy venue per row (NULL on pre-v1.10 rows = hub).
-    # One Multibuy block per venue so each pastes into the right market
-    # window; 'shallow' = the structure's ladder had fewer units beating
-    # the Jita landed price than the plan buys there (the engine NULLs
-    # structure_units_cheaper on every non-structure row).
-    structure_buys = {
-        i["type_id"] for i in buys
-        if i["buy_venue"] == store.BUY_VENUE_STRUCTURE
+    # v1.25 fill pricing: a row walked on its ladders carries per-venue
+    # quantities and may be SPLIT; a legacy row (hub_buy_qty NULL) puts
+    # its whole quantity on its buy_venue. One Multibuy block per venue.
+    def venue_split(i) -> tuple[int, int]:
+        if "hub_buy_qty" in i.keys() and i["hub_buy_qty"] is not None:
+            return int(i["hub_buy_qty"] or 0), int(i["structure_buy_qty"] or 0)
+        qty = int(i["recommended_buy_qty"] or 0)
+        if i["buy_venue"] == store.BUY_VENUE_STRUCTURE:
+            return 0, qty
+        return qty, 0
+
+    venue_qty = {i["type_id"]: venue_split(i) for i in buys}
+    structure_buys = {t for t, (_h, s) in venue_qty.items() if s > 0}
+    split_buys = {t for t, (h, s) in venue_qty.items() if h > 0 and s > 0}
+    # 'shallow': a fill-priced row whose stored ladders ran out — the rest
+    # (unfilled_qty) is UNSOURCED: no market held it at plan time, it is
+    # priced at the last rung walked, sits in no venue quantity and in no
+    # Multibuy block (review 2026-09-05, R5; the engine folds a remainder
+    # into the Jita quantity only when Jita's stored book was truncated at
+    # HUB_LADDER_MAX_RUNGS, so its real book continues) — invariant
+    # hub_buy_qty + structure_buy_qty + unfilled_qty == recommended_buy_qty;
+    # or a legacy structure row whose ladder had fewer units beating the
+    # Jita landed price than the plan buys there.
+    shallow = set()
+    for i in buys:
+        if "hub_buy_qty" in i.keys() and i["hub_buy_qty"] is not None:
+            if (i["unfilled_qty"] or 0) > 0:
+                shallow.add(i["type_id"])
+        elif (
+            i["structure_units_cheaper"] is not None
+            and i["recommended_buy_qty"] > i["structure_units_cheaper"]
+        ):
+            shallow.add(i["type_id"])
+    # v1.25 compressed sourcing: the compressed buy rows (what each is
+    # for, decoded), the raws they part-cover, and compressed rows whose
+    # fill outran their venue's ladder at plan time.
+    compressed = {}
+    for i in buys:
+        raw = i["compressed_outputs"] if "compressed_outputs" in i.keys() else None
+        if raw:
+            outputs = json.loads(raw) if isinstance(raw, str) else list(raw)
+            # (material_id, name, units out, units used) — names resolved
+            # here so the badge and the reprocess checklist share them.
+            compressed[i["type_id"]] = [
+                (
+                    int(m),
+                    ref.type_info(int(m)).name if ref is not None else str(m),
+                    int(out),
+                    int(used),
+                )
+                for m, out, used in outputs
+            ]
+    compressed_covered = {
+        i["type_id"]: i["compressed_covered_qty"]
+        for i in rows
+        if "compressed_covered_qty" in i.keys()
+        and (i["compressed_covered_qty"] or 0) > 0
+    }
+    # Review 2026-09-05 (R6): a compressed buy is shallow when the pass
+    # SHRANK it below what the LP wanted — the engine stores the wanted
+    # quantity (compressed_wanted_qty) beside the whole-batch fill it
+    # settled for. The old test compared recommended_buy_qty against
+    # compressed_ladder_units, which can never be true after the shrink
+    # (the fill is by construction within the ladder), so the badge never
+    # fired. Rows planned before the column (key absent / NULL) are not
+    # flagged — the figure was never recorded.
+    def wanted(i):
+        return (
+            i["compressed_wanted_qty"]
+            if "compressed_wanted_qty" in i.keys()
+            else None
+        )
+
+    compressed_shallow = {
+        i["type_id"]
+        for i in buys
+        if i["type_id"] in compressed
+        and wanted(i) is not None
+        and wanted(i) > (i["recommended_buy_qty"] or 0)
     }
     return dict(
         buys=buys,
+        compressed=compressed,
+        compressed_covered=compressed_covered,
+        compressed_shallow=compressed_shallow,
         buy_total=sum(
             (i["recommended_buy_qty"] or 0) * (i["price_snapshot"] or 0)
             for i in buys
@@ -310,22 +406,19 @@ def _buy_context(rows) -> dict:
         # must say so (mirrors the profit pages' "N unpriced" badge).
         buys_unpriced=sum(1 for i in buys if i["price_snapshot"] is None),
         structure_buys=structure_buys,
-        shallow={
-            i["type_id"]
-            for i in buys
-            if i["structure_units_cheaper"] is not None
-            and i["recommended_buy_qty"] > i["structure_units_cheaper"]
-        },
+        split_buys=split_buys,
+        venue_qty=venue_qty,
+        shallow=shallow,
         # Plan-time provenance of price_snapshot: which bought inputs were
         # priced from a region-wide fallback.
         region_wide={i["type_id"] for i in buys if i["price_region_wide"]},
         multibuy_hub="\n".join(
-            f"{i['name']} {i['recommended_buy_qty']}"
-            for i in buys if i["type_id"] not in structure_buys
+            f"{i['name']} {venue_qty[i['type_id']][0]}"
+            for i in buys if venue_qty[i["type_id"]][0] > 0
         ),
         multibuy_structure="\n".join(
-            f"{i['name']} {i['recommended_buy_qty']}"
-            for i in buys if i["type_id"] in structure_buys
+            f"{i['name']} {venue_qty[i['type_id']][1]}"
+            for i in buys if venue_qty[i["type_id"]][1] > 0
         ),
         struct_builds=struct_builds,
         struct_buys=struct_buys,
@@ -341,7 +434,7 @@ def _planning_context(ref, plan, settings_) -> dict:
     wallet-dependent (low stock, wallets, multibuy) is absent here, and
     alchemy too — plan_steady_state plans direct reactions only."""
     rows = _steady_rows(ref, plan)
-    bc = _buy_context(rows)
+    bc = _buy_context(rows, ref)
     builds_reaction = [
         i
         for i in rows
@@ -354,8 +447,13 @@ def _planning_context(ref, plan, settings_) -> dict:
         buy_total=bc["buy_total"],
         buys_unpriced=bc["buys_unpriced"],
         structure_buys=bc["structure_buys"],
+        split_buys=bc["split_buys"],
+        venue_qty=bc["venue_qty"],
         shallow=bc["shallow"],
         region_wide=bc["region_wide"],
+        compressed=bc["compressed"],
+        compressed_covered=bc["compressed_covered"],
+        compressed_shallow=bc["compressed_shallow"],
         builds=bc["builds_mfg_all"],
         reactions=builds_reaction,
         builds_grouped=_group_by_category(ref, bc["builds_mfg_all"]),
@@ -416,6 +514,33 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
     return alchemy
 
 
+def _compressed_section(ref, items, compressed: dict) -> list[dict]:
+    """run_detail's Compressed sourcing section rows (v1.25): each
+    compressed buy with its reprocess outcome — what it covers and what
+    is left over — for the manual reprocess checklist."""
+    by_type = {i["type_id"]: i for i in items}
+    section = []
+    for type_id, outputs in compressed.items():
+        row = by_type.get(type_id)
+        if row is None:
+            continue
+        section.append(
+            {
+                "item": row,
+                "outputs": [
+                    {
+                        "name": name,
+                        "out": out,
+                        "used": used,
+                        "leftover": max(0, out - used),
+                    }
+                    for _m, name, out, used in outputs
+                ],
+            }
+        )
+    return section
+
+
 def _chain_context(ref, items) -> dict:
     """run_detail's Chain-tab derivations: the per-item status rows, their
     raw/manufactured/reacted/structure groupings, and the status counts."""
@@ -449,6 +574,13 @@ def _chain_context(ref, items) -> dict:
             "build_qty": i["recommended_build_qty"] or 0,
             "buy_qty": i["recommended_buy_qty"] or 0,
             "alchemy_out": i["alchemy_output_qty"] or 0,
+            # v1.25: units covered by reprocessing compressed purchases
+            # (pre-v1.25 rows have no column).
+            "compressed_covered": (
+                (i["compressed_covered_qty"] or 0)
+                if "compressed_covered_qty" in i.keys()
+                else 0
+            ),
             "capacity_limited": bool(i["capacity_limited"]),
             # 2026-09-01: the section-header stats (slots, build/buy value)
             # read the same keys the Plan tab's rows carry.
@@ -595,7 +727,7 @@ def _settings_save(c, form):
     c.execute(
         "UPDATE settings SET input_purchase_margin = ?, "
         "stockpile_buffer = ?, "
-        "max_run_duration_hours = ?, ship_batch_multiple = ?, "
+        "max_run_duration_hours = ?, "
         "composite_reaction_extra_runs = ?, price_region_id = ?, "
         "price_source = ?, manufacturing_slots = ?, "
         "reaction_slots = ?, skill_industry = ?, "
@@ -616,13 +748,15 @@ def _settings_save(c, form):
         "count_fitted_stock = ?, "
         "structure_freight_in_isk_per_m3 = ?, structure_buy_enabled = ?, "
         "skill_encryption = ?, "
-        "t1_bpc_overbuild = ?, t2_bpc_overbuild = ? "
+        "t1_bpc_overbuild = ?, t2_bpc_overbuild = ?, "
+        "compressed_minerals_enabled = ?, compressed_moon_enabled = ?, "
+        "compressed_gas_enabled = ?, compressed_ore_yield = ?, "
+        "compressed_gas_yield = ?, compressed_reprocess_tax = ? "
         "WHERE id = 1",
         (
             margin,
             buffer,
             max(1.0, _form_number(form, "duration")),
-            max(1, int_field("batch")),
             max(0, int_field("extra_runs")),
             int_field("region"),
             form["source"],
@@ -671,6 +805,12 @@ def _settings_save(c, form):
             min(5, max(0, int_field("skill_encryption"))),
             min(10.0, max(1.0, pct_field("t1_overbuild_pct"))),
             min(10.0, max(1.0, pct_field("t2_overbuild_pct"))),
+            1 if form.get("compressed_minerals_enabled") else 0,
+            1 if form.get("compressed_moon_enabled") else 0,
+            1 if form.get("compressed_gas_enabled") else 0,
+            min(1.0, max(0.0, pct_field("compressed_ore_yield_pct"))),
+            min(1.0, max(0.0, pct_field("compressed_gas_yield_pct"))),
+            min(0.5, max(0.0, pct_field("compressed_tax_pct"))),
         ),
     )
     # Security is chosen as a band (high/low/null) and stored as a
@@ -841,6 +981,30 @@ def create_app() -> Flask:
         )
         return redirect(request.referrer or url_for("dashboard"))
 
+    @app.errorhandler(RuntimeError)
+    def _runtime_error(exc):
+        # Review 2026-09-05: store.ensure_schema refuses a database written
+        # by a NEWER build with a RuntimeError whose message tells the user
+        # exactly what to do (install the latest release) — but it fired
+        # inside conn(), before any template could render, so a packaged
+        # user saw a bare "Internal Server Error". Render the message on a
+        # plain page instead. Deliberately no template: base.html's
+        # context processor opens the database, which would raise again.
+        # Still a 500 — the request genuinely failed and nothing was saved.
+        log.error("request failed: %s", exc)
+        message = escape(str(exc))
+        return (
+            "<!doctype html><title>Magoo — cannot continue</title>"
+            "<body style=\"font-family:system-ui,sans-serif;max-width:40rem;"
+            "margin:3rem auto;padding:0 1rem;line-height:1.5\">"
+            "<h1 style=\"font-size:1.3rem\">Magoo cannot continue</h1>"
+            f"<p>{message}</p>"
+            "<p style=\"color:#666\">Nothing was changed. Close this window "
+            "after reading the message above.</p></body>",
+            500,
+            {"Content-Type": "text/html; charset=utf-8"},
+        )
+
     # -- per-request database handles -----------------------------------
 
     # ensure_schema is not read-only (INSERT OR IGNORE seeds), so during a
@@ -860,7 +1024,9 @@ def create_app() -> Flask:
             if str(config.DB_PATH) not in schema_ready:
                 with schema_lock:
                     if str(config.DB_PATH) not in schema_ready:
-                        store.ensure_schema(g.conn)
+                        store.ensure_schema(
+                            g.conn, profile=store.FIRST_RUN_PROFILE
+                        )
                         schema_ready.add(str(config.DB_PATH))
         return g.conn
 
@@ -1169,10 +1335,11 @@ def create_app() -> Flask:
     ) -> tuple[str, int, int | None, int, int] | None:
         """One pasted row -> (name, qty, runs_per_bpc, me, te). Excel pastes
         tab-separated columns: product, quantity, runs/BPC, ME, TE. Trailing
-        columns may be omitted (runs/BPC -> uncapped, ME/TE -> None, which
-        the caller resolves: 0 for ships, the intermediate defaults for
-        other products — v1.9). Comma- and space-separated rows work too
-        (name may contain spaces)."""
+        columns may be omitted, and an interior tab/comma column may be
+        left blank (runs/BPC -> uncapped, ME/TE -> None, which the caller
+        resolves: 0 for ships, the intermediate defaults for other
+        products — v1.9). Comma- and space-separated rows work too (name
+        may contain spaces)."""
         line = line.strip()
         if not line:
             return None
@@ -1186,16 +1353,35 @@ def create_app() -> Flask:
             while tokens and tokens[-1].isdigit() and len(numbers) < 4:
                 numbers.insert(0, tokens.pop())
             fields = [" ".join(tokens)] + numbers
-        fields = [f for f in fields if f != ""]
+        # Review 2026-09-05: only TRAILING empties are dropped. An empty
+        # INTERIOR column is an omitted value in its own position — an
+        # Excel row with a blank runs/BPC cell pastes as
+        # "Ishtar\t40\t\t4\t8", and collapsing the blank used to shift ME
+        # 4 into runs/BPC and TE 8 into ME. (The space-separated branch
+        # never produces empties: it takes trailing digits only.)
+        while fields and fields[-1] == "":
+            fields.pop()
         if len(fields) < 2 or len(fields) > 5:
             raise ValueError(line)
         name, *numbers = fields
-        if not name or not all(n.isdigit() for n in numbers):
+        if (
+            not name
+            or numbers[0] == ""
+            or not all(n == "" or n.isdigit() for n in numbers)
+        ):
             raise ValueError(line)
+
+        def column(k: int) -> int | None:
+            return (
+                int(numbers[k])
+                if len(numbers) > k and numbers[k] != ""
+                else None
+            )
+
         qty = int(numbers[0])
-        runs_bpc = int(numbers[1]) if len(numbers) > 1 else None
-        me = int(numbers[2]) if len(numbers) > 2 else None
-        te = int(numbers[3]) if len(numbers) > 3 else None
+        runs_bpc = column(1)
+        me = column(2)
+        te = column(3)
         if (
             qty < 1
             or (runs_bpc is not None and runs_bpc < 1)
@@ -1226,9 +1412,9 @@ def create_app() -> Flask:
         relic tier or T1 BPO). Carries just what the selects need — the
         option lists, the current choices, and the source name for the
         tooltip. (The nine-option economics comparison that used to
-        render below each row was removed 2026-08-31 — user request; the
-        chosen option's economics show on the save flash and the profit
-        views.)"""
+        render below each row was removed 2026-08-31 — user request; since
+        2026-09-05 the row's compare button fetches the full source ×
+        decryptor comparison into a dialog on demand — pipeline_compare.)"""
         if not rows or not sde_ready():
             return {}
         options = [
@@ -1600,6 +1786,132 @@ def create_app() -> Flask:
             )
         )
         return redirect(url_for("pipelines"))
+
+    @app.get("/pipelines/<int:pipeline_id>/compare")
+    def pipeline_compare(pipeline_id):
+        """The invention comparison window (2026-09-05): every source ×
+        decryptor option of one capable pipeline, costed at today's
+        prices — the whole chain re-walked at each option's invented ME
+        (a decryptor's ME modifier moves the materials bill, not just the
+        invention line), that option's invention lines, and the final's
+        net proceeds — rendered as an HTML fragment the Pipelines page
+        fetches into its shared dialog on demand. The inline nine-option
+        table was struck as clutter on 2026-08-31; fetched on demand the
+        comparison costs the page GET nothing. Invention on, off or stale
+        alike — the window is how the choice gets made. 404 for a final
+        with no invention source."""
+        c = conn()
+        pipeline = c.execute(
+            "SELECT * FROM pipeline WHERE pipeline_id = ?", (pipeline_id,)
+        ).fetchone()
+        if pipeline is None or not sde_ready():
+            abort(404)
+        r = ref()
+        final_id = pipeline["final_product_type_id"]
+        sources = r.invention_sources_for_product(final_id)
+        if not sources:
+            abort(404)
+        settings_ = store.get_settings(c)
+        class_settings = store.get_class_settings(c)
+        # Price ids: THIS pipeline's chain — it may be inactive, and the
+        # active-demand set would then miss its materials (structure
+        # only; quantities and blacklisting do not change which types
+        # can appear) — plus the invention inputs and EIV bases of every
+        # capable pipeline, which demand_type_ids carries active or not.
+        type_ids = set(bom.expand(r, final_id, 1)) | engine.demand_type_ids(
+            c, r
+        )
+        prices, venues, _units, region_wide, adjusted = _price_maps(
+            c, r, settings_, type_ids
+        )
+        region_wide = frozenset(region_wide)
+        price, net, capital = sell_quote(c, settings_, final_id)
+        resolved = costing.resolve_invention(r, pipeline)
+        current = (
+            (
+                resolved[0].t1_blueprint_id,
+                resolved[1].type_id if resolved[1] else None,
+            )
+            if resolved is not None
+            else None
+        )
+
+        def landed(type_id):
+            return costing.landed_price(
+                r, settings_, prices.get(type_id), venues.get(type_id), type_id
+            )
+
+        rows = []
+        for source in sources:
+            for decryptor in (None, *r.decryptors()):
+                choice = (source, decryptor)
+                # invention_cost for the option's own figures (chance,
+                # invented stats, cost per licensed run); the chain walk
+                # for what a hull then costs end to end.
+                inv = costing.invention_cost(
+                    r, settings_, class_settings, source, decryptor,
+                    price_of=landed, adjusted_of=adjusted.get,
+                )
+                cost = costing.current_hull_cost(
+                    c, r, settings_, pipeline, prices, adjusted,
+                    region_wide=region_wide, venues=venues, invention=choice,
+                )
+                margin = net - cost.total if net is not None else None
+                rows.append(
+                    {
+                        "source_name": r.type_info(source.t1_blueprint_id).name,
+                        "decryptor_name": (
+                            decryptor.name if decryptor else "No decryptor"
+                        ),
+                        "chance": inv.probability,
+                        "runs": inv.runs_per_copy,
+                        "me": inv.me,
+                        "te": inv.te,
+                        "cost_per_run": inv.cost_per_run,
+                        "invention_per_unit": cost.subtotal("invention"),
+                        "cost": cost,
+                        "margin": margin,
+                        "current": current
+                        == (
+                            source.t1_blueprint_id,
+                            decryptor.type_id if decryptor else None,
+                        ),
+                        "unpriced": cost.missing_prices,
+                    }
+                )
+        # Best margin first (unpriced-quote rows keep their source /
+        # decryptor order at the end); the top row is the recommendation.
+        rows.sort(
+            key=lambda row: row["margin"]
+            if row["margin"] is not None
+            else float("-inf"),
+            reverse=True,
+        )
+        if rows and rows[0]["margin"] is not None:
+            rows[0]["best"] = True
+        info = r.type_info(final_id)
+        _count, prices_at = market.price_cache_state(
+            c, settings_.price_region_id, settings_.price_source
+        )
+        return render_template(
+            "_invention_compare.html",
+            name=info.name,
+            rows=rows,
+            multi=len(sources) > 1,
+            price=price,
+            net=net,
+            capital=capital,
+            qty=pipeline["output_qty_per_run"],
+            prices_at=prices_at,
+            current=current,
+            # Batch wording only where _size_jobs batches (the save flash
+            # applies the same rule): a ship final outside the
+            # exact-quantity groups builds in whole runs-per-copy batches.
+            batches=(
+                info.category_id == config.CATEGORY_SHIP
+                and info.group_id not in config.EXACT_QTY_SHIP_GROUPS
+            ),
+        )
 
     def _pipeline_or_422(c, pipeline_id):
         """The pipeline row for an inline edit of a value invention
@@ -2064,6 +2376,10 @@ def create_app() -> Flask:
         raw_leaves = {
             t for t in market_ids if r.blueprint_for_product(t) is None
         }
+        # v1.25 fill pricing: every input the plan may buy (compressed
+        # candidates included) also persists its hub SELL ladder — the
+        # depth the sourcing pass walks. Same paged pull, rows only.
+        ladder_ids = set(market_ids)
         try:
             fetched, skipped, fresh = market.refresh_prices(
                 c,
@@ -2072,6 +2388,7 @@ def create_app() -> Flask:
                 settings_.price_source,
                 fallback_type_ids=raw_leaves,
                 fallback_region_id=settings_.price_region_id,
+                ladder_type_ids=ladder_ids,
             )
         except httpx.HTTPError as exc:
             flash(
@@ -2104,6 +2421,16 @@ def create_app() -> Flask:
             message += (
                 f" — {len(region_priced)} raw input(s) priced region-wide "
                 "(no hub-station order)"
+            )
+        if ladder_ids:
+            n_ladders = len(
+                market.cached_hub_ladders(
+                    c, settings_.price_region_id, ladder_ids
+                )
+            )
+            message += (
+                f" — Jita sell ladders for {n_ladders}/{len(ladder_ids)} "
+                "inputs"
             )
 
         # One structure-market pull (the whole book comes down regardless)
@@ -2384,6 +2711,20 @@ def create_app() -> Flask:
         if not prices:
             flash("no price data yet — run a price refresh first")
             return redirect(url_for("dashboard"))
+        # v1.25: every demanded type's sell ladders, per venue, for the
+        # sourcing pass (fill pricing + compressed substitution).
+        sell_ladders = market.sell_ladders(c, settings_, type_ids)
+        # Review 2026-09-05 (C5): the cached Jita quote per type, kept even
+        # where the structure venue won Phase 1 — `prices` then holds the
+        # structure's quote, and the sourcing pass's synthetic hub rung
+        # (an item with a hub price but no stored hub ladder) needs the
+        # hub figure, not the winner's.
+        hub_prices = {
+            t: price
+            for t, (price, _region_wide) in market.cached_hub_quotes(
+                c, settings_.price_region_id, type_ids, settings_.price_source
+            ).items()
+        }
         snapshot = engine.snapshot_from_state(
             c,
             prices=prices,
@@ -2391,6 +2732,8 @@ def create_app() -> Flask:
             region_wide=region_wide,
             buy_venue=buy_venue,
             structure_units_cheaper=structure_units_cheaper,
+            sell_ladders=sell_ladders,
+            hub_prices=hub_prices,
         )
         if snapshot is None:
             flash("no ESI data yet — run an ESI update first")
@@ -2579,7 +2922,7 @@ def create_app() -> Flask:
             (index_run_id,),
         ).fetchall()
         settings_ = store.get_settings(c)
-        bc = _buy_context(items)
+        bc = _buy_context(items, ref())
         unmet = [
             i
             for i in items
@@ -2595,6 +2938,9 @@ def create_app() -> Flask:
             and not i["alchemy_for_type_id"]
         ]
         alchemy = _alchemy_section(ref(), settings_, items)
+        compressed_section = _compressed_section(
+            ref(), items, bc["compressed"]
+        )
         final_ids, final_net_margin = _final_margin_badges(
             c, ref(), settings_, items
         )
@@ -2620,6 +2966,15 @@ def create_app() -> Flask:
             struct_slots=bc["struct_slots"],
             alchemy=alchemy,
             alchemy_yield=settings_.alchemy_reprocess_yield,
+            compressed=bc["compressed"],
+            compressed_section=compressed_section,
+            compressed_covered=bc["compressed_covered"],
+            compressed_shallow=bc["compressed_shallow"],
+            compressed_saving=(
+                run["compressed_saving_isk"]
+                if "compressed_saving_isk" in run.keys()
+                else None
+            ),
             **_chain_context(ref(), items),
             unmet=unmet,
             low_stock=[i for i in items if i["low_stock"]],
@@ -2628,6 +2983,8 @@ def create_app() -> Flask:
             multibuy_hub=bc["multibuy_hub"],
             multibuy_structure=bc["multibuy_structure"],
             structure_buys=bc["structure_buys"],
+            split_buys=bc["split_buys"],
+            venue_qty=bc["venue_qty"],
             shallow=bc["shallow"],
             settings=settings_,
             mfg_slots_used=sum(

@@ -220,7 +220,10 @@ CREATE TABLE ref_type (
     category_id      INTEGER NOT NULL,
     volume           REAL,
     packaged_volume  REAL,
-    published        INTEGER NOT NULL DEFAULT 0
+    published        INTEGER NOT NULL DEFAULT 0,
+    -- v1.25: units per reprocessing batch (typeMaterials quantities are
+    -- per this many input units: ore / moon ore 100, gas and ice 1)
+    portion_size     INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE ref_blueprint (
     blueprint_id INTEGER NOT NULL,
@@ -308,6 +311,17 @@ CREATE TABLE ref_type_material (
     quantity    INTEGER NOT NULL,
     PRIMARY KEY (type_id, material_id)
 );
+-- v1.25 compressed sourcing: compression targets (compressibleTypes) —
+-- a raw ore / moon ore / gas and the compressed type it becomes. The
+-- candidate set for buying compressed instead of raw (a compressed
+-- type's reprocessing outputs live in ref_type_material). No semicolons
+-- in these comments: the schema is split on them.
+CREATE TABLE ref_compressible (
+    type_id            INTEGER PRIMARY KEY,
+    compressed_type_id INTEGER NOT NULL
+);
+CREATE INDEX idx_ref_compressible_target
+    ON ref_compressible (compressed_type_id);
 CREATE TABLE ref_solar_system (
     system_id INTEGER PRIMARY KEY,
     name      TEXT NOT NULL,
@@ -333,6 +347,7 @@ REF_TABLES = (
     "ref_industry_modifier",
     "ref_industry_target_filter",
     "ref_type_material",
+    "ref_compressible",
     "ref_solar_system",
     "ref_sde_build",
 )
@@ -399,10 +414,11 @@ def _import_types(conn, records) -> int:
                 _first(r, "volume"),
                 _first(r, "packagedVolume"),
                 1 if _first(r, "published", default=False) else 0,
+                max(1, int(_first(r, "portionSize", default=1) or 1)),
             )
         )
     conn.executemany(
-        "INSERT INTO ref_type VALUES (?, ?, ?, ?, ?, ?, ?)", rows
+        "INSERT INTO ref_type VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows
     )
     return len(rows)
 
@@ -652,6 +668,20 @@ def _import_type_materials(conn, records) -> int:
     return len(rows)
 
 
+def _import_compressible(conn, records) -> int:
+    """Compression targets (v1.25): raw type -> its compressed type."""
+    rows = []
+    for r in records:
+        target = _first(r, "compressedTypeID", "compressedTypeId")
+        if target is None:
+            continue
+        rows.append((_record_id(r, "typeID"), int(target)))
+    conn.executemany(
+        "INSERT OR REPLACE INTO ref_compressible VALUES (?, ?)", rows
+    )
+    return len(rows)
+
+
 def _import_solar_systems(conn, records) -> int:
     rows = []
     for r in records:
@@ -703,7 +733,7 @@ def run_import(force: bool = False, progress=None) -> bool:
             t0 = time.monotonic()
 
             def step(i: int, dataset: str):
-                _report(progress, stage="import", dataset=dataset, step=i, steps=8)
+                _report(progress, stage="import", dataset=dataset, step=i, steps=9)
 
             # One transaction spans the whole rebuild + import: a failure
             # anywhere (CCP schema drift, power loss) rolls back to the
@@ -747,7 +777,25 @@ def run_import(force: bool = False, progress=None) -> bool:
             step(7, "reprocessing yields")
             n = _import_type_materials(conn, _read_dataset(zf, "typeMaterials"))
             log.info(f"  ref_type_material       {n:>9,}")
-            step(8, "solar systems")
+            step(8, "compression targets")
+            # compressibleTypes is OPTIONAL (review 2026-09-05): an
+            # archive without the member imports everything else and
+            # leaves compressed sourcing inert (empty ref_compressible,
+            # refdata.compressed_sources() -> {}) rather than failing the
+            # whole build. Every other dataset stays required.
+            try:
+                n = _import_compressible(
+                    conn, _read_dataset(zf, "compressibleTypes")
+                )
+            except FileNotFoundError as exc:
+                n = 0
+                log.warning(
+                    "%s — compressed sourcing will have no candidates "
+                    "until an archive that ships it is imported",
+                    exc,
+                )
+            log.info(f"  ref_compressible        {n:>9,}")
+            step(9, "solar systems")
             n = _import_solar_systems(conn, _read_dataset(zf, "mapSolarSystems"))
             log.info(f"  ref_solar_system        {n:>9,}")
             _report(progress, stage="finalize", build=build)
@@ -756,9 +804,49 @@ def run_import(force: bool = False, progress=None) -> bool:
             )
             conn.commit()
             log.info("done in %.1fs", time.monotonic() - t0)
+        # Only after the commit: a failed import keeps every archive, so
+        # the previous build can still be re-imported offline.
+        _prune_sde_cache(build)
         return True
     finally:
         conn.close()
+
+
+_SDE_ARCHIVE_GLOB = "eve-online-static-data-*-jsonl.zip"
+
+
+def _archive_build(path: Path) -> int | None:
+    """The build number in a cached archive's name, None for anything
+    else (a .part download in flight is not matched by the glob)."""
+    stem = path.name[len("eve-online-static-data-"):-len("-jsonl.zip")]
+    return int(stem) if stem.isdigit() else None
+
+
+def _prune_sde_cache(current_build: int, keep_previous: int = 1) -> None:
+    """Delete stale SDE archives from config.SDE_CACHE_DIR after a
+    successful import (review 2026-09-05: each is ~100 MB and nothing
+    ever removed them). Keeps the CURRENT build's archive plus the
+    ``keep_previous`` highest OTHER builds — ordered by build number,
+    not mtime, because a cached re-download never touches the file and
+    a build number is the thing that identifies a rollback target.
+    Mirrors store._prune_backups: best-effort, never raises."""
+    try:
+        found = [
+            (build, path)
+            for path in config.SDE_CACHE_DIR.glob(_SDE_ARCHIVE_GLOB)
+            if (build := _archive_build(path)) is not None
+        ]
+    except OSError:
+        return
+    others = sorted(
+        (build, path) for build, path in found if build != current_build
+    )
+    for _build, stale in others[: max(0, len(others) - keep_previous)]:
+        try:
+            stale.unlink()
+            log.info("pruned cached %s", stale.name)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@
   <a href="#global">Global</a>
   <a href="#stockpile">Stockpile Buffer</a>
   <a href="#alchemy">Alchemy</a>
+  <a href="#compressed">Compressed Sourcing</a>
   <a href="#skills">Skills</a>
   <a href="#subcap">High Sec Trade Hub Pricing</a>
   <a href="#capital">Null Sec Trade Hub Pricing</a>
@@ -33,8 +34,6 @@
     <label for="duration">Max Run Duration <small>hours — the index-run cycle window</small></label>
     <input id="duration" name="duration" type="number" step="0.5" min="1"
            value="{{ settings.max_run_duration_hours }}">
-    <label for="batch">Ship Batch Multiple <small>ship builds round up to a multiple of this</small></label>
-    <input id="batch" name="batch" type="number" min="1" value="{{ settings.ship_batch_multiple }}">
     <label for="mfg_slots">Manufacturing Slots <small>total pool; multi-cycle active jobs (from ESI) subtract from this</small></label>
     <input id="mfg_slots" name="mfg_slots" type="number" min="0" value="{{ settings.manufacturing_slots }}">
     <label for="reaction_slots">Reaction Slots <small>total pool</small></label>
@@ -108,6 +107,51 @@
     <label for="max_alchemy_jobs">Max Alchemy Jobs per Type <small>per unrefined formula per cycle; 0 disables</small></label>
     <input id="max_alchemy_jobs" name="max_alchemy_jobs" type="number" min="0"
            value="{{ settings.max_alchemy_jobs_per_type }}">
+  </div>
+</div>
+
+<div class="panel" id="compressed">
+  <h2>Compressed Sourcing</h2>
+  <details class="muted help">
+    <summary>How compressed buying is planned</summary>
+    <p>For each group switched on below, when the plan buys those raws it
+    also considers buying compressed ore, compressed moon ore or compressed
+    gas and reprocessing it. A compressed buy covers every raw it yields —
+    a moon ore bought for its moon materials still covers the minerals it
+    reprocesses into, even with minerals switched off. Every compressed candidate is costed by walking
+    the cheaper market's sell ladder for the quantity actually needed (Jita
+    and the null-sec market compete, as for every buy), landed, so a thin
+    cheap order never wins on its own. A compressed buy stands only when it is
+    strictly cheaper than the raws it covers; purchases round up to whole
+    reprocessing batches, outputs beyond the cycle's need are leftover
+    stock and count for nothing in the decision (though the reprocessing
+    tax is charged on them), and compressed items already in your hangars
+    are ignored. Ice products are not covered.
+    Requires game data downloaded since v1.25 — download it again from
+    the Dashboard if the Buy list never shows compressed rows.</p>
+  </details>
+  <div class="fields">
+    <label for="compressed_minerals_enabled">Minerals from Compressed Ore
+      <small>Tritanium through Morphite, from compressed asteroid ore (a moon ore bought for its goo still covers the minerals it yields, whatever this says)</small></label>
+    <input id="compressed_minerals_enabled" name="compressed_minerals_enabled" type="checkbox" {{ 'checked' if settings.compressed_minerals_enabled }}>
+    <label for="compressed_moon_enabled">Moon Materials from Compressed Moon Ore
+      <small>Hydrocarbons, Scandium, Promethium and the rest, from compressed moon ore</small></label>
+    <input id="compressed_moon_enabled" name="compressed_moon_enabled" type="checkbox" {{ 'checked' if settings.compressed_moon_enabled }}>
+    <label for="compressed_gas_enabled">Gas from Compressed Gas
+      <small>fullerites, cytoserocins and mykoserocins, decompressed 1:1 at the yield below</small></label>
+    <input id="compressed_gas_enabled" name="compressed_gas_enabled" type="checkbox" {{ 'checked' if settings.compressed_gas_enabled }}>
+    <label for="compressed_ore_yield_pct">Ore Reprocessing Yield
+      <small>your refinery's yield for compressed ore and moon ore (structure, rigs, skills) &mdash; the pure yield; the tax has its own field below</small></label>
+    <span class="withunit"><input id="compressed_ore_yield_pct" name="compressed_ore_yield_pct" type="number" step="0.5" min="0" max="100"
+           value="{{ settings.compressed_ore_yield|pct }}">%</span>
+    <label for="compressed_gas_yield_pct">Gas Decompression Yield
+      <small>your yield when reprocessing compressed gas back into gas &mdash; the pure yield</small></label>
+    <span class="withunit"><input id="compressed_gas_yield_pct" name="compressed_gas_yield_pct" type="number" step="0.5" min="0" max="100"
+           value="{{ settings.compressed_gas_yield|pct }}">%</span>
+    <label for="compressed_tax_pct">Reprocessing Tax
+      <small>the refinery owner's (or NPC station's) tax, a percentage of every output's value &mdash; charged on leftovers too</small></label>
+    <span class="withunit"><input id="compressed_tax_pct" name="compressed_tax_pct" type="number" step="0.1" min="0" max="50"
+           value="{{ settings.compressed_reprocess_tax|pct }}">%</span>
   </div>
 </div>
 
@@ -192,11 +236,15 @@
     <p>One null-sec structure market (the C-J6MT Keepstar by default) serves
     two jobs. <b>Buying:</b> every input the plan buys is priced at whichever
     is cheaper <i>landed</i> — Jita price + Jita freight-in, or this
-    market's best sell price + the C-J6 freight-in below; the Buy list
-    badges C-J6 buys and flags <i>shallow</i> ones whose sell ladder has
-    fewer units beating the Jita landed price than the plan buys (the best
-    price is still used; buy the rest in Jita). Pipeline finals are never
-    compared. <b>Selling:</b> capitals, freighters, jump freighters, and
+    market's sell ladder + the C-J6 freight-in below. Since v1.25 every buy
+    is priced by walking both markets' sell ladders together, cheapest
+    landed order first, so a buy may split across them (Multibuy lists each
+    market's share); a buy that outruns the stored ladders is flagged
+    <i>shallow</i>: the remainder is priced at the last order walked but is
+    unsourced — no market held it, so it appears in no Multibuy block
+    (unless Jita's stored book was cut off at 300 orders, when the rest is
+    assumed to sit deeper in Jita).
+    Pipeline finals are never compared. <b>Selling:</b> capitals, freighters, jump freighters, and
     Orcas sell-quote here instead of the price region, with the fee pair
     below and the fixed movement cost in place of ISK/m³ freight-out.
     Needs a character logged in with the structure-markets scope and

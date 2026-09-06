@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -58,7 +58,6 @@ CREATE TABLE IF NOT EXISTS settings (
     -- Fraction, 0.001-0.1 (i.e. 0.1%-10%), applied to intermediates/raw
     stockpile_buffer               REAL NOT NULL DEFAULT 0.05,
     max_run_duration_hours         REAL NOT NULL DEFAULT 24.0,
-    ship_batch_multiple            INTEGER NOT NULL DEFAULT 8,
     composite_reaction_extra_runs  INTEGER NOT NULL DEFAULT 1,
     price_region_id                INTEGER NOT NULL DEFAULT 10000002,
     price_source                   TEXT NOT NULL DEFAULT 'sell'
@@ -258,10 +257,27 @@ CREATE TABLE IF NOT EXISTS structure_sell_order (
     structure_id  INTEGER NOT NULL,
     type_id       INTEGER NOT NULL,
     price         REAL NOT NULL,
-    volume_remain INTEGER NOT NULL
+    volume_remain INTEGER NOT NULL,
+    -- review 2026-09-05: an order's minimum fill; a rung whose min_volume
+    -- exceeds the units a walk would take from it cannot be filled there
+    min_volume    INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS structure_sell_order_type
     ON structure_sell_order (structure_id, type_id);
+
+-- v1.25: the Jita hub station's SELL ladder (price, remaining volume,
+-- ascending) for compressed sourcing CANDIDATES only, replaced per type on
+-- every price refresh. The compressed pass walks it at plan time for a
+-- fill cost; every other buy keeps the single best-price quote above.
+CREATE TABLE IF NOT EXISTS hub_sell_order (
+    region_id     INTEGER NOT NULL,
+    type_id       INTEGER NOT NULL,
+    price         REAL NOT NULL,
+    volume_remain INTEGER NOT NULL,
+    min_volume    INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS hub_sell_order_type
+    ON hub_sell_order (region_id, type_id);
 
 -- Corporations reachable through the pool: which character answered each
 -- corp endpoint family at the last ESI refresh (NULL = no role or skipped),
@@ -505,6 +521,89 @@ _MIGRATIONS = (
     # 2026-08-23 drops.
     "ALTER TABLE index_run_invention DROP COLUMN copies_needed",
     "ALTER TABLE index_run_invention DROP COLUMN attempts",
+    # Schema 6 (2026-09-05): the global Ship Batch Multiple is gone —
+    # runs-per-BPC (pasted, or materialised from the invention choice)
+    # is the only ship batch unit; with none set a ship final builds its
+    # exact quantity. Same tolerant drop as schema 5; get_settings
+    # filters a column an old SQLite could not drop.
+    "ALTER TABLE settings DROP COLUMN ship_batch_multiple",
+    # Schema 7 (v1.25, 2026-09-05): compressed sourcing — buy compressed
+    # ore / moon ore / gas and reprocess it when cheaper landed than the
+    # raw minerals / moon materials / gas, Jita ladder depth considered.
+    # Two user-asserted yields (refinery for ore and moon ore, gas
+    # decompression), reprocessing tax folded in.
+    "ALTER TABLE settings ADD COLUMN compressed_sourcing_enabled "
+    "INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN compressed_ore_yield "
+    "REAL NOT NULL DEFAULT 0.75",
+    "ALTER TABLE settings ADD COLUMN compressed_gas_yield "
+    "REAL NOT NULL DEFAULT 0.60",
+    # The reprocessing tax as its own figure (user request 2026-09-05):
+    # a fraction of every output's value, charged per compressed buy;
+    # the two yields above are then PURE yields.
+    "ALTER TABLE settings ADD COLUMN compressed_reprocess_tax "
+    "REAL NOT NULL DEFAULT 0.0",
+    # One toggle per raw group (user request, same day): minerals, moon
+    # materials, gas. The single flag they replace is copied into all
+    # three the moment they appear, then dropped — the UPDATE and the
+    # DROP both fail harmlessly ("no such column") on every later start.
+    "ALTER TABLE settings ADD COLUMN compressed_minerals_enabled "
+    "INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN compressed_moon_enabled "
+    "INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN compressed_gas_enabled "
+    "INTEGER NOT NULL DEFAULT 0",
+    "UPDATE settings SET compressed_minerals_enabled = 1, "
+    "compressed_moon_enabled = 1, compressed_gas_enabled = 1 "
+    "WHERE compressed_sourcing_enabled = 1",
+    "ALTER TABLE settings DROP COLUMN compressed_sourcing_enabled",
+    # Compressed buy rows: what the purchase is FOR — json
+    # [[material_id, units out at the yield, units used to cover demand],
+    # …] — plus the ladder depth the fill walked (units on the chosen
+    # venue's ladder; orders taken), for the shallow flag and tooltip.
+    "ALTER TABLE index_run_item ADD COLUMN compressed_outputs TEXT",
+    "ALTER TABLE index_run_item ADD COLUMN compressed_ladder_units INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN compressed_fill_orders INTEGER",
+    # Raw rows: units of this cycle's purchase covered by reprocessing
+    # compressed buys (recommended_buy_qty is the direct remainder), and
+    # the blended LANDED per-unit cost the realized costing prices the
+    # raw at (direct share at its landed quote + the allocated compressed
+    # cost) — NULL when nothing was covered.
+    "ALTER TABLE index_run_item ADD COLUMN compressed_covered_qty "
+    "INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE index_run_item ADD COLUMN effective_unit_cost REAL",
+    # Fill pricing (2026-09-05): every bought input walks its Jita and
+    # structure sell ladders and may be SPLIT across them. Per-venue
+    # units, average raw fill price and orders taken; the units no
+    # stored ladder held (priced at the last rung walked; folded into the
+    # hub quantity only when Jita's stored ladder was truncated at the
+    # 300-rung cap, otherwise unsourced — review ruling R5) and that
+    # marginal price. hub_buy_qty NULL = a
+    # row priced before fill pricing (its buy_venue says it all).
+    "ALTER TABLE index_run_item ADD COLUMN hub_buy_qty INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN hub_fill_price REAL",
+    "ALTER TABLE index_run_item ADD COLUMN hub_fill_orders INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN structure_buy_qty INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN structure_fill_price REAL",
+    "ALTER TABLE index_run_item ADD COLUMN structure_fill_orders INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN unfilled_qty "
+    "INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE index_run_item ADD COLUMN unfilled_price REAL",
+    # Review 2026-09-05: the compressed buy the LP WANTED before the ladder
+    # shrank it to whole batches it held (the compressed shallow flag is
+    # wanted > recommended_buy_qty); the two freight-in rates a run was
+    # planned at, so the realized freight lines keep their vintage; the
+    # ladders' min_volume on databases created before the column.
+    "ALTER TABLE index_run_item ADD COLUMN compressed_wanted_qty INTEGER",
+    "ALTER TABLE index_run ADD COLUMN freight_in_isk_per_m3 REAL",
+    "ALTER TABLE index_run ADD COLUMN structure_freight_in_isk_per_m3 REAL",
+    "ALTER TABLE hub_sell_order ADD COLUMN min_volume "
+    "INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE structure_sell_order ADD COLUMN min_volume "
+    "INTEGER NOT NULL DEFAULT 1",
+    # Landed ISK the compressed pass saved vs buying every covered raw
+    # direct, at plan time (informational, the run page's strip badge).
+    "ALTER TABLE index_run ADD COLUMN compressed_saving_isk REAL",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -707,10 +806,110 @@ def _prune_backups(dest_dir, keep: int = 3) -> None:
             pass
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create state tables if missing and seed default rows. Idempotent."""
+# First-run profile (2026-09-05): what a NEW install starts with — the
+# author's working configuration, applied by ensure_schema exactly once,
+# to a database that has no settings row yet. An existing database is
+# never touched (a user's own settings survive every update: the column
+# DEFAULTs above stay the neutral engine baseline the tests run on, and
+# the profile is only ever layered onto a brand-new row). The app-path
+# callers (web, desktop preflight, the ESI CLI) pass it; tests build
+# neutral databases by leaving it out.
+FIRST_RUN_PROFILE = {
+    "settings": {
+        "stockpile_buffer": 0.01,
+        "max_run_duration_hours": 800.0,
+        "composite_reaction_extra_runs": 544,
+        "manufacturing_slots": 540,
+        "reaction_slots": 540,
+        "input_purchase_margin": 0.01,
+        "alchemy_enabled": 1,
+        "max_alchemy_jobs_per_type": 65,
+        "standing_broker_faction": 4.82,
+        "standing_broker_corp": 8.09,
+        "freight_in_isk_per_m3": 900.0,
+        "freight_out_isk_per_m3": 750.0,
+        "capital_broker_rate": 0.015,
+        "capital_movement_cost_isk": 25_000_000.0,
+        "capital_scc_surcharge": 0.005,
+        # v1.25: compressed sourcing on; the two yields stay at their
+        # schema defaults until the user asserts their own.
+        "compressed_minerals_enabled": 1,
+        "compressed_moon_enabled": 1,
+        "compressed_gas_enabled": 1,
+    },
+    # Every class builds in null-sec (-0.5) structures at index 0.14%:
+    # Sotiyo with T2 ME/TE rigs for every manufacturing class, Tatara
+    # with T2 rigs for reactions, the lab classes on the Sotiyo with a T2
+    # cost rig (the lab tier rides me_rig; te_rig is unused for labs).
+    "class_setting": {
+        "advanced_components": (config.STRUCTURE_TYPE_SOTIYO, "t2", "t2"),
+        "basic_capital_components": (config.STRUCTURE_TYPE_SOTIYO, "t2", "t2"),
+        "capital_ships": (config.STRUCTURE_TYPE_SOTIYO, "t2", "t2"),
+        "copying": (config.STRUCTURE_TYPE_SOTIYO, "t2", "none"),
+        "invention": (config.STRUCTURE_TYPE_SOTIYO, "t2", "none"),
+        "other": (config.STRUCTURE_TYPE_SOTIYO, "t2", "t2"),
+        "reactions": (config.STRUCTURE_TYPE_TATARA, "t2", "t2"),
+        "structures": (config.STRUCTURE_TYPE_SOTIYO, "t2", "t2"),
+        "t1_ships": (config.STRUCTURE_TYPE_SOTIYO, "t2", "t2"),
+        "t2_ships": (config.STRUCTURE_TYPE_SOTIYO, "t2", "t2"),
+    },
+    "class_security": -0.5,
+    "class_system_cost_index": 0.0014,
+    "blacklist_categories": ("tools",),
+}
+
+
+def _apply_first_run_profile(conn: sqlite3.Connection, profile: dict) -> None:
+    """Layer the first-run profile onto the freshly seeded rows. Only
+    ensure_schema calls this, and only on a database that had no
+    settings row before this call."""
+    columns = _columns(conn, "settings")
+    values = {k: v for k, v in profile["settings"].items() if k in columns}
+    if values:
+        conn.execute(
+            "UPDATE settings SET "
+            + ", ".join(f"{k} = ?" for k in values)
+            + " WHERE id = 1",
+            tuple(values.values()),
+        )
+    for cls, (structure, me_rig, te_rig) in profile["class_setting"].items():
+        conn.execute(
+            "UPDATE class_setting SET structure_type_id = ?, security = ?, "
+            "me_rig = ?, te_rig = ?, system_cost_index = ? "
+            "WHERE item_class = ?",
+            (
+                structure,
+                profile["class_security"],
+                me_rig,
+                te_rig,
+                profile["class_system_cost_index"],
+                cls,
+            ),
+        )
+    conn.executemany(
+        "INSERT OR IGNORE INTO blacklist_category VALUES (?)",
+        [(key,) for key in profile["blacklist_categories"]],
+    )
+
+
+def _has_settings_row(conn: sqlite3.Connection) -> bool:
+    exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'settings'"
+    ).fetchone()
+    if exists is None:
+        return False
+    return conn.execute("SELECT 1 FROM settings WHERE id = 1").fetchone() is not None
+
+
+def ensure_schema(conn: sqlite3.Connection, profile: dict | None = None) -> None:
+    """Create state tables if missing and seed default rows. Idempotent.
+    profile (FIRST_RUN_PROFILE): applied on top of the seeded defaults
+    when — and only when — the database had no settings row before this
+    call; an existing database keeps its own values on every update."""
     _check_schema_version(conn)
     _backup_before_migrating(conn)
+    fresh = profile is not None and not _has_settings_row(conn)
     conn.executescript(STATE_SCHEMA)
     conn.executescript(_SNAPSHOT_SCHEMA)
     _rebuild_class_setting_for_thukker(conn)
@@ -738,6 +937,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                 raise
     conn.execute("INSERT OR IGNORE INTO settings (id) VALUES (1)")
     _seed_class_settings(conn)
+    if fresh:
+        _apply_first_run_profile(conn, profile)
     _seed_structure_freight_rate(conn, settings_columns_before)
     _clear_legacy_client_secret(conn)
     conn.commit()
@@ -841,7 +1042,6 @@ def _seed_class_settings(conn: sqlite3.Connection) -> None:
 class Settings:
     stockpile_buffer: float  # fraction, 0.001-0.1
     max_run_duration_hours: float
-    ship_batch_multiple: int
     composite_reaction_extra_runs: int
     price_region_id: int
     price_source: str
@@ -895,6 +1095,31 @@ class Settings:
     # invented copies.
     t1_bpc_overbuild: float = 4.0
     t2_bpc_overbuild: float = 4.0
+    # v1.25 compressed sourcing: buy compressed ore / moon ore / gas and
+    # reprocess when cheaper landed than the raws (Jita ladder depth
+    # considered); two user-asserted PURE yields plus the reprocessing tax.
+    compressed_minerals_enabled: bool = False
+    compressed_moon_enabled: bool = False
+    compressed_gas_enabled: bool = False
+    compressed_ore_yield: float = 0.75
+    compressed_gas_yield: float = 0.60
+    compressed_reprocess_tax: float = 0.0  # fraction of output value
+
+    def compressed_groups(self) -> frozenset[int]:
+        """The raw groups compressed sourcing may cover — one toggle each
+        (2026-09-05): minerals, moon materials, gas."""
+        groups = set()
+        if self.compressed_minerals_enabled:
+            groups.add(config.COMPRESSED_MINERALS_GROUP)
+        if self.compressed_moon_enabled:
+            groups.add(config.COMPRESSED_MOON_GROUP)
+        if self.compressed_gas_enabled:
+            groups.add(config.COMPRESSED_GAS_SOURCE_GROUP)
+        return frozenset(groups)
+
+    @property
+    def compressed_sourcing_enabled(self) -> bool:
+        return bool(self.compressed_groups())
 
     def capital_structure(self) -> int:
         """The structure whose market prices capital-class hulls."""
@@ -941,6 +1166,9 @@ class Settings:
 # Buy venues (v1.10): where an input's price_snapshot came from.
 BUY_VENUE_HUB = "hub"
 BUY_VENUE_STRUCTURE = "structure"
+# v1.25 fill pricing: a buy split across both venues (per-venue units
+# on the index_run_item row).
+BUY_VENUE_SPLIT = "split"
 
 
 def get_settings(conn: sqlite3.Connection) -> Settings:
@@ -955,6 +1183,9 @@ def get_settings(conn: sqlite3.Connection) -> Settings:
         "alchemy_enabled",
         "count_fitted_stock",
         "structure_buy_enabled",
+        "compressed_minerals_enabled",
+        "compressed_moon_enabled",
+        "compressed_gas_enabled",
     ):
         kwargs[flag] = bool(kwargs[flag])
     return Settings(**kwargs)

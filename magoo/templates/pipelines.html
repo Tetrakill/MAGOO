@@ -14,13 +14,35 @@
 {% else %}
 <div class="panel">
   <form method="post">
-    <p class="muted" style="margin-top:0">Paste rows from a spreadsheet, one
-    pipeline per line:
-    <b>product · quantity per run · runs per BPC · ME · TE</b>.
-    You only need product and quantity — leave runs per BPC blank for
-    uncapped copies, and blank ME/TE means 0 for ships or your intermediate
-    defaults for everything else. Re-pasting a product updates it. Final products can be sub-capital and
-    capital ships, Upwell structures, and Standup rigs and modules.</p>
+    {# Paste help (2026-09-05): a lead, a column table and two notes replace
+       the one dense sentence — the invention shortcut leads because it is
+       what a first paste most often needs. #}
+    <p class="muted" style="margin-top:0">Paste one product per line, straight
+    from a spreadsheet — columns can be tab, comma or space separated.
+    <b>If the product will be invented, product and quantity are all you
+    need:</b> pick a decryptor on its row afterwards and runs per BPC, ME and
+    TE come from the invention choice.</p>
+    <table class="columns muted">
+      <thead><tr><th>Column</th><th>Meaning</th><th>If blank</th></tr></thead>
+      <tr><td><b>Product</b></td>
+          <td>the item name as in game (case doesn't matter)</td>
+          <td>required</td></tr>
+      <tr><td><b>Quantity per run</b></td>
+          <td>units of the product to build each index run</td>
+          <td>required</td></tr>
+      <tr><td><b>Runs per BPC</b></td>
+          <td>licensed runs on one copy of the product's blueprint — caps the
+              runs per job and sets the ship batch size</td>
+          <td>no cap (a BPO, or plenty of copies)</td></tr>
+      <tr><td><b>ME / TE</b></td>
+          <td>the product blueprint's research levels, 0–10 and 0–20</td>
+          <td>0 / 0 for ships; your intermediate defaults for everything
+              else</td></tr>
+    </table>
+    <p class="muted">Re-pasting a product updates it in place — with invention
+    on, only its quantity changes. Products can be sub-capital and capital
+    ships, Upwell structures, and Standup rigs and modules; anything else is
+    reported and skipped.</p>
     <textarea name="products" rows="6" style="width:100%"
       aria-label="Pipelines to add or update, one per row"
       placeholder="Ishtar&#9;40&#9;10&#9;4&#9;8&#10;Golem&#9;16&#9;10&#9;2&#9;4&#10;Astrahus&#9;1" required></textarea>
@@ -159,6 +181,16 @@
         {% else %}<span class="badge">inactive</span>{% endif %}</td>
     <td class="muted" title="{{ p.created_at }} UTC">{{ p.created_at[:10] }}</td>
     <td class="actions">
+      {# Invention comparison window (2026-09-05): every source ×
+         decryptor option costed end to end at today's prices, fetched
+         into the shared dialog on demand — the page GET stays light. #}
+      {% if inv and not inv.stale %}
+      <button type="button" class="mini"
+              data-url="{{ url_for('pipeline_compare', pipeline_id=p.pipeline_id) }}"
+              onclick="openCompare(this)"
+              title="compare every {{ 'relic tier and ' if inv.sources }}decryptor
+              option's margin per unit at today's prices">compare</button>
+      {% endif %}
       <form class="inline" method="post"
             action="{{ url_for('pipeline_toggle', pipeline_id=p.pipeline_id) }}">
         <button class="mini">{{ 'deactivate' if p.is_active else 'activate' }}</button>
@@ -185,6 +217,41 @@
 </details>
 {% elif sde_ready %}<p class="muted">No pipelines yet — paste your first
 above; product and quantity is enough.</p>{% endif %}
+{% if pipelines %}
+<dialog id="cmp" class="breakdown wide" aria-labelledby="cmp-title"></dialog>
+<script>
+// Invention comparison window: one shared dialog, its content fetched on
+// open — 9 to 27 full chain costings per pipeline are too heavy to inline
+// on every page load (the inline table was struck for that, 2026-08-31).
+// The fragment is our own server-rendered template; on open it is made
+// sortable and its ledger tooltips converted, like the breakdown dialogs.
+function openCompare(btn) {
+  const d = document.getElementById("cmp");
+  d.replaceChildren();
+  const head = document.createElement("div");
+  head.className = "dialog-head";
+  head.innerHTML = '<h2 id="cmp-title">Invention comparison</h2>'
+    + '<form method="dialog"><button class="mini">close</button></form>';
+  const note = document.createElement("p");
+  note.className = "muted";
+  note.style.margin = ".6rem 0 0";
+  note.textContent = "computing every option at today's prices…";
+  d.append(head, note);
+  d.showModal();
+  fetch(btn.dataset.url)
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
+    .then(html => {
+      if (!d.open) return;
+      d.innerHTML = html;
+      initSortable(d);
+      convertTips(d);
+    })
+    .catch(() => {
+      note.textContent = "comparison failed — reload the page and try again";
+    });
+}
+</script>
+{% endif %}
 <script>
 // Full-form submits (the invention selects, activate/delete, the paste)
 // come back via a redirect — a fresh navigation that lands at the top.

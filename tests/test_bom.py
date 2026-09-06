@@ -11,6 +11,17 @@ def hulk_bom(ref):
     return bom.expand(ref, ref.type_id("Hulk"), 1)
 
 
+def test_self_consuming_blueprint_keeps_its_own_depth(ref):
+    """Finding A9 (2026-09-05): the Silo's blueprint consumes a Silo, and
+    that self-edge raised the product's own depth to 1 — the quantity
+    still accumulates (one requested + one consumed), the depth stays 0."""
+    silo = 14343
+    items = bom.expand(ref, silo, 1)
+    assert items[silo].depth == 0
+    assert items[silo].quantity == 2
+    assert items[silo].buildable
+
+
 def test_final_product_at_depth_zero(ref, hulk_bom):
     hulk = hulk_bom[ref.type_id("Hulk")]
     assert hulk.depth == 0

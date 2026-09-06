@@ -300,6 +300,13 @@ h2 .muted { font-weight: 400; font-size: .9rem; }
 table.profit td, table.profit th { width: 1%; white-space: nowrap; }
 table.profit td.tagcol, table.profit th.tagcol { width: auto; padding-left: 1rem; }
 table.profit td.num, table.profit th.num { padding-left: 1.1rem; }
+/* paste help on the Pipelines page (2026-09-05): a compact, quiet column
+   legend inside the panel — no sticky header, no zebra, content-width */
+table.columns { width: auto; max-width: 100%; margin: .4rem 0 .6rem; font-size: .85rem; }
+table.columns th { position: static; background: transparent; }
+table.columns td { padding: .3rem .8rem .3rem 0; vertical-align: top; }
+table.columns tr:nth-child(even) td, table.columns tr:hover td { background: transparent; }
+table.columns td b { color: var(--text); font-weight: 600; }
 /* pipelines table: the same content-packing — the four small figure
    inputs shrink to their digits, the actions column absorbs the slack */
 table.pipelines td, table.pipelines th { width: 1%; white-space: nowrap; }
@@ -307,6 +314,8 @@ table.pipelines td.actions, table.pipelines th.actions { width: auto; }
 table.pipelines td.num input { width: 4rem; }
 table.pipelines td.num input.isk { width: 7rem; }
 table.pipelines td.actions form.inline + form.inline { margin-left: .3rem; }
+/* the compare button (invention window, 2026-09-05) leads the row's actions */
+table.pipelines td.actions > button.mini { margin-right: .3rem; }
 /* a multi-source final (relic tier + decryptor) stacks its two selects:
    side by side they would widen the Invention column for every row and
    push the table past the page */
@@ -358,6 +367,9 @@ table.classes td.num input { width: 6rem; }
 dialog.breakdown { background: var(--panel); color: var(--text);
   border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.2rem;
   max-width: min(64rem, 92vw); max-height: 85vh; overflow: auto; }
+/* the invention comparison (2026-09-05) carries twelve columns: wider than
+   a cost breakdown, still scrolling inside its tablewrap on narrow panes */
+dialog.breakdown.wide { max-width: min(84rem, 94vw); }
 dialog.breakdown::backdrop { background: rgba(0, 0, 0, .6); }
 dialog.breakdown th { position: static; }
 .dialog-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }

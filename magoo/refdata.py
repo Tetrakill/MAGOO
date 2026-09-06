@@ -6,6 +6,7 @@ reference data only changes on SDE reimport, so open a fresh Refdata after
 running sdeimport.
 """
 
+import math
 import sqlite3
 from dataclasses import dataclass
 
@@ -21,11 +22,50 @@ class TypeInfo:
     volume: float | None
     # Repackaged volume (ships shrink dramatically); None for most types.
     packaged_volume: float | None = None
+    # v1.25: units per reprocessing batch — typeMaterials quantities are
+    # per this many input units (ore / moon ore 100, gas and ice 1). 1 on
+    # a database imported before the column existed.
+    portion_size: int = 1
 
     @property
     def freight_volume(self) -> float:
         """m³ as hauled: packaged when the SDE gives one, else volume."""
         return self.packaged_volume or self.volume or 0.0
+
+
+@dataclass(frozen=True)
+class CompressedSource:
+    """One compressed sourcing candidate (v1.25): a compressed ore, moon
+    ore or gas whose reprocessing outputs include raws the plan buys.
+    `outputs` are the SDE base quantities per `portion_size` input units
+    (before the asserted yield); `kind` picks which yield applies —
+    "ore" (refinery, ore and moon ore alike) or "gas" (decompression)."""
+
+    compressed_id: int
+    kind: str
+    portion_size: int
+    outputs: tuple[tuple[int, int], ...]
+
+    def per_unit(self, material_id: int, yield_: float) -> float:
+        """Output units of one material per ONE input unit at the yield."""
+        for m, base in self.outputs:
+            if m == material_id:
+                return base / self.portion_size * yield_
+        return 0.0
+
+    def batch_output(self, batches: int, material_id: int, yield_: float) -> int:
+        """Whole output units from `batches` reprocessing batches:
+        batches × floor(base × yield). The floor is applied PER BATCH
+        (review ruling R3, 2026-09-05 — conservative: the game rounds each
+        batch's output down, so a fractional per-batch yield never
+        accumulates across batches; the previous floor(batches × base ×
+        yield) overstated the output by up to batches − 1 units). The
+        9-decimal round guards a binary-float base × yield that should be
+        exactly integral (e.g. 400 × 0.75)."""
+        for m, base in self.outputs:
+            if m == material_id:
+                return batches * math.floor(round(base * yield_, 9))
+        return 0
 
 
 @dataclass(frozen=True)
@@ -93,6 +133,7 @@ class Refdata:
         self._is_relic: dict[int, bool] = {}
         self._max_runs: dict[int, int] = {}
         self._invention_products: set[int] | None = None
+        self._compressed_sources: dict[int, CompressedSource] | None = None
 
     def close(self) -> None:
         self.conn.close()
@@ -128,6 +169,12 @@ class Refdata:
                 row["category_id"],
                 row["volume"],
                 row["packaged_volume"],
+                # Pre-v1.25 import: no column yet — one unit per batch.
+                (
+                    max(1, int(row["portion_size"] or 1))
+                    if "portion_size" in row.keys()
+                    else 1
+                ),
             )
             self._types[type_id] = info
         return info
@@ -436,6 +483,78 @@ class Refdata:
                 )
             self._alchemy_routes = routes
         return self._alchemy_routes
+
+    # -- compressed sourcing (v1.25) -------------------------------------
+
+    def compressed_sources(self) -> dict[int, CompressedSource]:
+        """compressed type_id -> CompressedSource for every compression
+        target (ref_compressible) that is published, is a compressed ore /
+        moon ore (Asteroid category) or a compressed gas, and has fixed
+        reprocessing outputs. Data-derived like alchemy routes: no
+        hardcoded pairs. Empty on a database imported before v1.25 (no
+        ref_compressible table / portion_size column) — the feature is
+        inert until the game data is downloaded again."""
+        if self._compressed_sources is None:
+            sources: dict[int, CompressedSource] = {}
+            try:
+                rows = self.conn.execute(
+                    # DISTINCT (review 2026-09-05): several raws can map
+                    # to ONE compressed type in compressibleTypes, and
+                    # the join would repeat that type's outputs once per
+                    # raw — doubling its per-batch yield in the LP.
+                    "SELECT DISTINCT t.type_id, t.group_id, t.category_id, "
+                    "t.portion_size, m.material_id, m.quantity "
+                    "FROM ref_compressible c "
+                    "JOIN ref_type t ON t.type_id = c.compressed_type_id "
+                    "JOIN ref_type_material m ON m.type_id = t.type_id "
+                    "WHERE t.published = 1 "
+                    "ORDER BY t.type_id, m.material_id"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            outputs: dict[int, list] = {}
+            meta: dict[int, tuple[str, int]] = {}
+            for row in rows:
+                if row["group_id"] == config.COMPRESSED_GAS_GROUP:
+                    kind = "gas"
+                elif row["category_id"] == config.CATEGORY_ASTEROID:
+                    kind = "ore"
+                else:
+                    continue
+                meta[row["type_id"]] = (kind, max(1, int(row["portion_size"] or 1)))
+                outputs.setdefault(row["type_id"], []).append(
+                    (row["material_id"], row["quantity"])
+                )
+            for type_id, (kind, portion) in meta.items():
+                sources[type_id] = CompressedSource(
+                    compressed_id=type_id,
+                    kind=kind,
+                    portion_size=portion,
+                    outputs=tuple(outputs[type_id]),
+                )
+            self._compressed_sources = sources
+        return self._compressed_sources
+
+    def compressed_sources_for(
+        self, raw_ids, groups=None
+    ) -> dict[int, CompressedSource]:
+        """The candidates that yield at least one of `raw_ids` — restricted
+        to `groups` (default: every raw group compressed sourcing covers,
+        config.COMPRESSED_SOURCE_GROUPS: minerals, moon materials, gas;
+        never ice products). The Settings toggles pass the enabled
+        subset (Settings.compressed_groups)."""
+        if groups is None:
+            groups = config.COMPRESSED_SOURCE_GROUPS
+        wanted = {
+            t for t in raw_ids if self.type_info(t).group_id in groups
+        }
+        if not wanted:
+            return {}
+        return {
+            type_id: source
+            for type_id, source in self.compressed_sources().items()
+            if any(m in wanted for m, _qty in source.outputs)
+        }
 
     # -- dogma attributes ------------------------------------------------
 

@@ -160,8 +160,14 @@ def _assert_all_stages_covered_and_converged(conn, ref, plan):
     finals = {
         p["final_product_type_id"] for p in store.active_pipelines(conn)
     }
+    shares = engine._steady_shares(conn, ref, plan.items)
     for item in plan.items.values():
         if not item.buildable or item.type_id in finals:
+            continue
+        if item.alchemy_for_type_id is None and draw.get(item.type_id, 0) == 0:
+            # Ruling R7 (2026-09-05): a stage nobody draws on this cycle
+            # is neither stocked nor built — no cycle to end covered.
+            assert item.recommended_build_qty == item.recommended_buy_qty == 0
             continue
         projected = (
             item.on_hand_qty
@@ -171,7 +177,15 @@ def _assert_all_stages_covered_and_converged(conn, ref, plan):
             + item.alchemy_output_qty
             - draw.get(item.type_id, 0)
         )
-        assert projected >= item.merged_min_qty, item.name
+        # The stage ends the cycle back at its target; that target is one
+        # steady cycle's consumption only for the consumers holding jobs
+        # (ruling R7), so the full-cycle bound applies when all of them do.
+        assert projected >= item.target_stock_qty, item.name
+        if all(
+            plan.items[c].runs_allocated > 0
+            for c in shares.get(item.type_id, {})
+        ):
+            assert projected >= item.merged_min_qty, item.name
         if item.alchemy_for_type_id is None:
             assert item.deficit_qty == max(
                 0,
@@ -554,11 +568,11 @@ def test_persistence_roundtrip(conn, ref):
 
 
 def test_capitals_build_exact_quantities(conn, ref):
-    """Capitals never round up to the ship batch multiple."""
+    """Capitals never round up to whole blueprint copies."""
     add_pipeline(conn, ref, "Revelation", 3)
     plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
     rev = plan.items[ref.type_id("Revelation")]
-    # exact final count (no buffer), NOT rounded up to 8
+    # exact final count (no buffer), never batch-rounded
     assert rev.total_runs_needed == 3
 
 
@@ -580,11 +594,14 @@ def test_bpc_runs_cap_slots_and_rounding(conn, ref):
     assert ishtar.recommended_build_qty == 50
 
 
-def test_bpc_cap_none_keeps_global_batching(conn, ref):
+def test_bpc_cap_none_builds_the_exact_quantity(conn, ref):
+    """No runs-per-BPC: a sub-capital ship builds exactly what was asked
+    (the global ship batch multiple was removed 2026-09-05 — every
+    invention pipeline overrode it and a BPO has no copy to fill)."""
     add_pipeline(conn, ref, "Ishtar", 45)  # no BPC cap
     plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
     ishtar = plan.items[ref.type_id("Ishtar")]
-    assert ishtar.total_runs_needed == 48  # exact 45 -> ceil(45/8)*8
+    assert ishtar.total_runs_needed == 45
 
 
 def test_manufacturing_jobs_capped_at_30_days_modified_time(conn, ref):
@@ -593,8 +610,12 @@ def test_manufacturing_jobs_capped_at_30_days_modified_time(conn, ref):
     is a copy-runs concept and does NOT cap manufacturing). Capital
     Propulsion Engine at NPC defaults: 16,000s x 0.80 (TE20) x 0.68
     (skills) = 8,704 s/run -> ceil(2,592,000 / 8,704) = 298 runs in a
-    window larger than 30 days (last-run overhang). Reaction formulas keep their own verified
-    cap arm (Meta-Operant Neurolink Enhancer: 100 < the flat 544)."""
+    window larger than 30 days (last-run overhang). Reaction formulas
+    size by the same rule alone: the SDE's maxProductionLimit on a
+    formula (Meta-Operant Neurolink Enhancer: 100) is NOT a client
+    ceiling (user-verified 2026-09-05, ruling R2) — at 10,800s x 0.80
+    (Reactions V) = 8,640 s/run the job takes ceil(2,592,000 / 8,640) =
+    300 runs."""
     conn.execute("UPDATE settings SET max_run_duration_hours = 2000")
     conn.commit()
     add_pipeline(conn, ref, "Revelation", 3)
@@ -605,7 +626,8 @@ def test_manufacturing_jobs_capped_at_30_days_modified_time(conn, ref):
     # 298th still installs (last-run overhang)
     assert engine_part.max_runs_per_job == 298
     enhancer = plan.items[ref.type_id("Meta-Operant Neurolink Enhancer")]
-    assert enhancer.max_runs_per_job == 100
+    assert ref.blueprint_for_product(enhancer.type_id).max_runs == 100
+    assert enhancer.max_runs_per_job == 300
 
 
 def test_all_jobs_of_an_item_run_uniform_counts(conn, ref):
@@ -657,7 +679,9 @@ def test_reaction_jobs_capped_at_30_days_modified_time(conn, ref):
     30-days-of-modified-time ceiling with the last-run overhang
     (user-verified 2026-08-21): at NPC test defaults a 10,800s formula runs
     8,640s/run with Reactions V -> ceil(2,592,000 / 8,640) = 300 runs.
-    The formula's own maxProductionLimit still applies where lower."""
+    The formula's own maxProductionLimit never caps (ruling R2,
+    2026-09-05): every 10,800s formula sizes to 300 whatever its SDE
+    figure says."""
     conn.execute("UPDATE settings SET max_run_duration_hours = 2000")
     conn.commit()
     add_pipeline(conn, ref, "Hulk", 8)
@@ -671,11 +695,39 @@ def test_reaction_jobs_capped_at_30_days_modified_time(conn, ref):
     for item in reactions:
         blueprint = ref.blueprint_for_product(item.type_id)
         if blueprint.base_time == 10_800:
-            assert item.max_runs_per_job == min(
-                300, blueprint.max_runs or 300
-            )
-        if blueprint.max_runs:
-            assert item.max_runs_per_job <= blueprint.max_runs
+            assert item.max_runs_per_job == 300
+
+
+def test_reaction_max_production_limit_never_caps_runs(ref):
+    """Ruling R2 (2026-09-05): the client accepts more runs than a
+    formula's maxProductionLimit, so the run cap is the 30-day rule
+    alone. The group-4096 formulas (max_runs 100 in the SDE) size like
+    every other reaction: 8,640 s/run -> 300."""
+    blueprint = ref.blueprint_for_product(
+        ref.type_id("Meta-Operant Neurolink Enhancer")
+    )
+    assert ref.type_info(blueprint.product_id).group_id == 4096
+    assert blueprint.max_runs == 100  # the SDE still carries the figure
+    assert engine._game_job_run_cap(8_640.0) == 300
+
+
+def test_run_caps_survive_float_noise_in_the_quotient(conn, ref):
+    """Finding A5 (2026-09-05): 30d / tpr and window / tpr land an ulp
+    off an exact integer for many run times (2,592,000 / (2,592,000 / 7)
+    is 7.000000000000001), and a raw ceil planned an eighth run the
+    client would refuse — a raw floor likewise dropped a whole run from
+    the window: a 98.192 h window is exactly three Hulk runs (117,830.4 s
+    each), but the quotient is 2.9999999999999996."""
+    assert config.MAX_JOB_SECONDS / (config.MAX_JOB_SECONDS / 7) > 7
+    assert engine._game_job_run_cap(config.MAX_JOB_SECONDS / 7) == 7
+    conn.execute("UPDATE settings SET max_run_duration_hours = 98.192")
+    conn.commit()
+    add_pipeline(conn, ref, "Hulk", 8)
+    plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    hulk = plan.items[ref.type_id("Hulk")]
+    assert hulk.time_per_run == pytest.approx(117_830.4)
+    assert 98.192 * 3600.0 / hulk.time_per_run < 3
+    assert hulk.max_runs_per_job == 3
 
 
 # --- Production blacklist --------------------------------------------------
@@ -981,3 +1033,206 @@ def test_buffered_target_guards_float_noise(conn, ref):
     }
     engine._apply_targets(conn, ref, merged, rich_snapshot(ref))
     assert merged[trit].target_stock_qty == 110
+
+
+# --- Review 2026-09-05 regressions --------------------------------------------
+
+
+def test_zero_draw_intermediates_are_neither_bought_nor_built(conn, ref):
+    """Finding A3 / ruling R7 (2026-09-05): an intermediate's target
+    follows the REALIZED draw, so a buildable stage whose consumers all
+    flipped to buy — every direct Hulk input undercut by the market —
+    draws nothing and gets no purchase and no jobs (no BOM-target floor).
+    Finding A7: the loop's reset also clears its sizing figures, so the
+    persisted row cannot claim a job that was never planned."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    hulk = ref.type_id("Hulk")
+    baseline = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    inputs = [
+        i.type_id
+        for i in baseline.items.values()
+        if i.buildable and i.depth == 1 and i.type_id != hulk
+    ]
+    assert inputs
+    deep = [
+        i.type_id
+        for i in baseline.items.values()
+        if i.buildable and i.depth >= 2 and i.jobs_allocated > 0
+    ]
+    assert deep  # the baseline really did build the deeper stages
+    plan = engine.plan_index_run(
+        conn, ref, rich_snapshot(ref, overrides={t: 1.0 for t in inputs}),
+        persist=False,
+    )
+    draw = engine._planned_consumption(conn, ref, plan.items)
+    for type_id in inputs:
+        item = plan.items[type_id]
+        assert item.recommended_action == "buy" and item.jobs_allocated == 0
+    for type_id in deep:
+        item = plan.items[type_id]
+        assert draw.get(type_id, 0) == 0
+        assert item.target_stock_qty == 0
+        assert item.deficit_qty == 0
+        assert item.recommended_buy_qty == 0
+        assert item.recommended_build_qty == 0
+        assert item.recommended_action is None
+        assert item.total_runs_needed == 0
+        assert item.jobs_needed_unconstrained == 0
+        assert item.max_runs_per_job == 0
+        assert item.time_per_run is None
+    # Raw inputs of the abandoned stages are not bought either.
+    for item in plan.items.values():
+        if not item.buildable and draw.get(item.type_id, 0) == 0:
+            assert item.recommended_buy_qty == 0, item.name
+    _assert_all_stages_covered_and_converged(conn, ref, plan)
+
+
+def test_composite_extra_runs_only_for_composites_holding_jobs(conn, ref):
+    """The composite extra-runs adder follows the jobs: with every
+    composite reaction's consumers undercut (no reaction holds a job)
+    the moon-material inputs carry no adder — and none are bought."""
+    conn.execute("UPDATE settings SET composite_reaction_extra_runs = 2")
+    conn.commit()
+    add_pipeline(conn, ref, "Hulk", 8)
+    hulk = ref.type_id("Hulk")
+    baseline = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    composites = [
+        i for i in baseline.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+        and ref.type_info(i.type_id).group_id in config.COMPOSITE_REACTION_GROUPS
+        and i.jobs_allocated > 0
+    ]
+    assert composites
+    for composite in composites:
+        for material_id, _qty in ref.materials(
+            composite.blueprint_id, composite.activity_id
+        ):
+            assert baseline.items[material_id].target_stock_qty > 0
+    inputs = [
+        i.type_id for i in baseline.items.values()
+        if i.buildable and i.depth == 1 and i.type_id != hulk
+    ]
+    plan = engine.plan_index_run(
+        conn, ref, rich_snapshot(ref, overrides={t: 1.0 for t in inputs}),
+        persist=False,
+    )
+    for composite in composites:
+        assert plan.items[composite.type_id].runs_allocated == 0
+        for material_id, _qty in ref.materials(
+            composite.blueprint_id, composite.activity_id
+        ):
+            material = plan.items[material_id]
+            assert material.target_stock_qty == 0, material.name
+            assert material.recommended_buy_qty == 0, material.name
+
+
+def test_unpriced_invention_inputs_reach_the_savings_badge(conn, ref):
+    """Finding A4 (2026-09-05): a datacore with no price on record is
+    costed at zero inside the invention adder; that omission must reach
+    the final's savings_unpriced_inputs badge like an unpriced raw leaf."""
+    zealot = ref.type_id("Zealot")
+    pid = conn.execute(
+        "INSERT INTO pipeline (name, final_product_type_id, "
+        "output_qty_per_run, runs_per_bpc) VALUES ('Zealot', ?, 2, 1)",
+        (zealot,),
+    ).lastrowid
+    conn.commit()
+    source = ref.invention_source_for_product(zealot)
+    engine.materialize_invention(conn, ref, pid, source, None, None)
+    datacore = next(
+        m for m, _q in ref.materials(source.t1_blueprint_id, config.ACTIVITY_INVENTION)
+    )
+    priced = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    assert priced.items[zealot].savings_unpriced_inputs == 0
+    plan = engine.plan_index_run(
+        conn, ref, rich_snapshot(ref, overrides={datacore: None}), persist=False
+    )
+    final = plan.items[zealot]
+    assert final.build_savings_per_unit is not None
+    assert final.savings_unpriced_inputs >= 1
+
+
+def test_whole_copies_round_even_when_the_window_binds(conn, ref):
+    """Finding A8 (2026-09-05, coordinator ruling): the whole-copy batch
+    rounding stands whatever the window. At a 100 h window a Hulk job fits
+    3 runs, so 5 requested hulls on an 8-run copy build 8 across three
+    jobs of at most 3 runs — each job on its own copy, whose unused runs
+    carry to the next cycle. A copy larger than the 30-day rule (30 runs)
+    still rounds the total to the whole copy; only the per-job runs are
+    capped."""
+    conn.execute("UPDATE settings SET max_run_duration_hours = 100")
+    conn.commit()
+    add_pipeline(conn, ref, "Hulk", 5, runs_per_bpc=8)
+    plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    hulk = plan.items[ref.type_id("Hulk")]
+    assert hulk.max_runs_per_job == 3  # the window binds the job
+    assert hulk.total_runs_needed == 8  # the copy binds the batch
+    assert hulk.jobs_needed_unconstrained == 3
+    assert hulk.recommended_build_qty == 8
+    conn.execute("UPDATE pipeline SET runs_per_bpc = 30")
+    conn.commit()
+    plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    hulk = plan.items[ref.type_id("Hulk")]
+    assert engine._game_job_run_cap(hulk.time_per_run) < 30
+    assert hulk.max_runs_per_job == 3
+    assert hulk.total_runs_needed == 30
+    assert hulk.recommended_build_qty == 30
+
+
+def test_zero_draw_stage_is_not_low_stock_when_primed(conn, ref):
+    """Finding A3 residual (2026-09-05): once a pipeline is primed the
+    low-stock projection must judge a stage against its prorated target —
+    a stage no consumer builds for this cycle (target 0) is not low."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    hulk = ref.type_id("Hulk")
+    first = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=True)
+    conn.execute(
+        "UPDATE index_run SET status = 'complete', "
+        "completed_at = datetime('now') WHERE index_run_id = ?",
+        (first.index_run_id,),
+    )
+    conn.commit()
+    inputs = [
+        i.type_id
+        for i in first.items.values()
+        if i.buildable and i.depth == 1 and i.type_id != hulk
+    ]
+    deep = [
+        i.type_id
+        for i in first.items.values()
+        if i.buildable and i.depth >= 2 and i.jobs_allocated > 0
+    ]
+    plan = engine.plan_index_run(
+        conn, ref, rich_snapshot(ref, overrides={t: 1.0 for t in inputs}),
+        persist=False,
+    )
+    for type_id in deep:
+        item = plan.items[type_id]
+        assert item.target_stock_qty == 0
+        assert not item.low_stock, item.name
+
+
+def test_raw_target_guards_float_noise(conn, ref, monkeypatch):
+    """Phase 7's raw target, consumption × (1 + margin), met the same
+    binary-float noise as the buffered target: 100 × 1.1 is
+    110.00000000000001 and a raw ceil bought 111 (review 2026-09-05)."""
+    conn.execute("UPDATE settings SET input_purchase_margin = 0.10")
+    conn.commit()
+    add_pipeline(conn, ref, "Hulk", 8)
+    trit = ref.type_id("Tritanium")
+    assert 100 * 1.1 > 110  # the noise this guards against
+    monkeypatch.setattr(
+        engine, "_planned_consumption", lambda *a, **k: {trit: 100}
+    )
+    plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    assert plan.items[trit].target_stock_qty == 110
+    assert plan.items[trit].recommended_buy_qty == 110
+
+
+def test_snapshot_from_state_carries_hub_prices(conn):
+    """Contract C5 (2026-09-05): the cached Jita quotes ride the Snapshot
+    beside the chosen-venue prices."""
+    store.save_esi_snapshot(conn, {}, {}, {}, 0.0, 0.0)
+    snap = engine.snapshot_from_state(conn, prices={34: 8.0}, hub_prices={34: 10.0})
+    assert snap.hub_prices == {34: 10.0}
+    assert engine.snapshot_from_state(conn).hub_prices == {}

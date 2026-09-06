@@ -858,8 +858,11 @@ def test_web_invention_lifecycle(seeded_client, ref):
 
     page = seeded_client.get("/pipelines").get_data(as_text=True)
     assert "Accelerant Decryptor" in page  # the select renders
-    # The nine-option comparison was removed 2026-08-31 (user request).
-    assert "Compare decryptors" not in page
+    # The nine-option comparison was removed from the page 2026-08-31
+    # (user request); since 2026-09-05 it lives in the on-demand compare
+    # window (test_invention_compare) — never inlined.
+    assert 'class="sortable profit compare"' not in page
+    assert f'data-url="/pipelines/{pid}/compare"' in page
 
     # Enable with the Accelerant: runs 2, ME 4 / TE 14 materialized.
     accelerant = decryptor_named(ref, "Accelerant Decryptor")
@@ -1090,3 +1093,37 @@ def test_web_settings_saves_encryption_level(seeded_client):
     c = _state()
     assert store.get_settings(c).skill_encryption == 3
     c.close()
+
+
+def test_invention_chance_ignores_production_gate_skills(conn, ref):
+    """Review 2026-09-05 (P0): an activity-8 skill outside the Science
+    group gates the job but contributes no /30 term. Verified live SDE:
+    bp 37020 (Standup Ballistic Control System I) requires Outpost
+    Construction (group 268, Production) + Mechanical and Electronic
+    Engineering + Caldari Encryption Methods; bp 3617 (Capital Remote
+    Shield Booster I) likewise carries Capital Ship Construction. The
+    gate skill used to be summed as a third science."""
+    settings = store.get_settings(conn)  # every level V
+    source = ref.invention_source_for_product(
+        ref.type_id("Standup Ballistic Control System II")
+    )
+    assert source is not None and source.t1_blueprint_id == 37020
+    groups = {
+        ref.type_info(skill).group_id
+        for skill, _level in ref.blueprint_skills(37020, config.ACTIVITY_INVENTION)
+    }
+    assert groups == {config.SKILL_GROUP_SCIENCE, 268}
+    expected = source.probability * (1 + (5 + 5) / 30 + 5 / 40)
+    assert costing.invention_chance(ref, settings, source, None) == pytest.approx(expected)
+    # The gate skill's level is irrelevant to the chance.
+    conn.execute("UPDATE settings SET skill_outpost_construction = 0")
+    conn.commit()
+    assert costing.invention_chance(
+        ref, store.get_settings(conn), source, None
+    ) == pytest.approx(expected)
+    # The sciences still count: Science at 0 removes both /30 terms.
+    conn.execute("UPDATE settings SET skill_science = 0")
+    conn.commit()
+    assert costing.invention_chance(
+        ref, store.get_settings(conn), source, None
+    ) == pytest.approx(source.probability * (1 + 5 / 40))

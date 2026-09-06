@@ -107,3 +107,57 @@ def test_inline_edits_refused_while_invention_on(seeded_client, ref):
     assert row["runs_per_bpc"] == materialized
     assert row["manual_runs_per_bpc"] == 5  # the stash survives untouched
     c.close()
+
+
+def test_paste_help_explains_the_columns(seeded_client, ref):
+    """The paste help (2026-09-05): a column legend and the invention
+    shortcut replace the old one-sentence description."""
+    page = seeded_client.get("/pipelines").get_data(as_text=True)
+    assert "product and quantity are all you\n    need" in page
+    for heading in ("<th>Column</th>", "<th>Meaning</th>", "<th>If blank</th>"):
+        assert heading in page
+    for column in ("Product", "Quantity per run", "Runs per BPC", "ME / TE"):
+        assert f"<b>{column}</b>" in page
+    assert "no cap (a BPO, or plenty of copies)" in page
+    assert "only its quantity changes" in page
+
+
+# --- paste parser: blank interior columns (review 2026-09-05) ----------------
+
+
+def _pasted(client, c, ref, products):
+    """POST one pasted sheet and return the Ishtar pipeline's
+    (runs_per_bpc, me_level, te_level) — the row plus its blueprint pin."""
+    resp = client.post("/pipelines", data={"products": products})
+    assert resp.status_code == 302, resp.status_code
+    row = _pipeline(c, "Ishtar")
+    assert row is not None, "the paste did not add the Ishtar pipeline"
+    blueprint = ref.blueprint_for_product(ref.type_id("Ishtar"))
+    pin = _pin(c, blueprint.blueprint_id)
+    return row["runs_per_bpc"], pin["me_level"], pin["te_level"]
+
+
+def test_paste_blank_interior_column_is_an_omitted_value(seeded_client, ref):
+    """An Excel row with an EMPTY runs/BPC cell pastes as
+    "Ishtar\t40\t\t4\t8". The parser used to drop every empty field, so
+    ME 4 slid into runs/BPC and TE 8 into ME (and TE fell back to the ship
+    default). Interior blanks are omitted columns; only trailing blanks are
+    dropped."""
+    c = _state()
+    assert _pasted(seeded_client, c, ref, "Ishtar\t40\t\t4\t8") == (None, 4, 8)
+    # the comma form behaves identically
+    assert _pasted(seeded_client, c, ref, "Ishtar,40,,4,8") == (None, 4, 8)
+    # a trailing blank (Excel appends one for an empty last column) is
+    # still just an omitted column: ME/TE fall back to the ship default 0/0
+    assert _pasted(seeded_client, c, ref, "Ishtar\t40\t10\t\t") == (10, 0, 0)
+    # the short forms are unchanged
+    assert _pasted(seeded_client, c, ref, "Ishtar\t40\t10") == (10, 0, 0)
+    assert _pasted(seeded_client, c, ref, "Ishtar 40 10 3 6") == (10, 3, 6)
+    # a blank QUANTITY is still a parse error, not a silent shift
+    resp = seeded_client.post(
+        "/pipelines", data={"products": "Ishtar\t\t10\t4\t8"},
+        follow_redirects=True,
+    )
+    assert "can&#39;t parse" in resp.get_data(as_text=True) or \
+        "can't parse" in resp.get_data(as_text=True)
+    c.close()

@@ -226,6 +226,13 @@ def expand(
             )
             child = items[material_id]
             child.quantity += required
+            if material_id == type_id:
+                # A self-consuming blueprint (legacy starbase structures
+                # such as the Silo) is its own input: the demand still
+                # accumulates, but it cannot sit one tier below itself —
+                # raising its depth here put the final product at depth 1
+                # (review 2026-09-05, finding A9).
+                continue
             child.depth = max(child.depth, item.depth + 1)
 
     # Nodes discovered under a branch that ended up raw (blacklist, cycle)
