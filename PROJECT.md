@@ -3,21 +3,26 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.24 built and live (engine, MILP allocation, sizing feedback
+Status: v1.25 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
-landed-price savings, Planning tab (today's-prices Profit + steady-state
-Slot Planner), ESI tab with per-corp/-character count toggles, runs
-lifecycle with superseded/discard, per-item deficit ledger, first-run
-onboarding with a crash-free fresh install and a one-click game-data
-download with live progress, full web UI restyled, accessibility- and
-audit-hardened; packaged as a Windows desktop application — portable
-zip (the only published artifact since v1.24; the installer is still
-buildable), native WebView2 window, shared-client-id PKCE login in the
-user's own browser, versioned schema with pre-migration backups, portable
-zip self-heals the Mark of the Web on first launch)
-Last updated: 2026-09-03
+landed-price savings, fill pricing for every buy walked over both sell
+ladders with venue splitting, compressed ore / moon material / gas
+sourcing with market depth, T2/T3 invention with a per-pipeline
+decryptor / relic-tier comparison, Planning tab (today's-prices Profit +
+steady-state Slot Planner), ESI tab with per-corp/-character count
+toggles, runs lifecycle with superseded/discard, per-item deficit
+ledger, first-run onboarding with a crash-free fresh install, seeded
+default settings and a one-click game-data download with live progress
+that re-imports itself after an update, full web UI restyled,
+accessibility- and audit-hardened; packaged as a Windows desktop
+application — portable zip (the only published artifact since v1.24;
+the installer is still buildable), native WebView2 window,
+shared-client-id PKCE login in the user's own browser, versioned schema
+with pre-migration backups, portable zip self-heals the Mark of the Web
+on first launch)
+Last updated: 2026-09-06
 
 ---
 
@@ -308,7 +313,15 @@ Documented at `developers.eveonline.com/docs/services/static-data/`:
 1. Fetch `https://developers.eveonline.com/static-data/tranquility/latest.jsonl`.
    The record keyed `"sde"` holds the current build number; the `"_meta"` record
    carries `lastBuildNumber` for change detection.
-2. Compare against the stored build number. If unchanged, skip.
+2. Compare against the stored build number. If unchanged, skip — unless
+   the imported build's tables predate this version's reference schema
+   (`sdeimport.ref_schema_outdated`: any `REF_SCHEMA` table or column
+   missing, e.g. a v1.24 import has no `ref_compressible` /
+   `portion_size`), in which case the same build is imported again —
+   from the cached archive when there is one. The web app starts that
+   re-import itself on its first request after an update and the
+   dashboard's Check for updates does the same, so a feature that
+   reads new reference data is never silently inert (v1.25).
 3. Download
    `https://developers.eveonline.com/static-data/tranquility/eve-online-static-data-<build>-jsonl.zip`
    (shorthand `.../static-data/eve-online-static-data-latest-jsonl.zip` redirects
@@ -1501,7 +1514,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 531 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, SDE import atomicity, schema/settings integrity) |
+| Test suite | 539 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, SDE import atomicity, schema/settings integrity) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -2501,7 +2514,7 @@ had planned 17 attempts); one `costing.resolve_invention` rule makes a
 vanished decryptor STALE everywhere instead of silently "no decryptor";
 materialised runs/ME/TE are re-derived after every SDE import; copy jobs
 on T2/T3 blueprint originals are no longer read as invention attempts.
-Schema 5 drops the never-read `copies_needed`/`attempts` vintage columns; schema 6 (2026-09-05) drops `settings.ship_batch_multiple`; schema 7 (v1.25) adds the compressed sourcing, fill pricing and review columns (`hub_sell_order`, the per-venue fill columns, `compressed_wanted_qty`, the per-run freight rates, ladder `min_volume`).
+Schema 5 drops the never-read `copies_needed`/`attempts` vintage columns.
 Tests 356 → 437.
 
 ### v1.24 (2026-09-03): portable zip opens its own window — commit 3737cb8
@@ -2527,6 +2540,131 @@ archives sit beside the real assets on the release page. **Decision
 (user, 2026-09-03): releases ship ONLY the portable zip from now on** —
 the installer is still buildable but is not uploaded. Code signing
 remains the durable fix for the reputation warnings. Tests 437 → 439.
+
+### v1.25 (2026-09-06): compressed sourcing, fill pricing for every buy, review fixes — commits d1fbc90, 71d50ff
+
+Every bought input is now priced by walking its stored sell ladders
+instead of a single best quote. The price refresh persists the 300
+cheapest Jita 4-4 sell orders per market input (`hub_sell_order`, beside
+the structure book v1.10 already stored), reports how many inputs got a
+ladder, and refetches a quote whose ladder is missing regardless of
+cache age; a new sourcing pass (Phase 7.5) fills each buy
+cheapest-landed-first across the merged Jita + C-J6 rungs, honouring
+each order's minimum volume. A buy that outruns one venue's book splits
+across both (`buy_venue = split`; per-venue quantity, blended fill price
+and order count persisted; a Multibuy block per venue; the split freight
+in the Profit view, whose null-sec share values a split line's structure
+part at its structure fill price), and `price_snapshot` becomes the
+blended average, so hub × fill + structure × fill (+ unsourced × last
+rung) = qty × price. A remainder beyond both stored books is UNSOURCED —
+no venue, no Multibuy line, a badge with the unfilled count and the last
+rung walked — unless the Jita ladder was cut at its 300 rungs, when the
+remainder folds into the Jita quantity at the last rung walked (user
+ruling). The Buy list's unit price is the average over the orders
+walked, with the per-venue fill ledger in its tooltip. The single
+best-price quote still drives the MILP objective, the alchemy
+comparison, the Planning tab and the Invention tab, by design; the
+2026-08-22 "structure depth rule" and "no order splitting" rules are
+struck.
+
+Raw minerals, moon materials and gas can be sourced from their
+compressed forms. The SDE import gained `ref_compressible`
+(`compressibleTypes`, an optional member so older dumps still import)
+and `ref_type.portion_size`; `Refdata.compressed_sources()` derives
+every published compressed ore, moon ore and gas with fixed reprocessing
+outputs (empty on a pre-v1.25 game-data build — the re-import below
+fills it). Settings gained a Compressed Sourcing panel: one toggle per
+group (Minerals, Moon Materials, Gas), asserted pure yields for ore and
+gas (the user's refinery decides), and an explicit reprocessing tax
+taken from every output's value. The pass runs a sparse HiGHS LP per
+plan over the direct rungs of every demanded raw of the three groups
+plus the candidates' own rungs — a candidate qualifies by yielding a
+demanded raw of an ENABLED group, and all its outputs then displace
+direct purchases, other groups included — rounds to whole batches
+(reprocessing floors per batch, user ruling), credits no surplus,
+ignores hangar stock of compressed items, and badges a compressed buy
+shallow when the LP wanted more than the ladder held. Compressed
+purchases are landed like any other buy, a compressed row keeps one
+venue (the one holding the larger share, re-filled there) and one
+Multibuy line, and an LP solver failure logs a warning and leaves the
+direct buys in place. The Buy list, Chain tab, Profit cards and Multibuy
+show the compressed share; the Plan tab gained a Compressed sourcing
+section with the landed saving and an after-buying reprocess checklist
+(quantity, expected outputs, leftovers); realized costing prices a
+compressed-covered raw at its blended `effective_unit_cost`. A candidate
+competes only once a price refresh has stored its ladder — after an
+upgrade, refresh prices before the first plan.
+
+Elsewhere: each invention-capable Pipelines row has a compare button
+opening a decryptor / relic-tier vs profit table; the paste help is a
+column table with the note that only product and quantity are needed
+when a decryptor will be used; interior blank paste columns stay omitted
+instead of shifting ME/TE; the Ship Batch Multiple setting is gone
+(schema 6 — invention's runs per BPC supersedes it: a sub-capital final
+with runs per BPC still rounds to whole copies, one without now builds
+its exact requested quantity instead of rounding up to the multiple,
+default 8); `FIRST_RUN_PROFILE` seeds a fresh install with the
+maintainer's settings (null-sec Sotiyo T2/T2 for every manufacturing
+class, Tatara T2/T2 reactions, 0.14% cost index, 540 + 540 slots, an
+800 h window, 1% buffer and margin, alchemy on, freight 900/750 ISK/m³,
+the maintainer's broker standings and capital rates, the three
+compressed toggles on, the Tools category blacklisted) and never
+overwrites an existing settings row; each `index_run` records the
+freight rates it was planned under and the realized Profit view lands
+inbound freight at those rates (live settings only for runs that
+predate the column), so editing the freight setting no longer reprices
+executed history; an older build opening a database written by a newer
+one shows a plain "Magoo cannot continue" page carrying
+`ensure_schema`'s message instead of a bare Internal Server Error; the
+SDE cache keeps the current build plus one previous; a game-data build
+whose tables predate the running version (a v1.24 import lacks
+`ref_compressible` and `portion_size`) is detected on the first request
+after an update and imported again from the cached archive on its own,
+and the dashboard's update check re-imports it too instead of reporting
+"already up to date" (`sdeimport.ref_schema_outdated`); the build script
+retries the portable zip while Defender or OneDrive still holds the
+fresh executable.
+
+A 7-lane correctness review (2026-09-05) produced 33 findings, fixed in
+three file-disjoint lanes with one adversarial verifier per finding and
+a completeness critic (session record; the commit carries the fixes and
+their tests). What changed numbers: `invention_chance` counts only
+Science-group skills (group 270 — the Production-group gate skills had
+inflated the chance); the feedback loop corrects a dual-role final to
+requested + max(0, draw − on hand − in progress) and prorates
+intermediate targets by their active consumers' share, so a stage whose
+consumers all flipped to buy is no longer bought to a phantom stockpile
+(4.8B ISK of Prometium observed on the maintainer's live plan); a cached
+Jita quote with no stored ladder competes as an unbounded synthetic
+rung, so a structure-only ladder can no longer route a whole buy to a
+dearer C-J6 price; a non-sell price source leaves every quote untouched;
+reaction formulas' `maxProductionLimit` no longer caps runs (the client
+accepts more, user ruling); per-job run caps use the noise-rounded
+ceil/floor (a 30-day quotient an ulp above an integer no longer adds a
+run); the composite-reaction extra-runs adder in the loop applies only
+to composites holding jobs; self-consuming blueprints keep their depth;
+low stock is judged against min(merged minimum, prorated target); a NULL
+install fee is badged instead of read as zero; a manual BPC cost with no
+runs per BPC is no longer charged in full per hull by the Profit views
+(`costing._bpc_line` follows the engine and charges nothing without a
+divisor); missing invention prices reach the unpriced badge; the shallow
+strip badge survives a Jita-only shallow run. The SCC surcharge (4%),
+NPC tax (0.25%) and 2% invention fee base are annotated as verified
+in-client. One lane's change to sub-capital batching ("the copy defines
+the job") was reverted by ruling: whole-copy rounding for T3 hulls
+stands, and per-job runs stay capped by the window, the 30-day rule and
+the copy. Schema 6 drops `settings.ship_batch_multiple`; schema 7 adds
+`hub_sell_order`, the six compressed settings, the compressed row
+columns (`compressed_outputs`, `compressed_ladder_units`,
+`compressed_fill_orders`, `compressed_covered_qty`,
+`compressed_wanted_qty`, `effective_unit_cost`), the per-venue fill
+columns (`hub_*`, `structure_*`, `unfilled_qty` / `unfilled_price`),
+`index_run.freight_in_isk_per_m3` / `structure_freight_in_isk_per_m3` /
+`compressed_saving_isk`, and `min_volume` on both ladder tables;
+migrations remain tolerant re-runs. Tests 439 → 532 in d1fbc90, 539
+with the re-import fix (new `test_invention_compare`,
+`test_compressed`, `test_sourcing`, `test_review_p0`,
+`test_sde_outdated`).
 
 ### Development environment constraints (historical)
 
@@ -2590,7 +2728,7 @@ user's Windows machine against the live database.
 | BPC cost (v1.5) | Per-pipeline all-in ISK per copy, amortized ÷ runs_per_bpc | ~~Invention math stays out of scope; user enters the number~~ v1.22: kept ONLY for non-invention pipelines (bought copies) and as the fallback for a stale invention config; an invention-enabled pipeline computes the figure instead |
 | Per-class security (2026-08-20) | High/Low/Null **dropdown** replaces the numeric field; stored capital_ships 2.1 migrates to nullsec; reaction classes offer Low/Null only | Live data showed the field used as a band multiplier; out-of-range statuses silently read as highsec |
 | Subcap SCC surcharge (2026-08-20) | The SCC market surcharge applies to sub-capital net proceeds too | The game levies ~1.5% on all sell orders since Apr 2023, not just capitals |
-| Price snapshot venue (2026-08-20) | Jita 4-4 station only (location 60003760), not region-wide min sell — the HUB leg; the structure leg (v1.10) deliberately takes its best order plus a depth flag, see "Structure depth rule (2026-08-22)" | A 1-unit scam/stale order in a backwater Forge station must not set cost basis or MILP savings |
+| Price snapshot venue (2026-08-20) | Jita 4-4 station only (location 60003760), not region-wide min sell — the HUB leg; the structure leg (v1.10) ~~deliberately takes its best order plus a depth flag, see "Structure depth rule (2026-08-22)"~~ walks its sell ladder with Jita's since v1.25 (see "Split buys across venues (2026-09-05)") | A 1-unit scam/stale order in a backwater Forge station must not set cost basis or MILP savings |
 | Stock scope (2026-08-20) | on_hand counts **corporation assets only** (tracked systems); personal hangars excluded. Amended 2026-08-25: both ends became toggles on the ESI tab — per-character `count_assets` opts personal hangars IN (default off), per-corp `esi_corp.count_assets` / `count_wallet` / `count_jobs` opt a corp's hangars / ISK / jobs OUT (defaults on; off skips that pull) | Corp hangars are the production stock; personal assets (parked ships, fittings, cargo) are noise — but the user wants the exception to be theirs to make |
 | In-progress scope (2026-08-20) | Corp AND personal jobs still credit in-progress output | Personal job output is delivered into corp hangars |
 | Multi-cycle slot netting (2026-08-20) | Active jobs whose end date lies beyond the next index run are netted from the slot pool; single-cycle jobs stay un-netted per v1.1. Amended 2026-08-25: the corp feed runs first and claims corp jobs — they count toward slots under the corp's `count_jobs` toggle; `include_job_slots` gates only the character's remaining personal jobs | The v1.1 "pools as entered" premise assumes all jobs deliver before planning; multi-cycle capital jobs violate it. Corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs |
@@ -2695,6 +2833,12 @@ user's Windows machine against the live database.
   4-4-filtered regional orders, v1.6 structure market).
 - **Multi-activity items** — items producible via both manufacturing and
   reaction are not yet disambiguated.
+- **Compressed candidates after an upgrade** (2026-09-06) — a candidate
+  competes only once a price refresh has stored its ladder, so a run
+  planned on a pre-v1.25 price cache shows no compressed rows and
+  nothing in the UI says why; the release notes say to refresh prices
+  first. A hint on the run page when the toggles are on but no
+  candidate had a ladder at plan time is still to do.
 - **System cost indices** — currently user-asserted per item class (the
   v1.22 `invention` and `copying` lab classes included); pulling live
   values from ESI `/industry/systems/` remains unimplemented.
