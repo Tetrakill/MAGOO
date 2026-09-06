@@ -43,7 +43,11 @@
   </div>
 </div>
 
-{% if not runs or show_setup %}
+{# Game data that predates this version is re-imported on its own; the
+   panel that shows that progress must open even for a user who
+   dismissed it long ago. #}
+{% set sde_attention = sde_outdated or sde_job.state == 'running' %}
+{% if not runs or show_setup or sde_attention %}
 {% set ns = namespace(marked=false) %}
 {% macro stepattrs(done) -%}
   {%- if done %}class="done"{% elif not ns.marked %}{% set ns.marked = true %}class="next" aria-current="step"{% endif -%}
@@ -61,16 +65,18 @@
     install to your first planned run.{% if not runs %} This panel
     disappears once a run exists.{% endif %}</p>
   <ol class="setup">
-    <li {{ stepattrs(sde_build) }} id="sde-step"><b>Download the game
+    <li {{ stepattrs(sde_build and not sde_outdated) }} id="sde-step"><b>Download the game
       data</b> — blueprints, items and solar systems, straight from CCP
       (~100&nbsp;MB; importing takes a few minutes, and the page reloads
-      itself when it lands).{{ donebadge(sde_build) }}
+      itself when it lands).{{ donebadge(sde_build and not sde_outdated) }}
+      {% if sde_outdated %}<span class="badge warn" title="the reference tables on disk lack data this version of Magoo reads (compressed-type tables); the same CCP build is imported again — from the cached download when there is one">needs re-import</span>
+      <span class="muted">The game data on disk predates this version of Magoo and must be imported again — that starts on its own after an update; the button retries it.</span>{% endif %}
       <div class="sde-fetch">
         <form method="post" action="{{ url_for('sde_import_start') }}"
               onsubmit="return sdeStart(this)">
           <button {% if sde_job.state == 'running' %}disabled
             title="a game data download is already running"{% endif %}>
-            {%- if sde_build %}⟳ Check for updates{% else %}↓ Download game data{% endif %}</button>
+            {%- if sde_outdated %}↓ Re-import game data{% elif sde_build %}⟳ Check for updates{% else %}↓ Download game data{% endif %}</button>
         </form>
         <div class="progress" id="sde-progress"
              data-state="{{ sde_job.state }}"
@@ -116,7 +122,7 @@ function dismissSetup() {
     // Pre-SDE the app is unusable and every gate's guidance points at
     // this panel's download button, so a stored dismissal is ignored
     // until the game data exists.
-    if ({{ 'true' if sde_build else 'false' }}
+    if ({{ 'true' if (sde_build and not sde_attention) else 'false' }}
         && localStorage.getItem("magoo-setup-dismissed") === "1"
         && location.search.indexOf("setup=1") === -1) {
       document.getElementById("setup").hidden = true;

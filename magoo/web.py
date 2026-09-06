@@ -85,6 +85,11 @@ def _sde_message(status: dict) -> str:
     if stage == "finalize":
         return "finishing — recording the new build"
     if stage == "resolved":
+        if status.get("outdated"):
+            return (
+                f"build {build} — game data predates this version, "
+                "importing it again"
+            )
         return f"build {build} — starting download"
     if stage == "current":
         return f"build {build} — already up to date"
@@ -1028,6 +1033,20 @@ def create_app() -> Flask:
                             g.conn, profile=store.FIRST_RUN_PROFILE
                         )
                         schema_ready.add(str(config.DB_PATH))
+                        # An installed build's reference tables can
+                        # predate this version (v1.25 reads
+                        # ref_compressible / portion_size, which a
+                        # v1.24 import never wrote): re-import the
+                        # game data now — from the cached archive
+                        # when there is one — rather than leave the
+                        # feature silently inert behind an "already
+                        # up to date" button.
+                        if sdeimport.ref_schema_outdated(g.conn):
+                            log.info(
+                                "reference tables predate this version "
+                                "— re-importing the game data"
+                            )
+                            sde_job.start()
         return g.conn
 
     def ref():
@@ -1086,7 +1105,8 @@ def create_app() -> Flask:
     def sde_import_start():
         # No sde_ready() guard on purpose: with a build already imported
         # this is the "check for updates" path (run_import no-ops when
-        # the build is unchanged).
+        # the build is unchanged and its tables are current; a build
+        # that predates this version is imported again).
         if sde_job.start():
             flash(
                 "game data download started — progress shows on the "
@@ -1307,6 +1327,7 @@ def create_app() -> Flask:
             ),
             structure_label=settings_.structure_market_label(),
             sde_build=ref().sde_build(),
+            sde_outdated=sdeimport.ref_schema_outdated(c),
             sde_job=sde_job_view(),
             pipelines=(
                 c.execute(

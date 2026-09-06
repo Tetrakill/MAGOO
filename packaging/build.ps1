@@ -134,7 +134,24 @@ Properties, tick "Unblock", and extract it again.
 '@
     $zip = Join-Path $dist "magoo-$version-win64.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
-    Compress-Archive -Path $tree -DestinationPath $zip -CompressionLevel Optimal
+    # Retry: right after the self-test exits, Magoo.exe can still be held
+    # for a few seconds (Defender scanning the fresh binary, OneDrive
+    # syncing it), and Compress-Archive then dies with "being used by
+    # another process" on a build that is otherwise finished (v1.25.0).
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            Compress-Archive -Path $tree -DestinationPath $zip `
+                -CompressionLevel Optimal -ErrorAction Stop
+            break
+        }
+        catch {
+            if (Test-Path $zip) { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
+            if ($attempt -eq 6) { throw }
+            Write-Warning "zip attempt $attempt failed ($($_.Exception.Message.Trim())); retrying"
+            Start-Sleep -Seconds 5
+        }
+    }
+    if (-not (Test-Path $zip)) { throw "no portable zip at $zip" }
     Write-Host "Portable: $zip" -ForegroundColor Green
 
     # The installed build must NOT be portable, or an uninstall could take

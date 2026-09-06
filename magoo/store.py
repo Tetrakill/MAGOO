@@ -266,9 +266,9 @@ CREATE INDEX IF NOT EXISTS structure_sell_order_type
     ON structure_sell_order (structure_id, type_id);
 
 -- v1.25: the Jita hub station's SELL ladder (price, remaining volume,
--- ascending) for compressed sourcing CANDIDATES only, replaced per type on
--- every price refresh. The compressed pass walks it at plan time for a
--- fill cost; every other buy keeps the single best-price quote above.
+-- ascending) for every input the plan may buy, compressed sourcing
+-- candidates included, replaced per type on every price refresh. The
+-- sourcing pass walks it at plan time for each buy's fill price.
 CREATE TABLE IF NOT EXISTS hub_sell_order (
     region_id     INTEGER NOT NULL,
     type_id       INTEGER NOT NULL,

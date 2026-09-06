@@ -12,8 +12,11 @@ leave it; there is no Magoo server.
 - **Plans an index run** end to end: expands your pipelines' bills of material
   against on-hand stock and in-progress jobs, then allocates job slots with a
   MILP solver to maximise savings.
-- **Prices two venues** — Jita and a structure market — and buys wherever is
-  cheaper *landed*, including freight.
+- **Prices two venues** — Jita and a structure market — walking both sell
+  ladders and filling each buy cheapest *landed* first, freight included,
+  splitting across markets when one book runs out.
+- **Sources compressed ore, moon ore and gas** when reprocessing them beats
+  buying the raw material outright.
 - **Costs realistically** using lag-based costing: each input is priced from
   the snapshot of the executed run its chain depth lags behind.
 - **Models your actual facilities**: structure and rig bonuses per item class,
@@ -59,8 +62,10 @@ Magoo walks you through it with an on-screen checklist. In short:
 4. **Add your pipelines** — what you build, and how many per cycle.
 5. **Refresh prices**, then **Plan index run**.
 
-Then visit Settings to enter your skills, structures and rigs — those are
-user-entered by design and materially change the numbers.
+Then visit Settings and check the seeded build settings — a fresh install
+starts from the maintainer's facilities (Sotiyo/Tatara with T2 rigs,
+compressed sourcing on); replace them with your own structures, rigs and
+skills, which are user-entered by design and materially change the numbers.
 
 ## Where your data lives
 

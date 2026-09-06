@@ -4,7 +4,10 @@ Implements the auto-pull protocol from PROJECT.md §4:
 
 1. Fetch latest.jsonl; the record keyed "sde" holds the current build number
    ("_meta" carries lastBuildNumber for change detection).
-2. Compare against ref_sde_build; skip if unchanged (unless --force).
+2. Compare against ref_sde_build; skip if unchanged — unless --force, or
+   the imported build predates this version's REF_SCHEMA (a table or
+   column the code reads is missing: ref_schema_outdated), which the web
+   app re-imports on its own at startup.
 3. Download the versioned zip into data/sde/ (cached).
 4. Extract and import; record the build number.
 
@@ -22,6 +25,7 @@ CLI:
 """
 
 import argparse
+import functools
 import io
 import json
 import logging
@@ -127,6 +131,47 @@ def stored_build(conn: sqlite3.Connection):
         "SELECT build_number FROM ref_sde_build ORDER BY imported_at DESC LIMIT 1"
     ).fetchone()
     return row["build_number"] if row else None
+
+
+@functools.lru_cache(maxsize=1)
+def _expected_ref_columns() -> dict[str, tuple[str, ...]]:
+    """{table: columns} that REF_SCHEMA defines, read back from an
+    in-memory database so the answer can never drift from the DDL."""
+    mem = sqlite3.connect(":memory:")
+    try:
+        for statement in REF_SCHEMA.split(";"):
+            if statement.strip():
+                mem.execute(statement)
+        return {
+            table: tuple(
+                row[1] for row in mem.execute(f"PRAGMA table_info({table})")
+            )
+            for table in REF_TABLES
+        }
+    finally:
+        mem.close()
+
+
+def ref_schema_outdated(conn: sqlite3.Connection) -> bool:
+    """True when the imported reference build predates this version of
+    the app: a table or column REF_SCHEMA now defines is missing, so the
+    code would read data that was never imported (v1.25's
+    ref_compressible and ref_type.portion_size on a v1.24 database —
+    compressed sourcing silently had no candidates). run_import
+    re-imports such a build even when CCP's build number is unchanged,
+    and the web app starts that re-import itself on its first request.
+    False on a fresh install: nothing is imported yet, and the first-run
+    download covers it."""
+    try:
+        if stored_build(conn) is None:
+            return False
+    except sqlite3.OperationalError:
+        return False
+    for table, columns in _expected_ref_columns().items():
+        have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not have or any(column not in have for column in columns):
+            return True
+    return False
 
 
 def download_sde_zip(client: httpx.Client, build: int, progress=None) -> Path:
@@ -722,11 +767,27 @@ def run_import(force: bool = False, progress=None) -> bool:
             except sqlite3.OperationalError:
                 pass  # first run, no ref tables yet
             if current == build and not force:
-                log.info("SDE build %s already imported; nothing to do", build)
-                _report(progress, stage="current", build=build)
-                return False
-            log.info("importing SDE build %s (had: %s)", build, current)
-            _report(progress, stage="resolved", build=build, had=current)
+                if not ref_schema_outdated(conn):
+                    log.info(
+                        "SDE build %s already imported; nothing to do", build
+                    )
+                    _report(progress, stage="current", build=build)
+                    return False
+                # Same CCP build, but the tables on disk predate this
+                # version of the app: the cached archive (or a fresh
+                # download) must be imported again.
+                log.info(
+                    "SDE build %s already imported, but its tables predate "
+                    "this version of Magoo; importing it again",
+                    build,
+                )
+                _report(
+                    progress, stage="resolved", build=build, had=current,
+                    outdated=True,
+                )
+            else:
+                log.info("importing SDE build %s (had: %s)", build, current)
+                _report(progress, stage="resolved", build=build, had=current)
             archive = download_sde_zip(client, build, progress)
 
         with zipfile.ZipFile(archive) as zf:
