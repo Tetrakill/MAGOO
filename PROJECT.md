@@ -174,9 +174,16 @@ anywhere, iterates quickly, and owns its own data pipeline.
     average (per-venue fills in the tooltip); Multibuy lists each market's
     share; freight splits by the venue quantities in the realized profit
     view. Phase 1's single best-price quote remains the starting point (the
-    MILP's savings objective, the alchemy comparison and the Planning tab's
-    live views still use it). Finals are never compared (their quote is a
-    sell reference).
+    chain cost's inputs, the alchemy comparison and the Planning tab's
+    live views still use it), but since v1.26 the build-vs-buy rule
+    judges a buildable intermediate's own buy side at its fill: its cycle
+    quantity walks the merged ladder, the units at or below the chain
+    cost are bought and the rest built (Phase 6; `market_buy_qty`), and a
+    capacity shortfall buys only from rungs that exist. Each market has a
+    **pricing basis** (v1.26, Settings → Global): Ladder (the walk),
+    Min Sell Order or Max Buy Order (any quantity at the best order — the
+    market becomes one unbounded synthetic rung; no split, no shallow
+    badge). Finals are never compared (their quote is a sell reference).
 
 16. **T2/T3 invention (v1.22)** — Per pipeline whose final is
     invention-capable (its manufacturing blueprint has at least one
@@ -881,7 +888,8 @@ Tools blacklisted.
 | `max_run_duration_hours` | 24.0 |
 | `composite_reaction_extra_runs` | 1 |
 | `price_region_id` | 10000002 (The Forge) — hub quotes come from its hub station, and (since 2026-08-23) raw leaves with no hub-station order take this same region's region-wide best order (the v1.9 `npc_goods_region_id` column was merged into it and dropped) |
-| `price_source` | sell |
+| `price_source` | sell — the ESI order side the hub refresh pulls; since v1.26 derived on save from `hub_price_basis` ('buy' only under max_buy) |
+| `hub_price_basis` / `structure_price_basis` | ladder / ladder (v1.26) — per market: `ladder` walks the sell book for the quantity bought, `min_sell` / `max_buy` price any quantity at the best order (one unbounded synthetic rung); the structure's buy orders are cached by every structure refresh (`market_price` source 'structure_buy') |
 | `manufacturing_slots` / `reaction_slots` | 10 / 10 — user-entered pools (v1.1) |
 | seven industry skill levels (`skill_industry` … `skill_science`, `skill_outpost_construction`) | 5 — user-entered, feed job time only (v1.1; Outpost Construction split out of the science level in v1.9) |
 | `count_fitted_stock` | 0 — ESI stock excludes assets fitted to / loaded in ships and structures (module, rig, subsystem, service, fuel, core, drone, fighter slots/bays) and assets deployed in space (singletons located in a solar system) unless on (v1.9) |
@@ -974,6 +982,7 @@ Structure bonuses are read from the structure type's own attributes via
 | `run_number` | Sequential, UNIQUE-indexed (2026-08-20, vs the duplicate-number race) |
 | `planned_start`, `actual_start`, `planned_end` | |
 | `compressed_saving_isk` | v1.25: landed ISK the compressed sourcing pass saved vs buying the covered raws direct at plan time (NULL when it changed nothing) |
+| `hub_price_basis` / `structure_price_basis` | v1.26: the pricing bases the run was planned under (NULL on older runs: ladder) |
 | `freight_in_isk_per_m3`, `structure_freight_in_isk_per_m3` | 2026-09-05 review: the plan-time freight-in rates (Jita leg, structure leg) the fill landed with — `costing.hull_cost` prices inbound freight at this vintage; NULL on pre-column runs falls back to live settings |
 | `status` | planned / active / complete |
 | `completed_at` | v1.5: stamped on "Mark executed" — lag costing walks completed runs only |
@@ -991,17 +1000,17 @@ The core output table.
 | `in_progress_qty` | Output of active jobs — counts as stock |
 | `target_stock_qty` | Merged minimum × (1 + buffer) |
 | `deficit_qty` | `max(0, target + merged_min − on_hand − in_progress)`; final products: Phase 4 seeds `= target`, and the feedback loop re-sizes a dual-role final to `requested + max(0, other pipelines' allocated draw − on_hand − in_progress)` (review 2026-09-05, A1) |
-| `recommended_action` | buy / build / both |
+| `recommended_action` | buy / build / both — `both` when jobs build part and the rest is bought (a capacity loser, or since v1.26 an item the market beats on part of its quantity) |
 | `blueprint_id`, `activity_id` | Activity selects the slot pool |
 | `time_per_run` | ME/TE/facility adjusted |
 | `portion_size` | |
 | `max_runs_per_job` | `floor(window / time_per_run)`, capped by the 30-day game ceiling and runs-per-BPC (see Phase 5) |
-| `total_runs_needed` | `ceil(deficit / portion_size)` |
+| `total_runs_needed` | `ceil(deficit / portion_size)`, whole copies for a sub-capital ship with runs per BPC; v1.26: re-sized to the units the market did not beat (`_resize_build`, the same `_runs_for_units` rounding) |
 | `jobs_needed_unconstrained` | `ceil(total_runs_needed / max_runs_per_job)` |
 | `jobs_allocated` | Post-MILP |
 | `runs_allocated`, `recommended_build_qty` | |
-| `recommended_buy_qty` | Shortfall flipped to purchase (never for finals) |
-| `build_savings_per_unit` | MILP objective coefficient |
+| `recommended_buy_qty` | v1.26: `market_buy_qty` + the capacity shortfall capped at `market_fallback_qty` (the whole shortfall when no ladder or quote was known; never for finals) |
+| `build_savings_per_unit` | MILP objective coefficient: the landed buy price − the chain cost; v1.26: the BUILT units' saving against the dearer rungs, NULL when no dearer rung exists (ranked with the unpriced, never bought) or when the item is unpriced |
 | `capacity_limited` | Allocation < need |
 | `low_stock` | Won't sustain next run |
 | `price_snapshot` | Cost basis at this run — the CHOSEN venue's raw best price (v1.10); since v1.25 fill pricing the blended raw fill average over the whole direct quantity (rows with `hub_buy_qty` NULL keep the single quote) |
@@ -1019,6 +1028,8 @@ The core output table.
 | `compressed_outputs` | v1.25, compressed buy rows: json `[[material_id, units out at the yield, units used to cover demand], ...]` — what the purchase is for |
 | `compressed_ladder_units`, `compressed_fill_orders` | v1.25, compressed buy rows: units on the chosen venue's ladder at plan time and orders the fill walked (the badge tooltip) |
 | `compressed_wanted_qty` | 2026-09-05 review (R6), compressed buy rows: the quantity the LP wanted before the whole-batch re-fill; the run page badges the row *shallow* when it exceeds `recommended_buy_qty`. NULL on pre-column rows (never flagged) |
+| `market_buy_qty` | v1.26: units of a buildable item bought because their sell-ladder rungs land at or below its chain cost (the fill-aware rule); the jobs build the rest. 0 on pre-column rows and on whole buys |
+| `market_fallback_qty` | v1.26: units dearer rungs could still supply — the only purchase fallback a capacity shortfall may take; NULL when no ladder or quote was known (the single-quote rule stood) |
 | `compressed_covered_qty` | v1.25, raw rows: units of this cycle's purchase covered by reprocessing compressed buys (`recommended_buy_qty` is the direct remainder) |
 | `effective_unit_cost` | v1.25, raw rows: blended LANDED per-unit cost (direct share at its landed quote + allocated compressed cost) the realized costing prices the raw at; NULL when nothing was covered |
 | `hub_buy_qty`, `hub_fill_price`, `hub_fill_orders` | v1.25 fill pricing: units bought at Jita (the unfilled remainder included ONLY when Jita's stored book was truncated — ruling R5 2026-09-05), their average raw fill price and the orders walked; `hub_buy_qty` NULL = a row priced before fill pricing / with no ladder anywhere (its `buy_venue` says it all) |
@@ -1258,7 +1269,21 @@ Grouped by pool (manufacturing, reaction). First, INTERMEDIATES whose build
 savings are zero or negative never get slots regardless of contention —
 building above the LANDED market price (raw + the venue's courier rate × m³,
 2026-08-23) wastes ISK, so Phase 7 buys their deficit instead
-(2026-08-20). Pipeline finals are exempt (2026-08-21): they are built to
+(2026-08-20). Since v1.26 that judgement is **fill-aware**
+(`_market_split`): the item's cycle quantity (`total_runs_needed ×
+portion`) walks its merged Jita + structure ladder (`_LadderLookup`,
+`costing.rungs_taken`) rung by rung against the chain cost — the units
+at or below it are bought (`market_buy_qty`), the rest is built with the
+jobs re-sized to that part (`_resize_build` through the same
+`_runs_for_units` rounding), and the dearer rungs become the only
+purchase fallback a capacity shortfall may take (`market_fallback_qty`;
+beyond them the shortfall is unmet). The MILP weight of the built part
+is its saving against those dearer rungs; with none, the built units
+have no fallback and rank with the unpriced contenders. Every unit
+cheaper on the market still flips the item to a whole buy; no rung
+anywhere (no ladder and no quote, e.g. the steady-state plan) leaves the
+single-quote figure in force. The chain cost's own INPUTS stay at their
+Phase 1 quotes. Pipeline finals are exempt (2026-08-21): they are built to
 sell, and their negative paper margin surfaces as a badge, not a buy order.
 Among the remaining contenders, if demand fits capacity everyone gets what
 they need. Otherwise pipeline FINALS take their slots first, then unpriced
@@ -1286,8 +1311,10 @@ MILP via `scipy.optimize.milp`:
   rather than silently flipping the pool to buys.
 - **Fallback:** priced INTERMEDIATE losers are not left unfulfilled — their
   shortfall becomes `recommended_buy_qty` (lowest-margin items are the ones
-  bought). A final's shortfall is never bought: it stays a
-  `capacity_limited` unmet build.
+  bought) — capped, since v1.26, at the units the dearer rungs hold
+  (`market_fallback_qty`); the rest is unmet ('+unmet' on the Chain tab,
+  the Plan tab's Unmet count). A final's shortfall is never bought: it
+  stays a `capacity_limited` unmet build.
 
 Items with no snapshot price on record (no orders at the hub, or never
 fetched) are never flipped to buy — their shortfall remains an unmet deficit
@@ -2769,7 +2796,7 @@ user's Windows machine against the live database.
 | Finals never overbuild (2026-08-20) | Uniform round-up is skipped for pipeline finals incl. EXACT_QTY groups — the last job runs short | Finals ignore stock, so overbuild never nets off; also keeps batch/BPC-rounded totals exact (batch multiple is a hard contract) |
 | ~~Component run caps (2026-08-20)~~ | ~~maxProductionLimit caps manufacturing runs/job~~ Superseded 2026-08-21: maxProductionLimit is the max licensed runs per blueprint COPY and does not cap manufacturing | In-client verification showed the game accepts far more runs |
 | Per-job run ceiling (2026-08-21) | ONE rule for manufacturing AND reactions: runs keep being added while the job's total **modified** time is under 30 days, so the last run may overhang — `ceil(30d / time_per_run)`; a single run over 30 days installs as 1 run. ~~Reaction formulas' maxProductionLimit kept as an extra ceiling where lower (unverified)~~ removed 2026-09-05 (ruling R2: client-verified, the client accepts more runs than the formula's maxProductionLimit). The earlier verified reaction caps (544, alchemy 272) were this same rule at the user's Tatara (543 runs = 29d 23:21:59, the 544th allowed) | User-verified in client 2026-08-21; supersedes the flat-544/base-time-scaled reaction machinery and the (misread) maxProductionLimit manufacturing cap |
-| Negative build savings (2026-08-20) | Buy in BOTH branches (contended and idle slots) | Building above market price — the LANDED price since 2026-08-23 — wastes ISK regardless of slot pressure; removes the one-slot build/buy flip-flop |
+| Negative build savings (2026-08-20) | Buy in BOTH branches (contended and idle slots). **2026-09-06 (v1.26):** judged unit by unit at the fill — the units the market sells at or below the chain cost are bought, the rest built | Building above market price — the LANDED price since 2026-08-23 — wastes ISK regardless of slot pressure; removes the one-slot build/buy flip-flop. The single best order misjudged large quantities (run 14: 862,200 Ferrofluid bought at a blended fill above build; 1,592 amplifiers bought against 752 on the market) |
 | Unpriced inputs in savings (2026-08-20) | Keep MILP weighting; badge the savings figure as incomplete ("N inputs unpriced") in the UI | Ranking-last could starve good builds on a stale price cache; flagging is honest and cheap |
 | Alchemy 1-job minimum (2026-08-20) | Kept — a zero-residual swap still installs one alchemy job | Confirmed intended: the token job's output is cheap extra buffer |
 | Lag depth semantics (2026-08-20) | Per-pipeline max depth (once the cross-pipeline depth bug is fixed); multi-depth usage within a hull prices at the deepest occurrence | Exact per-depth attribution needs schema the approximation doesn't warrant |
@@ -2851,7 +2878,9 @@ user's Windows machine against the live database.
 | Freight-rate vintage per run (C2) | `index_run.freight_in_isk_per_m3` / `structure_freight_in_isk_per_m3` persisted at plan time; `hull_cost` lands inbound freight at the run's own rates (live settings for pre-column runs) | Editing the freight setting must not silently reprice executed history |
 | Ladders carry `min_volume` (C3) | Both sell-order tables store ESI `min_volume`; the merged walk skips a rung whose minimum exceeds the units it would take | A 10,000-minimum order cannot fill a 300-unit buy; the walk was pricing buys off orders it could never hit |
 | Hub quote kept beside the winner (C5) | `Snapshot.hub_prices` carries the cached Jita quote per type even where the structure won Phase 1; the sourcing pass's synthetic hub rung reads it | An item with a hub price but no stored hub ladder was given the WINNING venue's price as its Jita rung |
-| No sell ladders off the sell source (C6) | `market.sell_ladders` returns empty ladders when `price_source != 'sell'`, so the pass leaves every Phase 1 quote alone | No sell ladder was ever pulled for a buy-side price source; walking a stale one mispriced the plan |
+| No sell ladders off the sell source (C6) | ~~`market.sell_ladders` returns empty ladders when `price_source != 'sell'`, so the pass leaves every Phase 1 quote alone~~ 2026-09-06: subsumed by the per-market basis — a buy-side hub is its quote, standing in as one unbounded synthetic rung, and a structure ladder can only take units that beat it landed | No sell ladder was ever pulled for a buy-side price source; walking a stale one mispriced the plan |
+| Fill-aware build-vs-buy (2026-09-06) | A buildable intermediate's cycle quantity walks its merged ladder; rungs at or below the chain cost are bought (`market_buy_qty`), the rest built; a capacity shortfall buys only from dearer rungs that exist (`market_fallback_qty`), the remainder is unmet; the chain cost's inputs keep their Phase 1 quotes | User ("are you sure about the build cost vs landed buy"): three independent recomputations showed the verdicts held only at the best order — Ferrofluid, Hyperflurite and the amplifier cost more to buy than to build at their fills, and 840 amplifiers had no market at all |
+| Per-market pricing basis (2026-09-06) | `hub_price_basis` / `structure_price_basis` ∈ {max_buy, min_sell, ladder}, default ladder, in Settings → Global; replaces the Price Source select (`price_source` derived: buy only under max_buy; a 'buy' database migrates to max_buy); a non-ladder market is one unbounded synthetic rung at its quote — no order count, no split, no shallow badge; the structure refresh caches the best buy order too | User request: price every item from Min Sell vs Ladders, per market, with Max Buy Order for a trader who fills their own buy orders |
 | Hub ladder for every input | `hub_sell_order` is stored for every market input on each refresh, not the compressed candidates only | Fill pricing walks every buy; the candidates-only pull left most rows with a single quote and no depth |
 | Paste keeps blank interior columns (B1) | `_parse_pipeline_line` drops trailing empties only; an interior blank is an omitted column | "Ishtar\t40\t\t4\t8" (blank runs/BPC) used to shift ME 4 into runs/BPC and TE 8 into ME |
 | Newer-database page (B7) | An `errorhandler(RuntimeError)` renders the message on a plain page (no template — base.html would reopen the database) | `ensure_schema`'s refusal of a newer-build database fired inside `conn()` as a bare 500 |

@@ -301,6 +301,31 @@ def fill_merged(
     )
 
 
+def rungs_taken(
+    hub_ladder, structure_ladder, qty: int, hub_rate: float,
+    structure_rate: float, m3: float,
+) -> list[tuple[float, float, int, str]]:
+    """The rungs fill_merged's walk takes for ``qty`` units, cheapest
+    landed first — [(landed, raw price, units taken, venue)], the same
+    min_volume rule — stopping where the ladders run out (fewer units
+    than asked means the rest is unsourced). The fill-aware build-vs-buy
+    rule (v1.26) reads it rung by rung against the build cost."""
+    rungs = _merged_rungs(
+        list(hub_ladder or ()), structure_ladder, hub_rate, structure_rate, m3
+    )
+    remaining = max(0, int(qty))
+    taken: list[tuple[float, float, int, str]] = []
+    for landed, price, volume, venue, min_volume in rungs:
+        if remaining <= 0:
+            break
+        take = _fillable(volume, min_volume, remaining)
+        if take <= 0:
+            continue
+        taken.append((landed, price, take, venue))
+        remaining -= take
+    return taken
+
+
 def fill_ladder(ladder, qty: int) -> LadderFill:
     """Walk ``ladder`` — [(price, volume_remain[, min_volume]), ...], any
     order — from the cheapest rung up until ``qty`` units are taken,

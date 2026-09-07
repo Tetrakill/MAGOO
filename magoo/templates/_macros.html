@@ -23,7 +23,7 @@
    its sell ladders shows the per-venue average fill, the orders taken and
    any units beyond the stored ladders; a legacy row shows the price. #}
 {% macro price_cell(i, plan_time=true) -%}
-    <td class="num"{% if i.hub_buy_qty is defined and i.hub_buy_qty is not none %} title="average raw price over the sell orders walked{{ ' at plan time' if plan_time }}{% if i.hub_buy_qty %} — Jita: {{ i.hub_buy_qty|qty }} units at {{ i.hub_fill_price|isk }} avg over {{ i.hub_fill_orders|qty }} order{{ 's' if i.hub_fill_orders != 1 }}{% endif %}{% if i.structure_buy_qty %} — {{ settings.structure_market_label() }}: {{ i.structure_buy_qty|qty }} units at {{ i.structure_fill_price|isk }} avg over {{ i.structure_fill_orders|qty }} order{{ 's' if i.structure_fill_orders != 1 }}{% endif %}{% if i.unfilled_qty %} — {{ i.unfilled_qty|qty }} units beyond the stored ladders (unsourced — no market held them) at the last order walked, {{ i.unfilled_price|isk }}{% endif %}"{% endif %}>{{ i.price_snapshot|isk }}</td>
+    <td class="num"{% if i.hub_buy_qty is defined and i.hub_buy_qty is not none %} title="raw price of the buy{{ ' at plan time' if plan_time }}{% if i.hub_buy_qty %} — Jita: {{ i.hub_buy_qty|qty }} units at {{ i.hub_fill_price|isk }}{% if i.hub_fill_orders is none %} (its best order, any quantity — Min Sell / Max Buy basis){% else %} avg over {{ i.hub_fill_orders|qty }} order{{ 's' if i.hub_fill_orders != 1 }} walked{% endif %}{% endif %}{% if i.structure_buy_qty %} — {{ settings.structure_market_label() }}: {{ i.structure_buy_qty|qty }} units at {{ i.structure_fill_price|isk }}{% if i.structure_fill_orders is none %} (its best order, any quantity — Min Sell / Max Buy basis){% else %} avg over {{ i.structure_fill_orders|qty }} order{{ 's' if i.structure_fill_orders != 1 }} walked{% endif %}{% endif %}{% if i.unfilled_qty %} — {{ i.unfilled_qty|qty }} units beyond the stored ladders (unsourced — no market held them) at the last order walked, {{ i.unfilled_price|isk }}{% endif %}"{% endif %}>{{ i.price_snapshot|isk }}</td>
 {%- endmacro %}
 
 {# shallow (review 2026-09-05, R5/R6): a fill-priced row's remainder beyond
@@ -101,6 +101,8 @@
     <td class="num">{{ (i.time_per_run * per_job)|hours }}</td>
     <td class="flags">{% if i.capacity_limited %}<span class="badge warn"
         title="the slot pool can't fit this item's full demand ({{ i.jobs_needed_unconstrained }} job(s) needed)">capacity</span>{% endif %}
+        {% if i.market_buy_qty is defined and i.market_buy_qty %}<span class="badge accent"
+          title="{{ i.market_buy_qty|qty }} units are cheaper on the market than building them (their sell orders land at or below the build cost{{ ' at plan time' if execution }}) and are on the Buy list; the jobs here build the rest">+buy {{ i.market_buy_qty|qty }}</span>{% endif %}
         {% if execution and i.low_stock %}<span class="badge warn"
           title="current stock and in-flight jobs won't sustain the next run">low stock</span>{% endif %}
         {% if execution and i.savings_unpriced_inputs %}<span class="badge warn"

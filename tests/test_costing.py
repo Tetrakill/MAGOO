@@ -747,7 +747,10 @@ def test_refresh_structure_prices_empty_book(conn, monkeypatch):
     rows = conn.execute(
         "SELECT COUNT(*) n FROM market_price WHERE region_id = 999"
     ).fetchone()
-    assert rows["n"] == 2
+    # v1.26: a sell-side AND a buy-side row per wanted type (the 'max_buy'
+    # basis), both NULL on an empty book.
+    assert rows["n"] == 4
+    assert market.cached_structure_quotes(conn, 999, [34, 35], "max_buy") == {}
 
 
 def test_min_sell_by_type_edge_inputs():

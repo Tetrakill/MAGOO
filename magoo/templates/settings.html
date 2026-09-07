@@ -38,6 +38,20 @@
     <input id="mfg_slots" name="mfg_slots" type="number" min="0" value="{{ settings.manufacturing_slots }}">
     <label for="reaction_slots">Reaction Slots <small>total pool</small></label>
     <input id="reaction_slots" name="reaction_slots" type="number" min="0" value="{{ settings.reaction_slots }}">
+    <label for="hub_price_basis">Jita Pricing Basis
+      <small>how every Jita purchase is priced: <b>Ladder</b> walks the sell book for the quantity bought (fill pricing, splits across markets, shallow badges, and build-vs-buy judged unit by unit); <b>Min Sell Order</b> prices any quantity at the cheapest sell order; <b>Max Buy Order</b> prices any quantity at the highest buy order &mdash; what you pay when you fill your own buy orders. Switching to or from Max Buy Order needs a price refresh: the refresh pulls that side of the order book</small></label>
+    <select id="hub_price_basis" name="hub_price_basis">
+      <option value="ladder" {{ 'selected' if settings.hub_price_basis == 'ladder' }}>Ladder</option>
+      <option value="min_sell" {{ 'selected' if settings.hub_price_basis == 'min_sell' }}>Min Sell Order</option>
+      <option value="max_buy" {{ 'selected' if settings.hub_price_basis == 'max_buy' }}>Max Buy Order</option>
+    </select>
+    <label for="structure_price_basis">Structure Market Pricing Basis
+      <small>the same choice for the structure market ({{ settings.capital_market_mode == 'cj6' and 'C-J6MT Keepstar' or 'your structure' }}) when Buy Inputs Here When Cheaper Landed is on; its buy orders come down with every structure refresh</small></label>
+    <select id="structure_price_basis" name="structure_price_basis">
+      <option value="ladder" {{ 'selected' if settings.structure_price_basis == 'ladder' }}>Ladder</option>
+      <option value="min_sell" {{ 'selected' if settings.structure_price_basis == 'min_sell' }}>Min Sell Order</option>
+      <option value="max_buy" {{ 'selected' if settings.structure_price_basis == 'max_buy' }}>Max Buy Order</option>
+    </select>
     <label for="count_fitted_stock">Count Fitted &amp; Deployed Items as Stock
       <small>when off, items fitted to or loaded in ships and structures (module, rig, subsystem, service, fuel, core, drone and fighter slots/bays) and anything deployed in space — anchored structures, sov hubs, POCOs — are left out of ESI on-hand stock; items stored inside them still count; applies at the next ESI update</small></label>
     <input id="count_fitted_stock" name="count_fitted_stock" type="checkbox" {{ 'checked' if settings.count_fitted_stock }}>
@@ -198,8 +212,9 @@
   <p class="muted" style="margin:.2rem 0 .6rem">The high-sec hub (Jita 4-4 in
     the price region): sub-capital hulls, Upwell structures, structure
     rigs/modules and structure components sell-quote here and list at its NPC
-    station with these fees; bought inputs default to its quote. Effective
-    with current values:
+    station with these fees; bought inputs default to its quote. How its
+    orders are priced (Ladder / Min Sell Order / Max Buy Order) is the
+    Jita Pricing Basis under Global. Effective with current values:
     <b>broker fee {{ "%.2f"|format(broker_rate * 100) }}%</b> ·
     <b>sales tax {{ "%.2f"|format(sales_tax * 100) }}%</b> —
     verify against a sell-order window in the client.</p>
@@ -207,11 +222,6 @@
     <label for="region">Price Region
       <small>10000002 = The Forge; quotes come from its hub station (Jita 4-4), and raw inputs with no hub-station order (NPC-seeded goods such as Marines or Janitors) take this region's region-wide best price</small></label>
     <input id="region" name="region" type="number" min="1" required value="{{ settings.price_region_id }}">
-    <label for="source">Price Source <small>min sell or max buy</small></label>
-    <select id="source" name="source">
-      <option value="sell" {{ 'selected' if settings.price_source == 'sell' }}>sell</option>
-      <option value="buy" {{ 'selected' if settings.price_source == 'buy' }}>buy</option>
-    </select>
     <label for="skill_accounting">Accounting</label>
     <input id="skill_accounting" name="skill_accounting" type="number" min="0" max="5" value="{{ settings.skill_accounting }}">
     <label for="skill_broker_relations">Broker Relations</label>

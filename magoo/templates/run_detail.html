@@ -66,7 +66,7 @@
   </div>
   <div class="stat">
     <span class="label">Unmet</span>
-    <span class="value {% if unmet %}bad{% endif %}" title="items with a deficit, no market and no capacity">{{ unmet|length }}</span>
+    <span class="value {% if unmet %}bad{% endif %}" title="items whose planned jobs, purchase and alchemy route together still fall short of the deficit — out of build slots, and the market holds too little (or nothing) for the rest">{{ unmet|length }}</span>
   </div>
   <div class="stat">
     <span class="label">Low stock</span>
@@ -94,13 +94,16 @@
 
 {% if unmet %}
 <div class="panel alert-bad">
-  <h2><span class="badge fill bad">unmet demand</span> nothing on the market
-    and you're out of build slots</h2>
+  <h2><span class="badge fill bad">unmet demand</span> out of build slots,
+    and the market holds too little (or nothing) to cover the rest</h2>
   <div class="tablewrap">
   <table>
-    <thead><tr><th>Item</th><th class="num">Deficit</th></tr></thead>
+    <thead><tr><th>Item</th><th class="num">Deficit</th><th class="num">Planned</th><th class="num">Unmet</th></tr></thead>
     {% for i in unmet %}
-    <tr><td>{{ i.name }}</td><td class="num">{{ i.deficit_qty|qty }}</td></tr>
+    {% set short = unmet_qty[i.type_id] if (unmet_qty is defined and i.type_id in unmet_qty) else i.deficit_qty %}
+    <tr><td>{{ i.name }}</td><td class="num">{{ i.deficit_qty|qty }}</td>
+      <td class="num" title="built {{ i.recommended_build_qty|qty }} + bought {{ i.recommended_buy_qty|qty }}">{{ (i.deficit_qty - short)|qty }}</td>
+      <td class="num">{{ short|qty }}</td></tr>
     {% endfor %}
   </table>
   </div>
@@ -402,13 +405,19 @@ function openDeficit(btn) {
   if (Number(d.covered)) parts.push(
     (parts.length ? "" : "buys nothing direct — ")
     + qty(d.covered) + " come from reprocessing compressed purchases");
+  // v1.26: a capacity loser buys only what the market holds; say what
+  // is left unmet rather than stop at "the plan buys N".
+  const shortfall = Number(d.deficit) - Number(d.build) - Number(d.buy) - Number(d.covered);
+  const unmetNote = (d.kind !== "final" && parts.length && shortfall > 0)
+    ? " " + qty(shortfall) + " unmet: out of slots, and the market holds no more."
+    : "";
   document.getElementById("deficit-answer").textContent =
     d.kind === "final"
       ? (deficit !== target
           ? "Finals build their requested quantity every run; the share other pipelines' jobs draw is netted against stock and in-flight jobs."
           : "Finals build the full cycle quantity every run — stock on hand is the previous wave, bound for sale.")
       : Number(d.deficit) > 0
-        ? (parts.length ? "The plan " + parts.join(" and ") + "."
+        ? (parts.length ? "The plan " + parts.join(" and ") + "." + unmetNote
                         : "Unmet — no market to buy from and no slots to build in.")
         : "No deficit — covered by stock and jobs.";
   document.getElementById("deficit-chain").href =

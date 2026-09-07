@@ -14,7 +14,10 @@ leave it; there is no Magoo server.
   MILP solver to maximise savings.
 - **Prices two venues** — Jita and a structure market — walking both sell
   ladders and filling each buy cheapest *landed* first, freight included,
-  splitting across markets when one book runs out.
+  splitting across markets when one book runs out; each market can instead
+  be priced at its best sell or buy order for any quantity (a setting).
+- **Builds or buys unit by unit** — an intermediate is bought only for the
+  units the market sells below its build cost; the rest is built.
 - **Sources compressed ore, moon ore and gas** when reprocessing them beats
   buying the raw material outright.
 - **Costs realistically** using lag-based costing: each input is priced from

@@ -180,16 +180,40 @@ def _chain_status(x) -> str:
     return "unmet"
 
 
+def _unmet_row(i) -> bool:
+    """The Plan tab's Unmet list — the same rule as the Chain tab's
+    _chain_short, over a persisted row: capacity-limited, and the jobs,
+    the purchase and the alchemy route together still fall short of the
+    deficit (v1.26: a capacity shortfall buys only from rungs the market
+    holds, so a partly-bought row can be short too)."""
+    deficit = i["deficit_qty"] or 0
+    if not (i["capacity_limited"] and deficit > 0):
+        return False
+    return _unmet_qty(i) > 0
+
+
+def _unmet_qty(i) -> int:
+    """Units of a row's deficit nothing covers (0 when covered)."""
+    covered = (
+        (i["recommended_build_qty"] or 0)
+        + (i["recommended_buy_qty"] or 0)
+        + ((i["alchemy_output_qty"] or 0) if "alchemy_output_qty" in i.keys() else 0)
+    )
+    return max(0, (i["deficit_qty"] or 0) - covered)
+
+
 def _chain_short(x) -> bool:
     """Unmet demand on a row that still reads build/react: capacity-limited
-    with no purchase fallback — the Plan tab's "Unmet" list (capacity_limited,
-    nothing bought, deficit > 0), so the two tabs count the same items."""
-    return bool(
-        x["capacity_limited"]
-        and x["buy_qty"] == 0
-        and x["deficit"] and x["deficit"] > 0
-        and x["build_qty"] > 0
-    )
+    and the jobs plus whatever the market could supply fall short of
+    the deficit — the Plan tab's "Unmet" list, so the two tabs count the
+    same items. v1.26: a capacity shortfall buys only from rungs the
+    market holds, so a partly-bought row can still be short."""
+    if not (x["capacity_limited"] and x["deficit"] and x["deficit"] > 0):
+        return False
+    covered = x["build_qty"] + x["buy_qty"] + (x.get("alchemy_out") or 0)
+    if covered <= 0:
+        return False  # nothing planned at all: the status 'unmet' covers it
+    return covered < x["deficit"]
 
 
 def _group_by_category(ref, rows) -> list:
@@ -257,6 +281,8 @@ def _steady_rows(ref, plan) -> list[dict]:
                 "max_runs_per_job": item.max_runs_per_job,
                 "time_per_run": item.time_per_run,
                 "capacity_limited": item.capacity_limited,
+                "market_buy_qty": item.market_buy_qty,
+                "market_fallback_qty": item.market_fallback_qty,
                 "savings_unpriced_inputs": item.savings_unpriced_inputs,
                 "price_snapshot": item.price_snapshot,
                 "price_region_wide": item.price_region_wide,
@@ -467,6 +493,7 @@ def _planning_context(ref, plan, settings_) -> dict:
         struct_buys=bc["struct_buys"],
         struct_slots=bc["struct_slots"],
         capacity_rows=[i for i in rows if i["capacity_limited"]],
+        unmet_qty=unmet_qty if "unmet_qty" in dir() else {},
         mfg_demand=_steady_demand(rows, config.ACTIVITY_MANUFACTURING),
         reaction_demand=_steady_demand(rows, config.ACTIVITY_REACTION),
         settings=settings_,
@@ -587,6 +614,13 @@ def _chain_context(ref, items) -> dict:
                 else 0
             ),
             "capacity_limited": bool(i["capacity_limited"]),
+            # v1.26: units bought because the market beat the build cost
+            # (pre-v1.26 rows have no column).
+            "market_buy": (
+                (i["market_buy_qty"] or 0)
+                if "market_buy_qty" in i.keys()
+                else 0
+            ),
             # 2026-09-01: the section-header stats (slots, build/buy value)
             # read the same keys the Plan tab's rows carry.
             "jobs_allocated": i["jobs_allocated"] or 0,
@@ -729,6 +763,15 @@ def _settings_save(c, form):
 
     buffer = min(0.1, max(0.001, pct_field("buffer_pct")))
     margin = min(0.5, max(0.0, pct_field("purchase_margin_pct")))
+
+    def basis_field(key: str) -> str:
+        # v1.26: one pricing basis per market; an unknown value (an old
+        # form, a hand-edited POST) keeps the ladder walk.
+        value = form.get(key) or store.PRICE_BASIS_LADDER
+        return value if value in store.PRICE_BASES else store.PRICE_BASIS_LADDER
+
+    hub_basis = basis_field("hub_price_basis")
+    structure_basis = basis_field("structure_price_basis")
     c.execute(
         "UPDATE settings SET input_purchase_margin = ?, "
         "stockpile_buffer = ?, "
@@ -756,7 +799,8 @@ def _settings_save(c, form):
         "t1_bpc_overbuild = ?, t2_bpc_overbuild = ?, "
         "compressed_minerals_enabled = ?, compressed_moon_enabled = ?, "
         "compressed_gas_enabled = ?, compressed_ore_yield = ?, "
-        "compressed_gas_yield = ?, compressed_reprocess_tax = ? "
+        "compressed_gas_yield = ?, compressed_reprocess_tax = ?, "
+        "hub_price_basis = ?, structure_price_basis = ? "
         "WHERE id = 1",
         (
             margin,
@@ -764,7 +808,9 @@ def _settings_save(c, form):
             max(1.0, _form_number(form, "duration")),
             max(0, int_field("extra_runs")),
             int_field("region"),
-            form["source"],
+            # v1.26: the ESI side the hub refresh pulls follows the hub
+            # basis (buy orders only under Max Buy Order).
+            "buy" if hub_basis == store.PRICE_BASIS_MAX_BUY else "sell",
             max(0, int_field("mfg_slots")),
             max(0, int_field("reaction_slots")),
             min(5, max(0, int_field("skill_industry"))),
@@ -816,6 +862,8 @@ def _settings_save(c, form):
             min(1.0, max(0.0, pct_field("compressed_ore_yield_pct"))),
             min(1.0, max(0.0, pct_field("compressed_gas_yield_pct"))),
             min(0.5, max(0.0, pct_field("compressed_tax_pct"))),
+            hub_basis,
+            structure_basis,
         ),
     )
     # Security is chosen as a band (high/low/null) and stored as a
@@ -2746,6 +2794,30 @@ def create_app() -> Flask:
                 c, settings_.price_region_id, type_ids, settings_.price_source
             ).items()
         }
+        # v1.26: the structure market's quote per type at ITS basis —
+        # the synthetic rung a 'min_sell' / 'max_buy' structure basis
+        # stands in with (empty when the structure comparison is off).
+        structure_prices = (
+            market.cached_structure_quotes(
+                c, settings_.structure_market(), type_ids,
+                settings_.structure_price_basis,
+            )
+            if settings_.structure_buy_enabled
+            else {}
+        )
+        if (
+            settings_.structure_buy_enabled
+            and settings_.structure_price_basis == store.PRICE_BASIS_MAX_BUY
+            and not structure_prices
+        ):
+            # The buy side of the structure book is cached only by a
+            # structure refresh made since the basis existed: say so
+            # rather than let the venue vanish from the plan silently.
+            flash(
+                f"{settings_.structure_market_label()} has no cached buy "
+                "orders yet — refresh the structure market for the Max Buy "
+                "Order basis; this plan priced nothing there"
+            )
         snapshot = engine.snapshot_from_state(
             c,
             prices=prices,
@@ -2755,6 +2827,7 @@ def create_app() -> Flask:
             structure_units_cheaper=structure_units_cheaper,
             sell_ladders=sell_ladders,
             hub_prices=hub_prices,
+            structure_prices=structure_prices,
         )
         if snapshot is None:
             flash("no ESI data yet — run an ESI update first")
@@ -2944,13 +3017,8 @@ def create_app() -> Flask:
         ).fetchall()
         settings_ = store.get_settings(c)
         bc = _buy_context(items, ref())
-        unmet = [
-            i
-            for i in items
-            if i["capacity_limited"]
-            and (i["recommended_buy_qty"] or 0) == 0
-            and (i["deficit_qty"] or 0) > 0
-        ]
+        unmet = [i for i in items if _unmet_row(i)]
+        unmet_qty = {i["type_id"]: _unmet_qty(i) for i in unmet}
         builds_reaction = [
             i
             for i in items

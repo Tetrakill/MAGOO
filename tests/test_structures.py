@@ -419,7 +419,7 @@ def test_run_chain_template_renders_structure_components_section(ref):
     assert "1 item, 1 slot, <span" in html  # the Structure Components group
     assert "raw input — bought just-in-time: 4" in html  # Tritanium tooltip
     assert ">+buy</span>" in html and "4 of the deficit is bought" in html
-    assert ">+unmet</span>" in html and "only 5 of the 8 deficit is planned" in html
+    assert ">+unmet</span>" in html and "cover only 5 of the 8 deficit" in html
     assert ">unmet</span>" in html
     assert "no purchase fallback (pipeline finals are never bought" in html
     assert "Unmet" in html and ">2</span>" in html  # header stat

@@ -242,6 +242,11 @@ def _fallback_price(
     return region_wide, 0
 
 
+# v1.26: the volume of a synthetic one-rung ladder standing in for a
+# market priced at its best order for any quantity.
+_UNBOUNDED_RUNG = 10**15
+
+
 def cached_prices(conn, region_id: int, type_ids, source: str) -> dict[int, float]:
     """{type_id: price} straight from the cache, ANY age. The planning path —
     never touches the network."""
@@ -492,21 +497,25 @@ def sell_ladders(conn, settings, type_ids) -> dict[str, dict[int, list]]:
     when the structure buy comparison is on (they arrive with every
     structure refresh). Cache-only.
 
-    Both EMPTY when settings.price_source is not 'sell' (review
-    2026-09-05, P0): no hub SELL ladder is ever pulled for the buy side,
-    and handing the pass the structure ladders alone would let a dearer
-    C-J6 book fill-price a buy the Jita quote already covers — the pass
-    must leave every Phase 1 quote alone instead."""
+    v1.26: a venue's ladder is handed over only when its pricing basis
+    is 'ladder' (settings.walks_ladder). Under 'min_sell' / 'max_buy'
+    the venue is priced at its best order for any quantity — the engine
+    then stands in one unbounded synthetic rung at that quote (so a
+    dearer structure book can never fill-price a buy the Jita quote
+    covers: review 2026-09-05, P0). No hub SELL ladder is pulled for
+    the buy side, so a 'ladder' hub basis needs price_source 'sell'."""
     type_ids = list(type_ids)
-    if settings.price_source != "sell":
-        return {store.BUY_VENUE_HUB: {}, store.BUY_VENUE_STRUCTURE: {}}
-    ladders = {
-        store.BUY_VENUE_HUB: cached_hub_ladders(
+    ladders = {store.BUY_VENUE_HUB: {}, store.BUY_VENUE_STRUCTURE: {}}
+    if (
+        settings.walks_ladder(store.BUY_VENUE_HUB)
+        and settings.price_source == "sell"
+    ):
+        ladders[store.BUY_VENUE_HUB] = cached_hub_ladders(
             conn, settings.price_region_id, type_ids
-        ),
-        store.BUY_VENUE_STRUCTURE: {},
-    }
-    if settings.structure_buy_enabled:
+        )
+    if settings.structure_buy_enabled and settings.walks_ladder(
+        store.BUY_VENUE_STRUCTURE
+    ):
         ladders[store.BUY_VENUE_STRUCTURE] = cached_structure_ladders(
             conn, settings.structure_market(), type_ids
         )
@@ -517,6 +526,50 @@ compressed_ladders = sell_ladders  # v1.25 name, kept for callers
 
 
 STRUCTURE_SOURCE = "structure"
+# v1.26: the structure market's best BUY order per wanted type, from the
+# same book pull, for the 'max_buy' basis.
+STRUCTURE_BUY_SOURCE = "structure_buy"
+
+
+def _max_buy_by_type(orders, wanted: set[int]) -> dict[int, float]:
+    """Highest buy order with volume left per wanted type from a
+    structure order dump (v1.26, the 'max_buy' basis)."""
+    best: dict[int, float] = {}
+    for order in orders:
+        if not order.get("is_buy_order"):
+            continue
+        type_id = order["type_id"]
+        if type_id not in wanted or int(order.get("volume_remain") or 0) <= 0:
+            continue
+        price = order["price"]
+        if type_id not in best or price > best[type_id]:
+            best[type_id] = price
+    return best
+
+
+def cached_structure_quotes(
+    conn, structure_id: int, type_ids, basis: str
+) -> dict[int, float]:
+    """{type_id: price} the structure market quotes at its basis
+    (v1.26): the best BUY order under 'max_buy', else the cheapest sell
+    order. Cache-only; types with no such order are absent."""
+    source = (
+        STRUCTURE_BUY_SOURCE
+        if basis == store.PRICE_BASIS_MAX_BUY
+        else STRUCTURE_SOURCE
+    )
+    wanted = set(type_ids)
+    if not wanted:
+        return {}
+    return {
+        row["type_id"]: row["price"]
+        for row in conn.execute(
+            "SELECT type_id, price FROM market_price "
+            "WHERE region_id = ? AND source = ? AND price IS NOT NULL",
+            (structure_id, source),
+        )
+        if row["type_id"] in wanted
+    }
 
 
 def _sell_ladders(
@@ -572,16 +625,24 @@ def refresh_structure_prices(
     wanted = set(type_ids)
     ladders = _sell_ladders(orders, wanted)
     best = {t: ladder[0][0] for t, ladder in ladders.items()}
+    best_buy = _max_buy_by_type(orders, wanted)
     now_iso = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "DELETE FROM market_price WHERE region_id = ? AND source = ?",
-        (structure_id, STRUCTURE_SOURCE),
-    )
+    for source in (STRUCTURE_SOURCE, STRUCTURE_BUY_SOURCE):
+        conn.execute(
+            "DELETE FROM market_price WHERE region_id = ? AND source = ?",
+            (structure_id, source),
+        )
     conn.executemany(
         "INSERT OR REPLACE INTO market_price "
         "(type_id, region_id, source, price, fetched_at) VALUES (?, ?, ?, ?, ?)",
         [
             (type_id, structure_id, STRUCTURE_SOURCE, best.get(type_id), now_iso)
+            for type_id in wanted
+        ]
+        + [
+            # v1.26: the best buy order too (the 'max_buy' basis);
+            # a type nobody bids on is cached as NULL like a sell.
+            (type_id, structure_id, STRUCTURE_BUY_SOURCE, best_buy.get(type_id), now_iso)
             for type_id in wanted
         ],
     )
@@ -659,9 +720,21 @@ def buy_quotes(
         t for t in type_ids
         if settings.structure_buy_enabled and t not in exclude
     ]
-    ladders = cached_structure_ladders(
-        conn, settings.structure_market(), compare
-    )
+    if settings.walks_ladder(store.BUY_VENUE_STRUCTURE):
+        ladders = cached_structure_ladders(
+            conn, settings.structure_market(), compare
+        )
+    else:
+        # v1.26: a 'min_sell' / 'max_buy' structure basis quotes its
+        # best order for ANY quantity — one unbounded rung, so the
+        # chooser's depth figure is moot (nulled below).
+        ladders = {
+            t: [(price, _UNBOUNDED_RUNG, 1)]
+            for t, price in cached_structure_quotes(
+                conn, settings.structure_market(), compare,
+                settings.structure_price_basis,
+            ).items()
+        }
     hub_rate = settings.freight_in_rate(store.BUY_VENUE_HUB)
     structure_rate = settings.freight_in_rate(store.BUY_VENUE_STRUCTURE)
     quotes: dict[int, costing.BuyQuote] = {}
@@ -676,7 +749,12 @@ def buy_quotes(
             hub_price, ladder, volume, hub_rate, structure_rate
         )
         quotes[type_id] = costing.BuyQuote(
-            quote.price, quote.venue, quote.units_cheaper,
+            quote.price, quote.venue,
+            (
+                quote.units_cheaper
+                if settings.walks_ladder(store.BUY_VENUE_STRUCTURE)
+                else None
+            ),
             region_wide=hub_region_wide and quote.venue == store.BUY_VENUE_HUB,
         )
     return quotes

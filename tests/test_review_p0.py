@@ -71,7 +71,10 @@ def test_structure_only_ladder_keeps_the_cheaper_hub_quote(conn, ref):
 
 
 # P0-3b — with price_source = 'buy' no hub sell ladder exists at all; the
-# pass must leave the Phase 1 quotes alone rather than fill from C-J6.
+# pass must not fill from a dearer C-J6 book. v1.26: the hub quote stands in
+# as one unbounded synthetic rung, so the walk keeps every unit at Jita's
+# quote (no order count: it is a quote, not a walked book) and the dearer
+# structure ladder never wins a unit.
 def test_buy_price_source_never_fill_prices_from_structure_only(conn, ref):
     conn.execute("UPDATE settings SET price_source = 'buy'")
     conn.commit()
@@ -80,4 +83,7 @@ def test_buy_price_source_never_fill_prices_from_structure_only(conn, ref):
     plan = engine.plan_index_run(conn, ref, _snapshot(ref, ladders), persist=False)
     trit = plan.items[TRITANIUM]
     assert trit.price_snapshot == pytest.approx(10.0)
-    assert trit.hub_buy_qty is None
+    assert trit.buy_venue == HUB
+    assert trit.structure_buy_qty == 0 and trit.unfilled_qty == 0
+    assert trit.hub_buy_qty == trit.recommended_buy_qty
+    assert trit.hub_fill_orders is None  # a quote, not orders walked

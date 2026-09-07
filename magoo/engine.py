@@ -83,6 +83,10 @@ class Snapshot:
     # no hub LADDER is stored, so the merged walk still compares a
     # structure-only ladder against Jita. Empty = no hub quotes known.
     hub_prices: dict[int, float] = field(default_factory=dict)
+    # v1.26: the structure market's quote per type at ITS pricing basis
+    # ({type_id: price}, market.cached_structure_quotes) — the synthetic
+    # rung a 'min_sell' / 'max_buy' structure basis stands in with.
+    structure_prices: dict[int, float] = field(default_factory=dict)
     # Informational (UI: buying power vs. the shopping list) — planning
     # itself does not budget ISK.
     character_isk: float = 0.0
@@ -140,6 +144,13 @@ class PlanItem:
     # in the figure, understating chain cost) — surfaced as a UI badge.
     savings_unpriced_inputs: int = 0
     capacity_limited: bool = False
+    # v1.26 fill-aware build-vs-buy: units of a buildable item the
+    # market beat the build cost on (bought; the rest is built) and the
+    # units dearer rungs could still supply — the only purchase
+    # fallback a capacity shortfall may take (None: no ladder known,
+    # the single-quote rule stands).
+    market_buy_qty: int = 0
+    market_fallback_qty: int | None = None
     low_stock: bool = False
     price_snapshot: float | None = None
     # v1.9: price_snapshot came from a region-wide fallback quote
@@ -539,6 +550,38 @@ def _skill_levels(settings) -> industry.SkillLevels:
     return settings.skill_levels()
 
 
+def _runs_for_units(ref, item: PlanItem, units: int) -> int:
+    """Whole runs for `units` of an item. Sub-capital ships build whole
+    blueprint copies: when runs-per-BPC is set (pasted, or materialised
+    from the invention choice) it is the batch unit — never a partial
+    BPC; capacity gets the final word in Phase 7. With no runs-per-BPC
+    the final builds its exact quantity (the global ship batch multiple
+    was removed 2026-09-05: every invention pipeline overrode it, and a
+    BPO-built hull has no copy to fill). Capitals, freighters, and jump
+    freighters are exempt — they build in exact quantities.
+
+    Review 2026-09-05 (finding A8, coordinator ruling): the whole-copy
+    rounding stands whatever the window. In game a copy keeps its unused
+    runs, so parallel jobs on separate copies leave reusable runs for
+    the next cycle rather than wasting copies; the runs per job stay
+    capped by the window, the 30-day rule and the copy itself (a job
+    never installs more runs than its copy holds). The T3 whole-copies
+    contract (a 20-run Intact-relic hull builds in whole 20-hull batches)
+    depends on this. v1.26: the fill-aware build-vs-buy split re-sizes
+    the built part through the same rule."""
+    runs = math.ceil(max(0, units) / item.portion_size)
+    info = ref.type_info(item.type_id)
+    if (
+        info.category_id == config.CATEGORY_SHIP
+        and info.group_id not in config.EXACT_QTY_SHIP_GROUPS
+        and item.bpc_runs_limit
+        and item.bpc_runs_limit > 1
+    ):
+        multiple = item.bpc_runs_limit
+        runs = math.ceil(runs / multiple) * multiple
+    return runs
+
+
 def _size_jobs(conn, ref, merged: dict[int, PlanItem]):
     settings = store.get_settings(conn)
     class_settings = store.get_class_settings(conn)
@@ -593,37 +636,7 @@ def _size_jobs(conn, ref, merged: dict[int, PlanItem]):
             item.max_runs_per_job = min(
                 item.max_runs_per_job, item.bpc_runs_limit
             )
-        item.total_runs_needed = math.ceil(
-            item.deficit_qty / item.portion_size
-        )
-        # Sub-capital ships build whole blueprint copies: when runs-per-BPC
-        # is set (pasted, or materialised from the invention choice) it is
-        # the batch unit — never a partial BPC; capacity gets the final
-        # word in Phase 7. With no runs-per-BPC the final builds its exact
-        # quantity (the global ship batch multiple was removed 2026-09-05:
-        # every invention pipeline overrode it, and a BPO-built hull has no
-        # copy to fill). Capitals, freighters, and jump freighters are
-        # exempt — they build in exact quantities.
-        #
-        # Review 2026-09-05 (finding A8, coordinator ruling): the
-        # whole-copy rounding stands whatever the window. In game a copy
-        # keeps its unused runs, so parallel jobs on separate copies leave
-        # reusable runs for the next cycle rather than wasting copies; the
-        # runs per job stay capped by the window, the 30-day rule and the
-        # copy itself (a job never installs more runs than its copy holds).
-        # The T3 whole-copies contract (a 20-run Intact-relic hull builds
-        # in whole 20-hull batches) depends on this.
-        info = ref.type_info(item.type_id)
-        if (
-            info.category_id == config.CATEGORY_SHIP
-            and info.group_id not in config.EXACT_QTY_SHIP_GROUPS
-            and item.bpc_runs_limit
-            and item.bpc_runs_limit > 1
-        ):
-            multiple = item.bpc_runs_limit
-            item.total_runs_needed = (
-                math.ceil(item.total_runs_needed / multiple) * multiple
-            )
+        item.total_runs_needed = _runs_for_units(ref, item, item.deficit_qty)
         item.jobs_needed_unconstrained = math.ceil(
             item.total_runs_needed / item.max_runs_per_job
         )
@@ -941,8 +954,196 @@ def _build_savings_per_unit(ref, item: PlanItem, chain, buy_cost, snapshot):
     return landed - cost
 
 
+class _LadderLookup:
+    """One item's sell ladders per venue as the engine walks them —
+    shared by the fill-aware build-vs-buy rule (Phase 5, v1.26) and the
+    sourcing pass (Phase 7.5). Per venue: the stored ladder when that
+    market's pricing basis is 'ladder'; otherwise ('min_sell' /
+    'max_buy', v1.26) ONE unbounded synthetic rung at the market's quote
+    (`synthetic` says which). A 'ladder' hub with no stored ladder gets
+    the synthetic rung only beside a structure ladder (finding A2, so a
+    structure book alone can never fill-price a buy the Jita quote
+    covers); with no ladder and no quote anywhere the item keeps its
+    single Phase 1 quote untouched. A ladder with no positive-volume
+    rung counts as absent (finding A11)."""
+
+    def __init__(self, snapshot: Snapshot, settings, ref):
+        self.snapshot, self.settings, self.ref = snapshot, settings, ref
+        self.rates = {
+            venue: settings.freight_in_rate(venue)
+            for venue in (store.BUY_VENUE_HUB, store.BUY_VENUE_STRUCTURE)
+        }
+        self._hub = snapshot.sell_ladders.get(store.BUY_VENUE_HUB, {})
+        self._structure = snapshot.sell_ladders.get(store.BUY_VENUE_STRUCTURE, {})
+        self._synthetic: set[tuple[str, int]] = set()
+        self._memo: dict[int, tuple] = {}
+
+    @staticmethod
+    def _stored(ladder):
+        if any(int(o[1]) > 0 for o in (ladder or ())):
+            return ladder
+        return None
+
+    def _hub_quote(self, type_id: int):
+        price = self.snapshot.hub_prices.get(type_id)
+        if price is None and self.snapshot.venue(type_id) == store.BUY_VENUE_HUB:
+            price = self.snapshot.price(type_id)  # the hub won Phase 1
+        return price
+
+    def _structure_quote(self, type_id: int):
+        price = self.snapshot.structure_prices.get(type_id)
+        if (
+            price is None
+            and self.snapshot.venue(type_id) == store.BUY_VENUE_STRUCTURE
+        ):
+            price = self.snapshot.price(type_id)
+        return price
+
+    def ladders_of(self, type_id: int):
+        if type_id in self._memo:
+            return self._memo[type_id]
+        settings = self.settings
+        hub = structure = None
+        if settings.walks_ladder(store.BUY_VENUE_HUB):
+            hub = self._stored(self._hub.get(type_id))
+        if settings.structure_buy_enabled and settings.walks_ladder(
+            store.BUY_VENUE_STRUCTURE
+        ):
+            structure = self._stored(self._structure.get(type_id))
+        if settings.structure_buy_enabled and not settings.walks_ladder(
+            store.BUY_VENUE_STRUCTURE
+        ):
+            price = self._structure_quote(type_id)
+            if price is not None:
+                structure = [(price, _SYNTHETIC_HUB_DEPTH)]
+                self._synthetic.add((store.BUY_VENUE_STRUCTURE, type_id))
+        if not settings.walks_ladder(store.BUY_VENUE_HUB) or (
+            hub is None and structure is not None
+        ):
+            price = self._hub_quote(type_id)
+            if price is not None:
+                hub = [(price, _SYNTHETIC_HUB_DEPTH)]
+                self._synthetic.add((store.BUY_VENUE_HUB, type_id))
+        self._memo[type_id] = (hub, structure)
+        return hub, structure
+
+    def venue_ladder(self, venue: str, type_id: int):
+        hub, structure = self.ladders_of(type_id)
+        return structure if venue == store.BUY_VENUE_STRUCTURE else hub
+
+    def synthetic(self, venue: str, type_id: int) -> bool:
+        self.ladders_of(type_id)
+        return (venue, type_id) in self._synthetic
+
+    def has_ladder(self, type_id: int) -> bool:
+        hub, structure = self.ladders_of(type_id)
+        return hub is not None or structure is not None
+
+    def _m3(self, type_id: int) -> float:
+        return self.ref.type_info(type_id).freight_volume
+
+    def direct_fill(self, type_id: int, qty: int) -> costing.DirectFill:
+        hub, structure = self.ladders_of(type_id)
+        return costing.fill_merged(
+            hub, structure, qty, self.rates[store.BUY_VENUE_HUB],
+            self.rates[store.BUY_VENUE_STRUCTURE], self._m3(type_id),
+        )
+
+    def rungs_taken(self, type_id: int, qty: int):
+        hub, structure = self.ladders_of(type_id)
+        return costing.rungs_taken(
+            hub, structure, qty, self.rates[store.BUY_VENUE_HUB],
+            self.rates[store.BUY_VENUE_STRUCTURE], self._m3(type_id),
+        )
+
+
+def _resize_build(ref, item: PlanItem, units: int) -> None:
+    """Re-size an item's jobs to `units` (the part of its cycle quantity
+    the market did not beat), the same rounding _size_jobs used."""
+    item.total_runs_needed = _runs_for_units(ref, item, units)
+    item.jobs_needed_unconstrained = math.ceil(
+        item.total_runs_needed / item.max_runs_per_job
+    )
+
+
+def _saturating_reaction(ref, item: PlanItem) -> bool:
+    """A reaction whose every job runs the full window (composites and
+    the like): its output is a whole-job multiple, not the deficit."""
+    return (
+        item.activity_id == config.ACTIVITY_REACTION
+        and ref.type_info(item.type_id).group_id
+        not in config.NON_SATURATING_REACTION_GROUPS
+    )
+
+
+def _market_split(ref, item: PlanItem, ladders: _LadderLookup) -> None:
+    """Fill-aware build-vs-buy (v1.26, 2026-09-06). Walk the item's
+    merged sell ladders for its whole cycle quantity: every unit whose
+    landed rung price is at or below the vertically-integrated build
+    cost is BOUGHT (market_buy_qty), the rest — dearer rungs and units
+    no market holds — is BUILT, the jobs re-sized to that part. The
+    dearer rungs are the only purchase fallback a capacity shortfall
+    may take (market_fallback_qty); a shortfall beyond them is unmet.
+    build_savings_per_unit becomes the built units' saving against
+    those dearer rungs (the MILP weight), None when nothing dearer
+    exists (no fallback: allocated ahead of priced contenders, like an
+    unpriced item). Every unit cheaper on the market: the figure goes
+    non-positive and Phase 7 buys the lot, as the 2026-08-20 rule
+    always did — now judged at the fill over the quantity, not the
+    best single order. No rung anywhere (no ladder, no quote): the
+    single-quote figure stands untouched.
+
+    A SATURATING reaction runs the full window per job whatever the
+    deficit, so its built output is a whole-job multiple: only the units
+    those jobs leave uncovered are worth buying (verifier counterexample
+    2026-09-06 — Crystallite Alloy bought 200 cheap units on top of jobs
+    that already overshot the need). Two documented edges: the fallback
+    counts dearer rungs at the split's own take, so a rung whose
+    min_volume exceeds a later capacity shortfall lands unsourced in the
+    sourcing pass (badged shallow); and units past a Jita ladder
+    truncated at the pull cap count as 'no market' here, though the
+    sourcing pass (ruling R5) would price a remainder there."""
+    units = item.total_runs_needed * item.portion_size
+    chain_cost = item.unit_chain_cost
+    if units <= 0 or chain_cost is None:
+        return
+    taken = ladders.rungs_taken(item.type_id, units)
+    if not taken:
+        return
+    cheaper = dearer = 0
+    cheaper_cost = dearer_cost = 0.0
+    for landed, _price, take, _venue in taken:
+        if landed <= chain_cost:
+            cheaper += take
+            cheaper_cost += take * landed
+        else:
+            dearer += take
+            dearer_cost += take * landed
+    if cheaper >= units:
+        item.build_savings_per_unit = cheaper_cost / units - chain_cost
+        return
+    if cheaper > 0 and _saturating_reaction(ref, item):
+        # Whole-window jobs: buy only what the jobs sized for the rest
+        # leave uncovered, never units their overshoot already makes.
+        runs = _runs_for_units(ref, item, units - cheaper)
+        jobs = math.ceil(runs / item.max_runs_per_job)
+        output = jobs * item.max_runs_per_job * item.portion_size
+        cheaper = min(cheaper, max(0, units - output))
+    item.market_fallback_qty = dearer
+    if cheaper > 0:
+        item.market_buy_qty = cheaper
+        _resize_build(ref, item, units - cheaper)
+    item.build_savings_per_unit = (
+        dearer_cost / dearer - chain_cost if dearer else None
+    )
+
+
 def _allocate_slots(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     chain, buy_cost = _chain_coster(conn, ref, snapshot)
+    ladders = _LadderLookup(snapshot, store.get_settings(conn), ref)
+    finals = {
+        p["final_product_type_id"] for p in store.active_pipelines(conn)
+    }
 
     for activity_id in (config.ACTIVITY_MANUFACTURING, config.ACTIVITY_REACTION):
         contenders = [
@@ -958,6 +1159,11 @@ def _allocate_slots(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
             item.build_savings_per_unit = _build_savings_per_unit(
                 ref, item, chain, buy_cost, snapshot
             )
+            # v1.26: judge the buy side at its fill over the cycle
+            # quantity, unit by unit, and split the item where the
+            # market beats the build cost on part of it only.
+            if item.type_id not in finals and item.build_savings_per_unit is not None:
+                _market_split(ref, item, ladders)
 
         # Building above the LANDED market price wastes ISK regardless of
         # slot pressure (decision 2026-08-20; landed since 2026-08-23):
@@ -968,9 +1174,6 @@ def _allocate_slots(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         # Pipeline FINALS are exempt (2026-08-21): they are built to SELL,
         # so "buy your own product" is never actionable advice; their
         # negative paper margin is surfaced as a badge, not a buy order.
-        finals = {
-            p["final_product_type_id"] for p in store.active_pipelines(conn)
-        }
         contenders = [
             i
             for i in contenders
@@ -1393,10 +1596,21 @@ def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
                 snapshot.price(item.type_id) is not None
                 and item.type_id not in final_products
             ):
-                item.recommended_buy_qty = shortfall_qty
-                item.recommended_action = (
-                    "both" if item.recommended_build_qty > 0 else "buy"
-                )
+                buyable = shortfall_qty
+                if not market_preferred and item.market_fallback_qty is not None:
+                    # v1.26: a capacity shortfall can only be bought
+                    # from rungs the market actually holds (the ones
+                    # dearer than building); beyond them it is unmet.
+                    buyable = min(shortfall_qty, item.market_fallback_qty)
+                if buyable > 0:
+                    item.recommended_buy_qty = buyable
+        if item.market_buy_qty > 0:
+            # v1.26: the units the market beat the build cost on.
+            item.recommended_buy_qty += item.market_buy_qty
+        if item.recommended_buy_qty > 0:
+            item.recommended_action = (
+                "both" if item.recommended_build_qty > 0 else "buy"
+            )
 
     # What this cycle's ALLOCATED jobs will actually consume, per material.
     consumption = _planned_consumption(conn, ref, merged)
@@ -1532,64 +1746,19 @@ def _sourcing_pass(
     Hangar compressed stock is ignored. Returns the landed ISK the
     compressed buys saved, None when none stood."""
     settings = store.get_settings(conn)
-    if settings.price_source != "sell":
-        # Contract C6 (2026-09-05): the buy side prices from buy orders,
-        # so no sell ladder describes it — market.sell_ladders hands back
-        # empty ladders, and a caller-built snapshot gets the same
-        # treatment here. Every Phase 1 quote stands.
-        return None
-    rates = {
-        venue: settings.freight_in_rate(venue)
-        for venue in (store.BUY_VENUE_HUB, store.BUY_VENUE_STRUCTURE)
-    }
-    hub_ladders = snapshot.sell_ladders.get(store.BUY_VENUE_HUB, {})
-    structure_ladders = snapshot.sell_ladders.get(store.BUY_VENUE_STRUCTURE, {})
+    # v1.26: per-venue ladders through the shared lookup — a 'min_sell'
+    # / 'max_buy' venue is one unbounded synthetic rung at its quote, so
+    # the walk below prices it at the best order for any quantity (the
+    # 2026-09-05 C6 guard is subsumed: a buy-side hub has no ladder,
+    # only its quote, and a structure ladder can never undercut it
+    # unless it really is cheaper landed).
+    ladders = _LadderLookup(snapshot, settings, ref)
+    rates = ladders.rates
     finals = {p["final_product_type_id"] for p in store.active_pipelines(conn)}
 
-    def stored(ladder):
-        """The ladder as stored when at least one rung has volume, else
-        None (finding A11: an all-zero-volume ladder counted as present
-        here while merged_rungs dropped every rung, nulling
-        price_snapshot). The rows pass through untouched — (price,
-        volume) or, since the min_volume column (contract C3), (price,
-        volume, min_volume) — and the list itself is kept whole so
-        costing.fill_merged's truncated-book test (len ==
-        config.HUB_LADDER_MAX_RUNGS, ruling R5) sees the stored depth."""
-        if any(int(o[1]) > 0 for o in (ladder or ())):
-            return ladder
-        return None
-
-    # Every bought item with at least one ladder: fill-priced. Items with
-    # no ladder anywhere keep their single quote (pre-ladder cache).
-    def ladders_of(type_id: int):
-        hub = stored(hub_ladders.get(type_id))
-        structure = stored(structure_ladders.get(type_id))
-        if hub is None and structure is not None:
-            # Finding A2: no hub LADDER stored (the type was never a
-            # ladder pull, or the structure won Phase 1) but a hub quote
-            # is cached — one synthetic unbounded rung at that quote
-            # keeps Jita in the merged walk, so structure rungs are taken
-            # only while they beat it landed. Never for a type with no
-            # hub quote at all: the structure ladder is then the only
-            # market known, and the fill takes it as before.
-            hub_price = snapshot.hub_prices.get(type_id)
-            if hub_price is None and snapshot.venue(type_id) == store.BUY_VENUE_HUB:
-                # The hub won Phase 1: `prices` IS the hub quote.
-                hub_price = snapshot.price(type_id)
-            if hub_price is not None:
-                hub = [(hub_price, _SYNTHETIC_HUB_DEPTH)]
-        return hub, structure
-
-    def has_ladder(type_id: int) -> bool:
-        hub, structure = ladders_of(type_id)
-        return hub is not None or structure is not None
-
-    def direct_fill(type_id: int, qty: int) -> costing.DirectFill:
-        hub, structure = ladders_of(type_id)
-        return costing.fill_merged(
-            hub, structure, qty, rates[store.BUY_VENUE_HUB],
-            rates[store.BUY_VENUE_STRUCTURE], ref.type_info(type_id).freight_volume,
-        )
+    ladders_of = ladders.ladders_of
+    has_ladder = ladders.has_ladder
+    direct_fill = ladders.direct_fill
 
     bought = {
         item.type_id: item.recommended_buy_qty
@@ -1716,7 +1885,7 @@ def _sourcing_pass(
             cap = max(_ceil(demand[r] / a) for r, a in coeff[c].items())
             m3 = ref.type_info(c).freight_volume
             for venue, rate in rates.items():
-                ladder = stored(snapshot.sell_ladders.get(venue, {}).get(c))
+                ladder = ladders.venue_ladder(venue, c)
                 if not ladder:
                     continue
                 taken = 0
@@ -1787,7 +1956,7 @@ def _sourcing_pass(
                     continue
                 source = sources[c]
                 venue = max(by_venue, key=by_venue.get)
-                ladder = snapshot.sell_ladders[venue][c]
+                ladder = ladders.venue_ladder(venue, c)
                 portion = source.portion_size
                 batches = _ceil(total / portion)
                 # Ruling R6 (2026-09-05): what the LP WANTED, in whole
@@ -1822,7 +1991,12 @@ def _sourcing_pass(
                     },
                     # The true ladder depth (rows may carry a third
                     # min_volume element since contract C3).
-                    "ladder_units": sum(int(o[1]) for o in ladder),
+                    # None for a synthetic rung (v1.26 'min_sell' /
+                    # 'max_buy' basis: the book's depth is not known).
+                    "ladder_units": (
+                        None if ladders.synthetic(venue, c)
+                        else sum(int(o[1]) for o in ladder)
+                    ),
                 }
 
             # Allocate coverage cheapest-first; drop the worst offender of
@@ -1928,7 +2102,10 @@ def _sourcing_pass(
                 ),
                 compressed_ladder_units=pick["ladder_units"],
                 compressed_wanted_qty=pick["wanted_qty"],
-                compressed_fill_orders=pick["fill"].orders,
+                compressed_fill_orders=(
+                    None if ladders.synthetic(pick["venue"], c)
+                    else pick["fill"].orders
+                ),
             )
 
     # --- fill-price every direct buy ---------------------------------------
@@ -1958,12 +2135,20 @@ def _sourcing_pass(
             unfilled = 0
         item.hub_buy_qty = hub_qty
         item.hub_fill_price = hub_cost / hub_qty if hub_qty else None
-        item.hub_fill_orders = fill.hub_orders
+        # v1.26: a synthetic rung is the market's best order for any
+        # quantity, not a count of orders walked.
+        item.hub_fill_orders = (
+            None if ladders.synthetic(store.BUY_VENUE_HUB, type_id)
+            else fill.hub_orders
+        )
         item.structure_buy_qty = structure_qty
         item.structure_fill_price = (
             structure_cost / structure_qty if structure_qty else None
         )
-        item.structure_fill_orders = fill.structure_orders
+        item.structure_fill_orders = (
+            None if ladders.synthetic(store.BUY_VENUE_STRUCTURE, type_id)
+            else fill.structure_orders
+        )
         item.unfilled_qty = unfilled
         item.unfilled_price = fill.marginal_price if unfilled else None
         if fill.raw_average is not None:
@@ -2403,7 +2588,7 @@ def _multi_cycle_overhang(job_ends: list, horizon: datetime) -> int:
 def snapshot_from_state(
     conn, prices=None, adjusted=None, region_wide=None,
     buy_venue=None, structure_units_cheaper=None, sell_ladders=None,
-    hub_prices=None,
+    hub_prices=None, structure_prices=None,
 ) -> Snapshot | None:
     """Build a Snapshot from the last persisted ESI pull plus the manual
     slot settings. Returns None if ESI has never been refreshed.
@@ -2452,6 +2637,8 @@ def snapshot_from_state(
         structure_units_cheaper=dict(structure_units_cheaper or {}),
         sell_ladders=dict(sell_ladders or {}),
         hub_prices=dict(hub_prices or {}),
+        # v1.26: the structure market's quote per type at its basis.
+        structure_prices=dict(structure_prices or {}),
         character_isk=state["character_isk"],
         corporation_isk=state["corporation_isk"],
     )
@@ -2592,6 +2779,8 @@ def plan_index_run(
             item.recommended_buy_qty = 0
             item.recommended_action = None
             item.capacity_limited = False
+            item.market_buy_qty = 0
+            item.market_fallback_qty = None
             item.low_stock = False
             item.alchemy_output_qty = 0
             # The alchemy comparison is re-derived each pass too (a route
@@ -2642,15 +2831,18 @@ def plan_index_run(
             "INSERT INTO index_run (run_number, planned_start, status, "
             "wallet_character_isk, wallet_corporation_isk, "
             "compressed_saving_isk, freight_in_isk_per_m3, "
-            "structure_freight_in_isk_per_m3) "
+            "structure_freight_in_isk_per_m3, hub_price_basis, "
+            "structure_price_basis) "
             "SELECT COALESCE(MAX(run_number), 0) + 1, datetime('now'), "
-            "'planned', ?, ?, ?, ?, ? FROM index_run",
+            "'planned', ?, ?, ?, ?, ?, ?, ? FROM index_run",
             (
                 snapshot.character_isk,
                 snapshot.corporation_isk,
                 compressed_saving,
                 settings_.freight_in_isk_per_m3,
                 settings_.structure_freight_in_isk_per_m3,
+                settings_.hub_price_basis,
+                settings_.structure_price_basis,
             ),
         )
         index_run_id = cur.lastrowid
@@ -2682,9 +2874,10 @@ def plan_index_run(
                     effective_unit_cost, hub_buy_qty, hub_fill_price,
                     hub_fill_orders, structure_buy_qty, structure_fill_price,
                     structure_fill_orders, unfilled_qty, unfilled_price,
-                    compressed_wanted_qty
+                    compressed_wanted_qty, market_buy_qty, market_fallback_qty
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                          ?,?)
                 """,
                 (
                     index_run_id,
@@ -2741,6 +2934,8 @@ def plan_index_run(
                     item.unfilled_qty,
                     item.unfilled_price,
                     item.compressed_wanted_qty,
+                    item.market_buy_qty,
+                    item.market_fallback_qty,
                 ),
             )
             item_id = cur.lastrowid

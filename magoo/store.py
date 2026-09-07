@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -608,6 +608,28 @@ _MIGRATIONS = (
     # Landed ISK the compressed pass saved vs buying every covered raw
     # direct, at plan time (informational, the run page's strip badge).
     "ALTER TABLE index_run ADD COLUMN compressed_saving_isk REAL",
+    # Schema 8 (v1.26, 2026-09-06): one pricing BASIS per market —
+    # 'max_buy' (the best buy order, any quantity), 'min_sell' (the
+    # cheapest sell order, any quantity) or 'ladder' (walk the sell
+    # book for the quantity bought). The hub basis replaces the old
+    # Price Source select: price_source stays as the ESI side the
+    # refresh pulls, derived from it ('buy' only for max_buy).
+    "ALTER TABLE settings ADD COLUMN hub_price_basis "
+    "TEXT NOT NULL DEFAULT 'ladder'",
+    "ALTER TABLE settings ADD COLUMN structure_price_basis "
+    "TEXT NOT NULL DEFAULT 'ladder'",
+    "UPDATE settings SET hub_price_basis = 'max_buy' "
+    "WHERE price_source = 'buy' AND hub_price_basis = 'ladder'",
+    # Fill-aware build-vs-buy (v1.26): the units of a buildable item
+    # the market beat the build cost on (bought; the rest is built)
+    # and the units dearer rungs could still supply (the only
+    # purchase fallback a capacity shortfall may take).
+    "ALTER TABLE index_run_item ADD COLUMN market_buy_qty "
+    "INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE index_run_item ADD COLUMN market_fallback_qty INTEGER",
+    # The bases a run was planned under (vintage for the run pages).
+    "ALTER TABLE index_run ADD COLUMN hub_price_basis TEXT",
+    "ALTER TABLE index_run ADD COLUMN structure_price_basis TEXT",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -1051,6 +1073,8 @@ class Settings:
     max_run_duration_hours: float
     composite_reaction_extra_runs: int
     price_region_id: int
+    # The ESI order side the hub refresh pulls and caches ('sell' /
+    # 'buy'); since v1.26 derived from hub_price_basis on save.
     price_source: str
     manufacturing_slots: int = 10
     reaction_slots: int = 10
@@ -1111,6 +1135,12 @@ class Settings:
     compressed_ore_yield: float = 0.9063
     compressed_gas_yield: float = 0.95
     compressed_reprocess_tax: float = 0.04  # of output value; ore refining only
+    # v1.26: pricing basis per market (PRICE_BASES). 'ladder' walks the
+    # sell book for the quantity bought (fill pricing, the fill-aware
+    # build-vs-buy rule); 'min_sell' / 'max_buy' price any quantity at
+    # the best order — the market is then a single unbounded rung.
+    hub_price_basis: str = "ladder"
+    structure_price_basis: str = "ladder"
 
     def compressed_groups(self) -> frozenset[int]:
         """The raw groups compressed sourcing may cover — one toggle each
@@ -1147,6 +1177,16 @@ class Settings:
             return "C-J6"
         return f"structure {self.structure_market()}"
 
+    def price_basis(self, venue: str | None) -> str:
+        """The pricing basis of a buy venue (v1.26): the structure's for
+        'structure', the hub's for anything else."""
+        if venue == BUY_VENUE_STRUCTURE:
+            return self.structure_price_basis
+        return self.hub_price_basis
+
+    def walks_ladder(self, venue: str | None) -> bool:
+        return self.price_basis(venue) == PRICE_BASIS_LADDER
+
     def freight_in_rate(self, venue: str | None) -> float:
         """Flat inbound ISK/m³ for a buy venue: 'structure' takes the
         structure leg, anything else (hub, unpriced) the Jita leg."""
@@ -1176,6 +1216,13 @@ BUY_VENUE_STRUCTURE = "structure"
 # v1.25 fill pricing: a buy split across both venues (per-venue units
 # on the index_run_item row).
 BUY_VENUE_SPLIT = "split"
+
+# v1.26: the pricing basis of a market (settings.hub_price_basis /
+# structure_price_basis).
+PRICE_BASIS_MAX_BUY = "max_buy"
+PRICE_BASIS_MIN_SELL = "min_sell"
+PRICE_BASIS_LADDER = "ladder"
+PRICE_BASES = (PRICE_BASIS_MAX_BUY, PRICE_BASIS_MIN_SELL, PRICE_BASIS_LADDER)
 
 
 def get_settings(conn: sqlite3.Connection) -> Settings:

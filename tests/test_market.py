@@ -390,7 +390,25 @@ def test_sell_ladders_are_empty_for_a_buy_price_source(conn):
         store.BUY_VENUE_HUB: {34: [(9.0, 10, 1)]},
         store.BUY_VENUE_STRUCTURE: {34: [(50.0, 100, 2)]},
     }
+    # A buy-side hub has no sell ladder; the structure keeps its own under
+    # its own basis (v1.26 — the engine stands the hub quote in as one
+    # unbounded rung, so the dearer book still cannot win a unit).
     conn.execute("UPDATE settings SET price_source = 'buy'")
+    conn.commit()
+    assert market.sell_ladders(conn, store.get_settings(conn), [34]) == {
+        store.BUY_VENUE_HUB: {}, store.BUY_VENUE_STRUCTURE: {34: [(50.0, 100, 2)]},
+    }
+    # v1.26: a venue priced at its best order for any quantity hands over
+    # no ladder at all — per market.
+    conn.execute(
+        "UPDATE settings SET price_source = 'sell', hub_price_basis = 'ladder', "
+        "structure_price_basis = 'min_sell'"
+    )
+    conn.commit()
+    assert market.sell_ladders(conn, store.get_settings(conn), [34]) == {
+        store.BUY_VENUE_HUB: {34: [(9.0, 10, 1)]}, store.BUY_VENUE_STRUCTURE: {},
+    }
+    conn.execute("UPDATE settings SET hub_price_basis = 'min_sell'")
     conn.commit()
     assert market.sell_ladders(conn, store.get_settings(conn), [34]) == {
         store.BUY_VENUE_HUB: {}, store.BUY_VENUE_STRUCTURE: {},

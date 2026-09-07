@@ -384,6 +384,14 @@ and hover with the teal Hover Wash.
   hex because a data URI cannot read CSS custom properties — keep it in
   sync if the accent is ever retuned.
 - **Grouping:** stacked in `span.tags` inside the trailing table column.
+- **Fill-aware build-vs-buy (v1.26):** an accent `+buy N` badge on a job
+  row means N units of that item are cheaper on the market than building
+  them and sit on the Buy list; the jobs build the rest. The Chain tab's
+  `+buy` badge is accent for that case and warn for a capacity buy, its
+  tooltip naming each part; `+unmet` (bad) means the jobs and the orders
+  the market holds still fall short of the deficit. A price cell whose
+  tooltip says "its best order, any quantity" was priced under the Min
+  Sell / Max Buy basis, not walked.
 - **Compressed sourcing (v1.25):** the accent `compressed` badge marks a
   compressed ore / moon ore / gas bought to be reprocessed (Buy list, Chain,
   the Profit breakdown's blended-cost lines); a covered raw carries a neutral
