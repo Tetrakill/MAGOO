@@ -50,7 +50,6 @@
     <span class="tags">
       {% if buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — the materials total understates">{{ buys_unpriced }} unpriced</span>{% endif %}
       {% if structure_buys %}<span class="badge accent" title="inputs cheaper landed (price + freight-in) at the structure market than at Jita">{{ structure_buys|length }} via {{ settings.structure_market_label() }}</span>{% endif %}
-      {% if shallow %}<span class="badge warn" title="structure-market buys whose sell ladder has fewer units beating the Jita landed price than the cycle buys">{{ shallow|length }} shallow</span>{% endif %}
     </span>
   </div>
   {% endif %}
@@ -88,7 +87,7 @@
     <td class="flags">{% if i.capacity_limited %}<span class="badge warn"
         title="bought because the slot pool can't fit the jobs">capacity</span>{% endif %}
         {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
-        {{ m.shallow_badge(i, plan_time=false) }}
+        {{ m.book_badge(i, plan_time=false) }}
         {% if i.type_id in region_wide %}<span class="badge" title="priced from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
   </tr>
   {% endfor %}

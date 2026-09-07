@@ -111,8 +111,7 @@ def test_stockpile_targets_and_netting(conn, ref):
     ):
         assert buy(data, material_id)["gross"] == with_margin(conn, qty * 6)
         assert buy(data, material_id)["to_buy"] == with_margin(conn, qty * 6)
-        assert buy(data, material_id)["shallow"] is False
-    assert data["buys_shallow"] == 0
+        assert buy(data, material_id)["thin_book"] is False
     assert data["buy_total"] > 0
     assert "Datacore" in data["multibuy_hub"]
 
@@ -254,3 +253,34 @@ def test_web_invention_tab_renders(seeded_client, ref):
     assert "Datacore" in page
     assert "copy job" in page
     c.close()
+
+
+def test_thin_structure_book_splits_the_multibuy_like_the_venue_cell(conn, ref):
+    """UI lane 2026-09-07 (v1.26.1): a datacore bought at the structure
+    market whose ladder beats Jita for only part of the quantity shows
+    'Jita Z · C-J6 X' in the venue cell — Multibuy must list the same
+    split, not the whole buy under the structure (mirrors
+    web._buy_context.venue_split)."""
+    pid = add_pipeline(conn, ref, "Zealot", 2)
+    enable_invention(conn, ref, pid, "Zealot")
+    source = ref.invention_source_for_product(ref.type_id("Zealot"))
+    datacore, _qty = next(
+        iter(ref.materials(source.t1_blueprint_id, config.ACTIVITY_INVENTION))
+    )
+    snap = rich_snapshot(ref)
+    snap.buy_venue[datacore] = store.BUY_VENUE_STRUCTURE
+    snap.structure_units_cheaper[datacore] = 5
+    data = engine.invention_stockpile(conn, ref, snap)
+    row = buy(data, datacore)
+    assert row["venue"] == store.BUY_VENUE_STRUCTURE
+    assert row["to_buy"] > 5
+    assert row["thin_book"] is True
+    name = ref.type_info(datacore).name
+    assert f"{name} 5" in data["multibuy_structure"].splitlines()
+    assert f"{name} {row['to_buy'] - 5}" in data["multibuy_hub"].splitlines()
+    # A ladder deep enough for the whole buy is no split at all.
+    snap.structure_units_cheaper[datacore] = row["to_buy"]
+    data = engine.invention_stockpile(conn, ref, snap)
+    assert buy(data, datacore)["thin_book"] is False
+    assert f"{name} {row['to_buy']}" in data["multibuy_structure"].splitlines()
+    assert name not in data["multibuy_hub"]

@@ -456,7 +456,6 @@ def _ctx(**over):
         buy_total=0.0,
         buys_unpriced=0,
         structure_buys=set(),
-        shallow=set(),
         region_wide=set(),
         builds=[],
         reactions=[],
@@ -521,11 +520,14 @@ def test_template_buy_row_badges(ref):
             buys=[row],
             buy_total=12000.0,
             structure_buys={tid},
-            shallow={tid},
+            split_buys={tid},
+            venue_qty={tid: (7, 5)},
         )
     )
-    assert ">C-J6</span>" in html
-    assert "shallow" in html
+    # v1.26.1: the single-quote structure case is a split in the venue cell.
+    assert ">Jita 7 · C-J6 5</span>" in html
+    assert "holds only 5 of 12 units" in html
+    assert "buy the other 7 at Jita" in html
 
 
 def test_template_capacity_panel_lists_starved_items():

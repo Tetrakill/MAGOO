@@ -500,12 +500,14 @@ def test_buy_context_splits_multibuy_by_venue_quantities(ref):
     )
     legacy = _row("Pyerite", 35, 12, 20.0, venue=STRUCT, structure_units_cheaper=5)
     bc = _buy_context([split, legacy], ref)
-    assert bc["venue_qty"] == {TRITANIUM: (1000, 500), 35: (0, 12)}
-    assert bc["split_buys"] == {TRITANIUM}
+    # v1.26.1: the legacy structure row (5 of 12 cheaper than Jita) is a
+    # split too — the rest goes to Jita in the cell and in Multibuy.
+    assert bc["venue_qty"] == {TRITANIUM: (1000, 500), 35: (7, 5)}
+    assert bc["split_buys"] == {TRITANIUM, 35}
     assert bc["structure_buys"] == {TRITANIUM, 35}
-    assert bc["shallow"] == {TRITANIUM, 35}  # unfilled units; the legacy rule
-    assert bc["multibuy_hub"] == "Tritanium 1000"
-    assert bc["multibuy_structure"] == "Tritanium 500\nPyerite 12"
+    assert bc["unsourced"] == {TRITANIUM}  # unfilled units
+    assert bc["multibuy_hub"] == "Tritanium 1000\nPyerite 7"
+    assert bc["multibuy_structure"] == "Tritanium 500\nPyerite 5"
     assert bc["buy_total"] == pytest.approx(1500 * 9.4 + 12 * 20.0)
 
 
@@ -534,21 +536,21 @@ def test_run_detail_renders_split_venue_fill_tooltip_and_shallow(ref):
         unmet=[], low_stock=[], buy_total=1500 * 9.4, buys_unpriced=0,
         multibuy_hub="Tritanium 1000", multibuy_structure="Tritanium 500",
         structure_buys={TRITANIUM}, split_buys={TRITANIUM},
-        venue_qty={TRITANIUM: (1000, 500)}, shallow={TRITANIUM},
+        venue_qty={TRITANIUM: (1000, 500)}, unsourced={TRITANIUM},
         settings=settings_with(manufacturing_slots=50, reaction_slots=50),
         mfg_slots_used=0, reaction_slots_used=0, alchemy_slots_used=0,
         region_wide=set(), compressed={}, compressed_covered={},
-        compressed_shallow=set(), compressed_section=[], compressed_saving=None,
+        compressed_section=[], compressed_saving=None,
     )
     app = template_app()
     with app.test_request_context("/runs/1"):
         html = render_template("run_detail.html", **ctx)
     assert "Jita 1,000 · C-J6 500" in html
-    assert "1 split" in html and "1 shallow" in html
+    assert "1 split" in html and "1 unsourced" in html
     assert "Jita: 1,000 units at 10 avg over 2 orders" in html
     assert "C-J6: 500 units at 8 avg over 1 order" in html
     assert "200 units beyond the stored ladders" in html
-    assert "only 1,300 of 1,500 units were on the stored Jita / C-J6 sell ladders" in html
+    assert "only 1,300 of 1,500 units were on the stored Jita / C-J6 sell orders" in html
     # Ruling R5: the badge says the remainder is unsourced.
     assert "unsourced" in html
     assert ">Tritanium 1000</textarea>" in html

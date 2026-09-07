@@ -72,21 +72,20 @@
     <span class="label">Low stock</span>
     <span class="value {% if low_stock %}warn{% endif %}" title="won't sustain the next run">{{ low_stock|length }}</span>
   </div>
-  {# Review 2026-09-05: `shallow` joins the gate (a hub-only shallow run
+  {# Review 2026-09-05: the book badges join the gate (a hub-only unsourced run
      used to lose its strip badge), and "N via C-J6" counts rows bought
      ONLY there — split rows have their own badge and were double-counted. #}
   {% set structure_only = structure_buys|length - (split_buys|length if split_buys is defined else 0) %}
-  {% if exceeds or buys_unpriced or structure_buys or compressed or split_buys or shallow %}
+  {% if exceeds or buys_unpriced or structure_buys or compressed or split_buys or unsourced %}
   <div class="stat">
     <span class="label">&nbsp;</span>
     <span class="tags">
       {% if exceeds %}<span class="badge fill bad" title="buy total {{ buy_total|isk }} vs {{ wallets|isk }} in wallets at plan time">exceeds wallets</span>{% endif %}
       {% if buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — total understates">{{ buys_unpriced }} unpriced</span>{% endif %}
       {% if structure_only > 0 %}<span class="badge accent" title="inputs cheaper landed (price + freight-in) at the structure market than at Jita — bought there in full">{{ structure_only }} via {{ settings.structure_market_label() }}</span>{% endif %}
-      {% if split_buys %}<span class="badge accent" title="buys split across Jita and {{ settings.structure_market_label() }} by walking both sell ladders together, cheapest landed rung first — Multibuy lists each market's share">{{ split_buys|length }} split</span>{% endif %}
-      {% if shallow %}<span class="badge warn" title="buys whose stored sell ladders (Jita's 300 cheapest orders, the whole {{ settings.structure_market_label() }} book) held fewer units than the plan buys — the remainder is unsourced: no market held it at plan time, it is priced at the last order walked and belongs to no Multibuy block">{{ shallow|length }} shallow</span>{% endif %}
+      {% if split_buys %}<span class="badge accent" title="buys split across Jita and {{ settings.structure_market_label() }} — by walking both sell ladders together, cheapest landed rung first, or, on rows planned before fill pricing, by how far {{ settings.structure_market_label() }}'s ladder beats the Jita landed price — Multibuy lists each market's share">{{ split_buys|length }} split</span>{% endif %}
+      {% if unsourced %}<span class="badge warn" title="buys whose stored sell orders (Jita's 300 cheapest, the whole {{ settings.structure_market_label() }} book) held fewer units than the plan buys — the remainder has no market at plan time: it is priced at the last order walked and belongs to no Multibuy block (it rides the Jita quantity only when Jita's stored list was cut off at 300 orders, so its real book continues)">{{ unsourced|length }} unsourced</span>{% endif %}
       {% if compressed %}<span class="badge accent" title="compressed ore / moon ore / gas bought and reprocessed instead of {{ compressed_covered|length }} raw type{{ 's' if compressed_covered|length != 1 }} — saves {{ compressed_saving|isk }} ISK landed vs buying those raws direct at plan time (the cheaper market's sell ladder walked to depth — Jita and {{ settings.structure_market_label() }} compete)">{{ compressed|length }} via compressed</span>{% endif %}
-      {% if compressed_shallow %}<span class="badge warn" title="compressed buys the sell ladder could not fill in whole batches for the quantity the plan wanted at plan time — bought smaller; the raws they cover keep a larger direct buy">{{ compressed_shallow|length }} shallow</span>{% endif %}
     </span>
   </div>
   {% endif %}
@@ -139,7 +138,7 @@
         {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
         {{ m.compressed_badge(i) }}
         {{ m.covered_badge(i) }}
-        {{ m.shallow_badge(i) }}
+        {{ m.book_badge(i) }}
         {% if i.type_id in region_wide %}<span class="badge" title="priced at plan time from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
   </tr>
   {% endfor %}
@@ -199,7 +198,7 @@
     <td class="flags"><span class="badge warn">buy</span>
         {% if i.capacity_limited %}<span class="badge warn">capacity</span>{% endif %}
         {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
-        {{ m.shallow_badge(i) }}
+        {{ m.book_badge(i) }}
         {% if i.type_id in region_wide %}<span class="badge" title="priced at plan time from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
   </tr>
   {% endfor %}

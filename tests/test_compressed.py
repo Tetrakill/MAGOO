@@ -13,6 +13,7 @@ example: at the 0.75 ore yield one unit yields 3 Tritanium, so a rung under
 """
 
 import json
+import math
 import sqlite3
 import threading
 
@@ -300,10 +301,11 @@ def test_toggle_off_changes_nothing(conn, ref):
 
 
 def test_short_ladder_records_the_wanted_quantity(conn, ref):
-    """Ruling R6 (2026-09-05): when the venue's ladder holds fewer whole
-    batches than the LP wanted, the engine keeps the wanted whole-batch
-    quantity in compressed_wanted_qty (the web layer's shallow badge)
-    and compressed_ladder_units stays the ladder's true depth."""
+    """A ladder of 250 holds two whole batches. Ruling R6 (2026-09-05)
+    recorded what the LP wanted beside the shrunk buy; since v1.26.1 the
+    pass pins the type at its market's whole-batch depth and re-solves,
+    so the wanted figure equals the buy and compressed_ladder_units stays
+    the ladder's true depth."""
     if not ref.compressed_sources():
         pytest.skip("reference data imported before v1.25")
     _hulk(conn, ref)
@@ -313,8 +315,7 @@ def test_short_ladder_records_the_wanted_quantity(conn, ref):
     ore, = compressed_rows(plan)
     assert ore.recommended_buy_qty == 200  # two whole batches of the 250
     assert ore.compressed_ladder_units == 250
-    assert ore.compressed_wanted_qty % 100 == 0
-    assert ore.compressed_wanted_qty > ore.recommended_buy_qty
+    assert ore.compressed_wanted_qty == ore.recommended_buy_qty == 200
     # A three-element (price, volume, min_volume) ladder row walks the
     # same (contract C3).
     ladders = {HUB: {COMPRESSED_VELDSPAR: [(20.0, 250, 1)]}}
@@ -349,19 +350,29 @@ def test_cheap_ladder_substitutes_whole_batches(conn, ref):
     (material, out, used), = ore.compressed_outputs
     assert material == TRITANIUM
     assert out == ore.recommended_buy_qty // 100 * 300
-    # Whole batches round UP, so the ore covers every unit of demand and
-    # the leftover is the rounding surplus.
+    # Whole batches round UP — since v1.26.1 only when the last, partly
+    # wanted batch (2,000 ISK for 300 Tritanium) costs less than the
+    # direct units its wanted fraction displaces (10 ISK each); otherwise
+    # the type rounds down and those few units stay direct.
+    wanted_units = demand / 3
+    batches = math.ceil(round(wanted_units / 100, 9))
+    frac = wanted_units - (batches - 1) * 100
+    if 100 * 20.0 > frac * 3 * 10.0:
+        batches -= 1
+    assert ore.recommended_buy_qty == batches * 100
+    assert ore.compressed_wanted_qty == ore.recommended_buy_qty
     trit = plan.items[TRITANIUM]
-    assert trit.compressed_covered_qty == demand == used
-    assert out - used < 300
-    assert trit.recommended_buy_qty == 0
-    assert trit.recommended_action is None
+    direct = max(0, demand - out)
+    assert trit.compressed_covered_qty == used == demand - direct
+    assert out - used < 300 and direct < 300
+    assert trit.recommended_buy_qty == direct
+    assert trit.recommended_action == ("buy" if direct else None)
     assert trit.deficit_qty == baseline.items[TRITANIUM].deficit_qty
     # Blended landed cost: the ore's landed fill split over the covered
     # units — about 20 / 3 per Tritanium, always below the direct 10.
     assert 6.0 < trit.effective_unit_cost < 7.5
     assert plan.compressed_saving_isk == pytest.approx(
-        demand * 10.0 - ore.recommended_buy_qty * 20.0
+        (demand - direct) * 10.0 - ore.recommended_buy_qty * 20.0
     )
     assert plan.compressed_saving_isk > 0
     # Nothing else moved: the other raws keep their direct buys.
@@ -444,7 +455,12 @@ def test_reprocessing_tax_is_charged_on_output_value(conn, ref):
     plan = engine.plan_index_run(conn, ref, snapshot(ref, ladders), persist=False)
     ore, = compressed_rows(plan)
     trit = plan.items[TRITANIUM]
-    assert trit.compressed_covered_qty == trit.deficit_qty
+    # The last, partly wanted batch (2,400 ISK with the tax) loses to the
+    # few direct Tritanium its wanted fraction would displace at 10 and is
+    # dropped (v1.26.1), so those units stay direct.
+    assert trit.compressed_covered_qty + trit.recommended_buy_qty == trit.deficit_qty
+    assert trit.recommended_buy_qty < 300
+    assert ore.compressed_wanted_qty == ore.recommended_buy_qty
     assert 8.5 < trit.effective_unit_cost < 9.0  # 6.67 + 2.00, batch-rounded
     assert ore.price_snapshot == pytest.approx(20.0)  # the tax is not a price
     enable_compressed(conn, tax=0.5)
@@ -487,6 +503,46 @@ def test_gas_is_decompressed_untaxed_and_floored_once(conn, ref):
     assert plan.compressed_saving_isk == pytest.approx(
         demand * 10.0 - gas.recommended_buy_qty * 8.0
     )
+
+
+def test_pinned_type_lets_another_ore_cover_the_rest(conn, ref):
+    """v1.26.1: the LP spreads Compressed Veldspar over both markets (each
+    holds 60% of the ore the Tritanium demand needs); the one-market rule
+    pins it to the heavier one, and the re-solve lets Compressed Scordite
+    (dearer per Tritanium than Veldspar once its Pyerite credit is spent,
+    but still under the direct price) cover what the pin gave up — the
+    raw's direct buy used to absorb it."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    _hulk(conn, ref)
+    enable_compressed(conn)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    demand = baseline.items[TRITANIUM].recommended_buy_qty
+    scordite = ref.type_id("Compressed Scordite")
+    # 60% of the Veldspar units the demand needs (3 Tritanium a unit at
+    # the 0.75 yield), in whole batches, on each market.
+    part = -(-int(demand * 0.6 / 3) // 100) * 100
+    ladders = {
+        # Scordite at 11: 9.78 ISK per Tritanium with no Pyerite credit —
+        # dearer than Veldspar (6.67), cheaper than direct (10).
+        HUB: {COMPRESSED_VELDSPAR: [(20.0, part)], scordite: [(11.0, 10**8)]},
+        STRUCT: {COMPRESSED_VELDSPAR: [(19.5, part)]},
+    }
+    plan = engine.plan_index_run(conn, ref, snapshot(ref, ladders), persist=False)
+    rows = {r.type_id: r for r in compressed_rows(plan)}
+    assert set(rows) == {COMPRESSED_VELDSPAR, scordite}
+    veld = rows[COMPRESSED_VELDSPAR]
+    assert veld.buy_venue == STRUCT  # the cheaper market held the larger share
+    assert veld.recommended_buy_qty == part
+    assert veld.compressed_wanted_qty == veld.recommended_buy_qty
+    scord = rows[scordite]
+    assert scord.compressed_wanted_qty == scord.recommended_buy_qty
+    trit = plan.items[TRITANIUM]
+    # Scordite covers what the pin gave up, bar its last, partly wanted
+    # batch, which loses to the few direct units it would displace and is
+    # dropped (v1.26.1) — those stay direct.
+    assert trit.compressed_covered_qty + trit.recommended_buy_qty == demand
+    assert trit.recommended_buy_qty < 300
 
 
 def test_group_toggles_limit_the_candidates(conn, ref):
@@ -666,7 +722,6 @@ def test_buy_context_decodes_compressed_rows(ref):
         COMPRESSED_VELDSPAR: [(TRITANIUM, "Tritanium", 1500, 1200)]
     }
     assert bc["compressed_covered"] == {TRITANIUM: 1200}
-    assert bc["compressed_shallow"] == {COMPRESSED_VELDSPAR}  # wanted 600 > 500 bought
     assert "Compressed Veldspar 500" in bc["multibuy_hub"]
     section = _compressed_section(ref, [ore, trit], bc["compressed"])
     assert section[0]["outputs"] == [
@@ -709,12 +764,11 @@ def test_run_detail_renders_compressed_section_and_badges(ref):
         chain_counts={"covered": 0, "buy": 0, "build": 0, "react": 0, "alchemy": 0},
         unmet=[], low_stock=[], buy_total=500 * 21.0 + 100.0, buys_unpriced=0,
         multibuy_hub="Compressed Veldspar 500\nTritanium 10",
-        multibuy_structure="", structure_buys=set(), shallow=set(),
+        multibuy_structure="", structure_buys=set(), unsourced=set(),
         settings=settings, mfg_slots_used=0, reaction_slots_used=0,
         alchemy_slots_used=0, region_wide=set(),
         compressed={COMPRESSED_VELDSPAR: [(TRITANIUM, "Tritanium", 1500, 1200)]},
         compressed_covered={TRITANIUM: 1200},
-        compressed_shallow={COMPRESSED_VELDSPAR},
         compressed_section=[{
             "item": ore,
             "outputs": [{"name": "Tritanium", "out": 1500, "used": 1200, "leftover": 300}],
@@ -728,8 +782,10 @@ def test_run_detail_renders_compressed_section_and_badges(ref):
     assert ">compressed</span>" in html
     assert "covers 1,200 Tritanium; leftover 300 Tritanium" in html
     assert "1,200 via compressed" in html
-    assert ">shallow</span>" in html
-    assert "the ladder held only 500 of the 600 units the plan wanted" in html
+    # No badge for a shrunk buy any more (v1.26.1); the figure stays in the
+    # compressed badge's tooltip for rows planned before the re-solve.
+    assert "cut short" not in html
+    assert "the plan wanted 600 but the market could fill only 500 in whole batches" in html
     assert "Compressed sourcing" in html
     assert "Reprocess <b>500 Compressed Veldspar</b>" in html
     assert "~1,200 Tritanium" in html and "leftover +300 Tritanium" in html
@@ -806,3 +862,99 @@ def test_run_route_sources_compressed_end_to_end(seeded_client, ref):
     chain = seeded_client.get(f"/runs/{run_id}?view=chain").get_data(as_text=True)
     assert ">compressed</span>" in chain
     c.close()
+
+
+def test_min_volume_order_caps_the_pin_at_what_fills(conn, ref):
+    """Refute lane 2026-09-07: a rung whose minimum volume exceeds the
+    fill's remainder is unfillable there. The LP takes 100 open units and
+    400 of a 500-minimum order; the pin must cap Compressed Veldspar at
+    the 100 the market fills at that quantity (not the ladder's 600-unit
+    whole depth), so the buy equals what the plan wanted and the rest of
+    the Tritanium stays direct."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    _hulk(conn, ref)
+    enable_compressed(conn)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    demand = baseline.items[TRITANIUM].recommended_buy_qty
+    ladders = {
+        HUB: {
+            # Direct Tritanium: all but 1,500 units cheap, the rest at 10.
+            TRITANIUM: [(3.0, demand - 1500, 1), (10.0, 10**9, 1)],
+            # 3.33 ISK per Tritanium — worth it for the 1,500 dear units,
+            # but the second order's minimum is the whole order.
+            COMPRESSED_VELDSPAR: [(10.0, 100, 1), (11.0, 500, 500)],
+        }
+    }
+    plan = engine.plan_index_run(conn, ref, snapshot(ref, ladders), persist=False)
+    ore, = compressed_rows(plan)
+    assert ore.recommended_buy_qty == ore.compressed_wanted_qty == 100
+    assert costing.fill_ladder(ladders[HUB][COMPRESSED_VELDSPAR], 100).units == 100
+    trit = plan.items[TRITANIUM]
+    assert trit.compressed_covered_qty == 300
+    assert trit.recommended_buy_qty == demand - 300
+
+
+def test_a_row_the_market_cannot_fill_is_dropped_not_under_costed(conn, ref):
+    """Refute lane 2026-09-07: the shrink after a short fill is re-checked
+    until the market fills the whole quantity. Three rungs, two with
+    minimum volumes: every whole-batch quantity the LP can want comes up
+    short (the open 50 units are half a batch), so no compressed row may
+    survive with a fill smaller than its own quantity."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    _hulk(conn, ref)
+    enable_compressed(conn)
+    ladders = {
+        HUB: {COMPRESSED_VELDSPAR: [(10.0, 50, 1), (11.0, 120, 100), (12.0, 200, 180)]}
+    }
+    plan = engine.plan_index_run(conn, ref, snapshot(ref, ladders), persist=False)
+    for row in compressed_rows(plan):
+        fill = costing.fill_ladder(ladders[row.buy_venue][row.type_id], row.recommended_buy_qty)
+        assert fill.units == row.recommended_buy_qty
+    assert compressed_rows(plan) == []
+    assert plan.items[TRITANIUM].compressed_covered_qty in (0, None)
+
+
+def test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct(conn, ref):
+    """Refute lane 2026-09-07: the LP's continuous take of a type is rounded
+    UP to whole batches, and a batch bought for a fraction of a unit can
+    cost far more than the direct units that fraction displaces (surplus
+    is worth nothing, decision 2026-09-05). Compressed Veldspar holds all
+    but 339 Spodumain batches' worth of the Tritanium — not in whole
+    batches, so the pin trims it and the re-solve asks Compressed
+    Spodumain for a fraction of a unit more: the 300,000 ISK batch that
+    would buy is dropped and those few Tritanium stay direct."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    _hulk(conn, ref)
+    enable_compressed(conn)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    demand = baseline.items[TRITANIUM].recommended_buy_qty
+    spodumain = ref.type_id("Compressed Spodumain")
+    sources = ref.compressed_sources()
+    a_spod = sources[spodumain].per_unit(TRITANIUM, 0.75)
+    a_veld = sources[COMPRESSED_VELDSPAR].per_unit(TRITANIUM, 0.75)
+    assert (a_spod, a_veld) == (360, 3)
+    batches = 339
+    depth = (demand - a_spod * 100 * batches) // a_veld
+    if depth % 100 == 0:
+        depth -= 10  # keep the Veldspar depth off a whole batch
+    assert depth > 0
+    ladders = {
+        HUB: {
+            COMPRESSED_VELDSPAR: [(20.0, depth, 1)],  # 6.67 ISK per Tritanium
+            spodumain: [(3000.0, 10**8, 1)],  # 8.33 before the goo credit
+        }
+    }
+    plan = engine.plan_index_run(conn, ref, snapshot(ref, ladders), persist=False)
+    rows = {r.type_id: r for r in compressed_rows(plan)}
+    veld, spod = rows[COMPRESSED_VELDSPAR], rows[spodumain]
+    assert veld.recommended_buy_qty == depth - depth % 100
+    assert spod.recommended_buy_qty == batches * 100  # not 34,000
+    assert spod.compressed_wanted_qty == spod.recommended_buy_qty
+    trit = plan.items[TRITANIUM]
+    left = demand - a_veld * veld.recommended_buy_qty - a_spod * spod.recommended_buy_qty
+    assert 0 < left < a_spod * 100
+    assert trit.recommended_buy_qty == left
+    assert plan.compressed_saving_isk > 0

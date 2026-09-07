@@ -327,7 +327,7 @@ def test_run_detail_template_renders_structure_components_section(ref):
         unmet=[], low_stock=[], buy_total=5000 * 1000.0 + 12 * 1000.0,
         buys_unpriced=0,
         multibuy_hub="Tritanium 5000\nStructure Construction Parts 12",
-        multibuy_structure="", structure_buys=set(), shallow=set(),
+        multibuy_structure="", structure_buys=set(), unsourced=set(),
         settings=store.Settings(0.05, 24.0, 1, 10000002, "sell",
                                 manufacturing_slots=50, reaction_slots=50),
         mfg_slots_used=3, reaction_slots_used=0, alchemy_slots_used=0,

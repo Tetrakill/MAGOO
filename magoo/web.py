@@ -330,7 +330,8 @@ def _steady_demand(rows, activity_id) -> int:
 def _buy_context(rows, ref=None) -> dict:
     """The buy-side derivations run_detail and _planning_context share:
     the buy list and its total, plan-time venue provenance (structure vs
-    hub, shallow ladders, region-wide fallbacks), the structure-component
+    hub, thin structure ladders shown as a Jita share, region-wide
+    fallbacks), the structure-component
     split, and the per-venue Multibuy blocks. Rows are either sqlite rows
     (NULL-able columns) or _steady_rows dicts (never None) — the `or 0`
     guards cover both shapes identically."""
@@ -352,31 +353,37 @@ def _buy_context(rows, ref=None) -> dict:
             return int(i["hub_buy_qty"] or 0), int(i["structure_buy_qty"] or 0)
         qty = int(i["recommended_buy_qty"] or 0)
         if i["buy_venue"] == store.BUY_VENUE_STRUCTURE:
+            # v1.26.1: a single-quote structure row whose ladder held
+            # fewer units beating Jita than the plan buys sends the rest
+            # to Jita — the venue cell and Multibuy say so (it used to be
+            # a 'shallow' / 'thin book' badge with the rest left implicit).
+            cheaper = i["structure_units_cheaper"]
+            if cheaper is not None and 0 < cheaper < qty:
+                return qty - int(cheaper), int(cheaper)
             return 0, qty
         return qty, 0
 
     venue_qty = {i["type_id"]: venue_split(i) for i in buys}
     structure_buys = {t for t, (_h, s) in venue_qty.items() if s > 0}
     split_buys = {t for t, (h, s) in venue_qty.items() if h > 0 and s > 0}
-    # 'shallow': a fill-priced row whose stored ladders ran out — the rest
-    # (unfilled_qty) is UNSOURCED: no market held it at plan time, it is
-    # priced at the last rung walked, sits in no venue quantity and in no
-    # Multibuy block (review 2026-09-05, R5; the engine folds a remainder
-    # into the Jita quantity only when Jita's stored book was truncated at
-    # HUB_LADDER_MAX_RUNGS, so its real book continues) — invariant
-    # hub_buy_qty + structure_buy_qty + unfilled_qty == recommended_buy_qty;
-    # or a legacy structure row whose ladder had fewer units beating the
-    # Jita landed price than the plan buys there.
-    shallow = set()
-    for i in buys:
-        if "hub_buy_qty" in i.keys() and i["hub_buy_qty"] is not None:
-            if (i["unfilled_qty"] or 0) > 0:
-                shallow.add(i["type_id"])
-        elif (
-            i["structure_units_cheaper"] is not None
-            and i["recommended_buy_qty"] > i["structure_units_cheaper"]
-        ):
-            shallow.add(i["type_id"])
+    # 'unsourced' (badge text since v1.26.1; 'shallow' before): a
+    # fill-priced row whose stored ladders ran out — the rest
+    # (unfilled_qty) has no market: priced at the last rung walked, in
+    # no venue quantity and no Multibuy block (review 2026-09-05, R5; the
+    # engine folds a remainder into the Jita quantity only when Jita's
+    # stored book was truncated at HUB_LADDER_MAX_RUNGS, so its real book
+    # continues) — invariant hub_buy_qty + structure_buy_qty +
+    # unfilled_qty == recommended_buy_qty. The single-quote case (a
+    # structure row whose ladder held fewer units beating Jita than the
+    # plan buys) is no badge at all: venue_split above sends the rest to
+    # Jita, so the venue cell and Multibuy show it as a split.
+    unsourced = {
+        i["type_id"]
+        for i in buys
+        if "hub_buy_qty" in i.keys()
+        and i["hub_buy_qty"] is not None
+        and (i["unfilled_qty"] or 0) > 0
+    }
     # v1.25 compressed sourcing: the compressed buy rows (what each is
     # for, decoded), the raws they part-cover, and compressed rows whose
     # fill outran their venue's ladder at plan time.
@@ -402,33 +409,15 @@ def _buy_context(rows, ref=None) -> dict:
         if "compressed_covered_qty" in i.keys()
         and (i["compressed_covered_qty"] or 0) > 0
     }
-    # Review 2026-09-05 (R6): a compressed buy is shallow when the pass
-    # SHRANK it below what the LP wanted — the engine stores the wanted
-    # quantity (compressed_wanted_qty) beside the whole-batch fill it
-    # settled for. The old test compared recommended_buy_qty against
-    # compressed_ladder_units, which can never be true after the shrink
-    # (the fill is by construction within the ladder), so the badge never
-    # fired. Rows planned before the column (key absent / NULL) are not
-    # flagged — the figure was never recorded.
-    def wanted(i):
-        return (
-            i["compressed_wanted_qty"]
-            if "compressed_wanted_qty" in i.keys()
-            else None
-        )
-
-    compressed_shallow = {
-        i["type_id"]
-        for i in buys
-        if i["type_id"] in compressed
-        and wanted(i) is not None
-        and wanted(i) > (i["recommended_buy_qty"] or 0)
-    }
+    # compressed_wanted_qty (ruling R6, 2026-09-05) once drove a badge for
+    # a compressed buy shrunk below what the LP wanted; since v1.26.1 the
+    # pass re-solves after pinning a type to its market's depth, so the
+    # two are equal on new rows. Older rows show the figure in the
+    # compressed badge's tooltip (_macros.compressed_badge) — no badge.
     return dict(
         buys=buys,
         compressed=compressed,
         compressed_covered=compressed_covered,
-        compressed_shallow=compressed_shallow,
         buy_total=sum(
             (i["recommended_buy_qty"] or 0) * (i["price_snapshot"] or 0)
             for i in buys
@@ -439,7 +428,7 @@ def _buy_context(rows, ref=None) -> dict:
         structure_buys=structure_buys,
         split_buys=split_buys,
         venue_qty=venue_qty,
-        shallow=shallow,
+        unsourced=unsourced,
         # Plan-time provenance of price_snapshot: which bought inputs were
         # priced from a region-wide fallback.
         region_wide={i["type_id"] for i in buys if i["price_region_wide"]},
@@ -480,11 +469,10 @@ def _planning_context(ref, plan, settings_) -> dict:
         structure_buys=bc["structure_buys"],
         split_buys=bc["split_buys"],
         venue_qty=bc["venue_qty"],
-        shallow=bc["shallow"],
+        unsourced=bc["unsourced"],
         region_wide=bc["region_wide"],
         compressed=bc["compressed"],
         compressed_covered=bc["compressed_covered"],
-        compressed_shallow=bc["compressed_shallow"],
         builds=bc["builds_mfg_all"],
         reactions=builds_reaction,
         builds_grouped=_group_by_category(ref, bc["builds_mfg_all"]),
@@ -3058,7 +3046,6 @@ def create_app() -> Flask:
             compressed=bc["compressed"],
             compressed_section=compressed_section,
             compressed_covered=bc["compressed_covered"],
-            compressed_shallow=bc["compressed_shallow"],
             compressed_saving=(
                 run["compressed_saving_isk"]
                 if "compressed_saving_isk" in run.keys()
@@ -3074,7 +3061,7 @@ def create_app() -> Flask:
             structure_buys=bc["structure_buys"],
             split_buys=bc["split_buys"],
             venue_qty=bc["venue_qty"],
-            shallow=bc["shallow"],
+            unsourced=bc["unsourced"],
             settings=settings_,
             mfg_slots_used=sum(
                 i["jobs_allocated"] or 0 for i in bc["builds_mfg_all"]

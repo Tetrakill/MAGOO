@@ -342,10 +342,10 @@ def _detail_ctx(rows, bc, **over):
         buys_unpriced=bc["buys_unpriced"], multibuy_hub=bc["multibuy_hub"],
         multibuy_structure=bc["multibuy_structure"],
         structure_buys=bc["structure_buys"], split_buys=bc["split_buys"],
-        venue_qty=bc["venue_qty"], shallow=bc["shallow"],
+        venue_qty=bc["venue_qty"], unsourced=bc["unsourced"],
         region_wide=bc["region_wide"], compressed=bc["compressed"],
         compressed_covered=bc["compressed_covered"],
-        compressed_shallow=bc["compressed_shallow"], compressed_section=[],
+        compressed_section=[],
         compressed_saving=None, mfg_slots_used=0, reaction_slots_used=0,
         alchemy_slots_used=0,
     )
@@ -391,7 +391,7 @@ def test_unsourced_remainder_is_in_no_venue_and_no_multibuy(ref):
             == row["recommended_buy_qty"]
         )
     assert bc["venue_qty"] == {34: (1000, 0), 35: (0, 0)}
-    assert bc["shallow"] == {34, 35}
+    assert bc["unsourced"] == {34, 35}
     assert bc["structure_buys"] == set() and bc["split_buys"] == set()
     assert bc["multibuy_hub"] == "Tritanium 1000"  # never the 200 unsourced
     assert bc["multibuy_structure"] == ""
@@ -399,12 +399,12 @@ def test_unsourced_remainder_is_in_no_venue_and_no_multibuy(ref):
     assert bc["buy_total"] == 1200 * 10.0 + 50 * 10.0
 
     html = _render_detail(_detail_ctx([trit, pyer], bc, settings=_settings()))
-    # B2: a hub-only shallow run keeps its strip badge
-    assert "2 shallow" in html
-    assert "the remainder is unsourced" in html
+    # B2: a hub-only unsourced run keeps its strip badge
+    assert "2 unsourced" in html
+    assert "the remainder has no market at plan time" in html
     # B9: the row badge names the unsourced units and their price
-    assert "only 1,000 of 1,200 units were on the stored Jita / C-J6 sell ladders" in html
-    assert ("the remaining 200 are unsourced (no market held them), priced at "
+    assert "only 1,000 of 1,200 units were on the stored Jita / C-J6 sell orders" in html
+    assert ("the remaining 200 have no market to buy from — they are priced at "
             "the last order walked, 12 ISK") in html
     assert "listed under Jita" not in html
     # the fully unsourced row names no venue
@@ -439,12 +439,12 @@ def test_via_structure_count_excludes_split_rows(ref):
     assert "via C-J6" not in html and "1 split" in html
 
 
-def test_compressed_shallow_flags_a_buy_shrunk_below_the_wanted_qty(ref):
-    """R6: the compressed shallow badge fires when the pass shrank the buy
-    below what the LP wanted (compressed_wanted_qty > recommended_buy_qty);
-    a row without the figure (pre-column, NULL, or the key absent) is not
-    flagged. The old ladder-units comparison could never fire after the
-    shrink."""
+def test_compressed_wanted_figure_shows_only_in_the_tooltip(ref):
+    """R6 recorded what the LP wanted beside a shrunk compressed buy. Since
+    v1.26.1 no badge fires for it (the re-solve keeps new rows within the
+    market's depth); a row planned before, whose wanted figure exceeds
+    the buy, says so in the compressed badge's tooltip. A row without
+    the figure (pre-column, NULL, or the key absent) says nothing."""
     from magoo.web import _buy_context
 
     veld = ref.type_id("Compressed Veldspar")
@@ -471,13 +471,13 @@ def test_compressed_shallow_flags_a_buy_shrunk_below_the_wanted_qty(ref):
     )
     del absent["compressed_wanted_qty"]
     bc = _buy_context([shrunk, whole, legacy, absent], ref)
-    assert bc["compressed_shallow"] == {veld}
+    assert "cut_short" not in bc
     html = _render_detail(
         _detail_ctx([shrunk, whole, legacy, absent], bc, settings=_settings())
     )
-    assert "the ladder held only 400 of the 500 units the plan wanted" in html
-    assert html.count(">shallow</span>") == 1
-    assert "1 shallow" in html
+    assert "the plan wanted 500 but the market could fill only 400 in whole batches" in html
+    assert html.count("the plan wanted") == 1
+    assert "cut short" not in html
 
 
 def test_deficit_dialog_and_chain_tooltip_carry_the_compressed_covered_leg(ref):

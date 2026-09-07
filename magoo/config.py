@@ -307,6 +307,13 @@ COMPRESSED_GAS_SOURCE_GROUP = 711
 # Compressed gas lives in its own group; compressed ore and moon ore sit
 # in their raw ore's group under the Asteroid category.
 COMPRESSED_GAS_GROUP = 4168
+# v1.26.1: floor on the passes of the compressed sourcing LP. Each pass
+# pins a chosen type to one market at what that market fills and
+# re-solves so another ore can cover what the pin gave up; pins never
+# loosen, so the loop settles in about a pass per pinned type. The
+# engine runs up to max(this, candidate types + 1) passes, then keeps
+# the last solution.
+COMPRESSED_LP_PASSES = 8
 CATEGORY_ASTEROID = 25
 # Cheapest Jita 4-4 sell orders kept per compressed candidate: the
 # fill-cost ladder the compressed pass walks. A fill that would need more

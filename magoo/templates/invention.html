@@ -43,12 +43,11 @@
     <span class="label">Outlay</span>
     <span class="value" title="{{ data.total_outlay|isk }} ISK — datacores, decryptors, relics and fees for every attempt, before netting inputs on hand">{{ data.total_outlay|isk_short }}</span>
   </div>
-  {% if data.buys_unpriced or data.buys_shallow %}
+  {% if data.buys_unpriced %}
   <div class="stat">
     <span class="label">&nbsp;</span>
     <span class="tags">
       {% if data.buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — the totals understate; refresh prices">{{ data.buys_unpriced }} unpriced</span>{% endif %}
-      {% if data.buys_shallow %}<span class="badge warn" title="structure-market buys whose sell ladder has fewer units beating the Jita landed price than the tab buys — the rest cost Jita money">{{ data.buys_shallow }} shallow</span>{% endif %}
     </span>
   </div>
   {% endif %}
@@ -75,9 +74,8 @@
     <td class="num">{{ b.price|isk }}</td>
     {% set line_total = (b.to_buy * b.price) if b.price is not none else none %}
     <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
-    <td class="cat">{% if b.venue == 'structure' %}<span class="badge accent" title="cheaper landed (price + freight-in) at the structure market than at Jita">{{ settings.structure_market_label() }}</span>{% elif b.price is not none %}<span class="muted">Jita</span>{% endif %}</td>
+    <td class="cat">{% if b.venue == 'structure' and b.thin_book %}<span class="muted" title="{{ settings.structure_market_label() }}'s sell ladder holds only {{ b.structure_units_cheaper|qty }} of {{ b.to_buy|qty }} units below the Jita landed price; buy the other {{ (b.to_buy - b.structure_units_cheaper)|qty }} at Jita — the unit price here is {{ settings.structure_market_label() }}'s best order for every unit">Jita {{ (b.to_buy - b.structure_units_cheaper)|qty }} · {{ settings.structure_market_label() }} {{ b.structure_units_cheaper|qty }}</span>{% elif b.venue == 'structure' %}<span class="muted" title="cheaper landed (price + freight-in) at the structure market than at Jita">{{ settings.structure_market_label() }}</span>{% elif b.price is not none %}<span class="muted">Jita</span>{% endif %}</td>
     <td class="flags">{% if b.price is none %}<span class="badge warn">unpriced</span>{% endif %}
-        {% if b.shallow %}<span class="badge warn" title="only {{ b.structure_units_cheaper|qty }} of {{ b.to_buy|qty }} units on the structure's sell ladder land at or below the Jita landed price — the rest must come from elsewhere">shallow</span>{% endif %}
         {% if b.region_wide %}<span class="badge" title="priced from the region-wide best order (no hub-station order)">region price</span>{% endif %}</td>
   </tr>
   {% endfor %}

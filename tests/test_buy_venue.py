@@ -614,9 +614,9 @@ def test_run_detail_renders_venue_column_shallow_flag_and_two_multibuys(ref):
         chain_mfg=[], chain_reactions=[],
         chain_counts={"covered": 0, "buy": 0, "build": 0, "react": 0, "alchemy": 0},
         unmet=[], low_stock=[], buy_total=5012 * 1000.0, buys_unpriced=0,
-        multibuy_hub="Pyerite 12", multibuy_structure="Tritanium 5000",
-        structure_buys={trit["type_id"]},
-        shallow={trit["type_id"]},
+        multibuy_hub="Pyerite 12\nTritanium 3500", multibuy_structure="Tritanium 1500",
+        structure_buys={trit["type_id"]}, split_buys={trit["type_id"]},
+        venue_qty={trit["type_id"]: (3500, 1500), pyer["type_id"]: (12, 0)},
         settings=settings_with(manufacturing_slots=50, reaction_slots=50),
         mfg_slots_used=0, reaction_slots_used=0, alchemy_slots_used=0,
         region_wide=set(),
@@ -625,15 +625,16 @@ def test_run_detail_renders_venue_column_shallow_flag_and_two_multibuys(ref):
     with app.test_request_context("/runs/1"):
         html = render_template("run_detail.html", **ctx)
     assert "<th class=\"cat\">Venue</th>" in html
-    assert ">C-J6</span>" in html and ">Jita</span>" in html
-    assert "1 via C-J6" in html and "1 shallow" in html
-    assert ">shallow</span>" in html
-    assert "only 1,500 of 5,000 units" in html
+    # v1.26.1: a single-quote structure row whose ladder covers only part
+    # of the buy reads as a split in the venue cell — no 'thin book' badge.
+    assert ">Jita 3,500 · C-J6 1,500</span>" in html and ">Jita</span>" in html
+    assert "1 split" in html and "thin book" not in html
+    assert "holds only 1,500 of 5,000 units below the Jita landed price" in html
     assert "one block per market" in html
     assert "<p class=\"muted\">Jita</p>" in html
     assert "<p class=\"muted\">C-J6 structure market</p>" in html
-    assert ">Tritanium 5000</textarea>" in html
-    assert ">Pyerite 12</textarea>" in html
+    assert ">Tritanium 1500</textarea>" in html
+    assert ">Pyerite 12\nTritanium 3500</textarea>" in html
 
 
 def test_run_detail_without_structure_buys_keeps_single_multibuy(ref):
@@ -652,7 +653,7 @@ def test_run_detail_without_structure_buys_keeps_single_multibuy(ref):
         chain_counts={"covered": 0, "buy": 0, "build": 0, "react": 0, "alchemy": 0},
         unmet=[], low_stock=[], buy_total=12 * 1000.0, buys_unpriced=0,
         multibuy_hub="Pyerite 12", multibuy_structure="",
-        structure_buys=set(), shallow=set(),
+        structure_buys=set(), unsourced=set(),
         settings=settings_with(manufacturing_slots=50, reaction_slots=50),
         mfg_slots_used=0, reaction_slots_used=0, alchemy_slots_used=0,
         region_wide=set(),
@@ -660,7 +661,7 @@ def test_run_detail_without_structure_buys_keeps_single_multibuy(ref):
     app = _app()
     with app.test_request_context("/runs/1"):
         html = render_template("run_detail.html", **ctx)
-    assert "via C-J6" not in html and "shallow" not in html
+    assert "via C-J6" not in html and "unsourced" not in html
     assert "one block per market" not in html
     assert html.count("<textarea") == 1
     assert "C-J6 structure market" not in html

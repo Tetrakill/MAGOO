@@ -564,7 +564,7 @@ _MIGRATIONS = (
     # Compressed buy rows: what the purchase is FOR — json
     # [[material_id, units out at the yield, units used to cover demand],
     # …] — plus the ladder depth the fill walked (units on the chosen
-    # venue's ladder; orders taken), for the shallow flag and tooltip.
+    # venue's ladder; orders taken), for the compressed tooltip.
     "ALTER TABLE index_run_item ADD COLUMN compressed_outputs TEXT",
     "ALTER TABLE index_run_item ADD COLUMN compressed_ladder_units INTEGER",
     "ALTER TABLE index_run_item ADD COLUMN compressed_fill_orders INTEGER",
@@ -594,8 +594,9 @@ _MIGRATIONS = (
     "INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE index_run_item ADD COLUMN unfilled_price REAL",
     # Review 2026-09-05: the compressed buy the LP WANTED before the ladder
-    # shrank it to whole batches it held (the compressed shallow flag is
-    # wanted > recommended_buy_qty); the two freight-in rates a run was
+    # shrank it to whole batches it held (equal to the buy since the
+    # v1.26.1 re-solve unless the pass cap was hit; the compressed tooltip
+    # states it when wanted > recommended_buy_qty); the two freight-in rates a run was
     # planned at, so the realized freight lines keep their vintage; the
     # ladders' min_volume on databases created before the column.
     "ALTER TABLE index_run_item ADD COLUMN compressed_wanted_qty INTEGER",

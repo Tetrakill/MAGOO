@@ -373,7 +373,7 @@ and hover with the teal Hover Wash.
 
 ### Badges
 - **Style:** outline chips — 4px radius, hairline border, 0.72rem, lowercase
-  text ("active", "no role", "shallow").
+  text ("active", "no role", "unsourced").
 - **State:** neutral / `good` / `warn` / `bad` / `accent`, each tinting text
   and a 45%-alpha border of the same hue. `fill` escalates the worst cases to
   a solid fill (fill-bad: red with #1a0404 text; fill-warn: amber with
@@ -394,21 +394,29 @@ and hover with the teal Hover Wash.
   Sell / Max Buy basis, not walked.
 - **Compressed sourcing (v1.25):** the accent `compressed` badge marks a
   compressed ore / moon ore / gas bought to be reprocessed (Buy list, Chain,
-  the Profit breakdown's blended-cost lines); a covered raw carries a neutral
-  "N via compressed" badge; a compressed buy the whole-batch re-fill shrank
-  below what the plan wanted reuses the warn `shallow` badge ("the ladder
-  held only N of the M units the plan wanted" — review 2026-09-05). Each
+  the Profit breakdown's blended-cost lines); a covered raw carries an accent
+  "N via compressed" badge (neutral until v1.26.1 — every compressed marker
+  is the one blue now). A compressed buy shrunk below what the plan
+  wanted is no warning since v1.26.1 (the pass re-solves after pinning a
+  type to what its market fills, so it is rare): the `shallow` / `cut
+  short` badge is gone and the compressed tooltip states "the plan wanted
+  M but the market could fill only N in whole batches" whenever the two
+  differ. Each
   tooltip states what is covered, what is left over and how many orders the
   fill walked — the Tooltip Ledger Rule.
-- **Fill pricing (v1.25):** a buy split across both markets shows an accent
-  venue badge naming each market's share ("Jita 1,000 · C-J6 500"); the unit
+- **Fill pricing (v1.25):** a buy split across both markets shows each
+  market's share in the venue cell ("Jita 1,000 · C-J6 500"). Since v1.26.1 the
+  venue column is plain muted text throughout — "Jita", "C-J6" and the split
+  read alike, with the reason in the tooltip; the column names a market, it
+  is not a warning. The unit
   price cell's tooltip carries the per-venue fill ledger (units, average,
-  orders walked, units beyond the stored ladders); the warn `shallow` badge
-  reads how many units the stored ladders held and names the rest as
-  **unsourced** — "the remaining N are unsourced (no market held them),
-  priced at the last order walked, X ISK, and listed in no Multibuy block"
+  orders walked, units beyond the stored ladders); the warn `N unsourced`
+  badge (v1.26.1 wording; `shallow` before) reads how many units the
+  stored orders held and says the rest has no market — "the remaining N
+  have no market to buy from, priced at the last order walked, X ISK, and
+  appear in no Multibuy block"
   (review 2026-09-05: a remainder is attributed to Jita only when Jita's
-  stored book was truncated; the strip's "N shallow" tooltip says the
+  stored book was truncated; the strip's "N unsourced" tooltip says the
   same). A row nothing filled at all shows "—" in the Venue column with
   an unsourced tooltip, never a market name.
 

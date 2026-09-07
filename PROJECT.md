@@ -170,8 +170,8 @@ anywhere, iterates quickly, and owns its own data pipeline.
     across the two markets; units beyond every stored order are priced at
     the last order walked and — unless Jita's stored book was truncated,
     so its real book continues — are **unsourced**: attributed to no
-    market and listed in no Multibuy block; the row is flagged *shallow*
-    with that count (ruling 2026-09-05). The Buy list's unit price is the blended fill
+    market and listed in no Multibuy block; the row is badged *N unsourced*
+    (ruling 2026-09-05; the word was *shallow* until v1.26.1). The Buy list's unit price is the blended fill
     average (per-venue fills in the tooltip); Multibuy lists each market's
     share; freight splits by the venue quantities in the realized profit
     view. Phase 1's single best-price quote remains the starting point (the
@@ -183,7 +183,7 @@ anywhere, iterates quickly, and owns its own data pipeline.
     capacity shortfall buys only from rungs that exist. Each market has a
     **pricing basis** (v1.26, in its Settings panel): Ladder (the walk),
     Min Sell Order or Max Buy Order (any quantity at the best order — the
-    market becomes one unbounded synthetic rung; no split, no shallow
+    market becomes one unbounded synthetic rung; no split, no unsourced
     badge). Finals are never compared (their quote is a sell reference).
 
 16. **T2/T3 invention (v1.22)** — Per pipeline whose final is
@@ -728,7 +728,7 @@ unfilled   = qty - units on the stored ladders        -- priced at the LAST rung
              so the real book continues): the remainder rides the Jita
              quantity. Otherwise (the whole book was stored, or there is no
              Jita ladder) the remainder is UNSOURCED: no venue, no Multibuy
-             block; the shallow badge says so (ruling R5, 2026-09-05)
+             block; the *unsourced* badge says so (ruling R5, 2026-09-05)
 price_snapshot = (hub cost + structure cost + unfilled x marginal) / qty   -- raw average
 ```
 
@@ -771,13 +771,42 @@ structure rung carries that structure price under the hub freight rate
 whenever the item has a hub ladder. An item with no ladder anywhere keeps
 the single quote unbadged.
 
-**Compressed shallow (ruling R6, 2026-09-05):** a compressed buy is
-badged *shallow* when the whole-batch re-fill SHRANK it below what the LP
-wanted — the engine stores the wanted quantity
-(`index_run_item.compressed_wanted_qty`) and the web layer flags
-`compressed_wanted_qty > recommended_buy_qty`. (The earlier test compared
-the buy against `compressed_ladder_units`, which the shrink makes true
-never.)
+**Re-solve after pinning (v1.26.1, 2026-09-07):** "one venue per
+compressed row" is part of the solve. After each LP pass, a chosen type
+the solver spread over both markets, or asked more of than its market
+fills in whole batches, is PINNED to its heavier market with a cap and
+the LP runs again over the pinned rungs so another candidate — or the
+direct raw — covers what the pin gave up. The cap is what that market
+FILLS at the wanted quantity (`costing.fill_ladder`, floored to
+batches), not the ladder's whole depth: an order whose minimum volume
+exceeds a fill's remainder is unfillable there (contract C3), so a
+deeper book is no promise the wanted quantity can be taken; a type the
+market fills in full keeps the whole depth so the re-solve may grow it.
+Pins never loosen (the venue is fixed once, the cap only falls), so the
+loop settles in about a pass per pinned type; it runs at most
+max(`config.COMPRESSED_LP_PASSES` = 8, candidate types + 1) passes,
+after which the last solution stands. The whole-batch re-fill then
+shrinks a buy until the market fills all of it (a smaller fill can run
+short again on a min-volume order) — so `compressed_wanted_qty`
+(ruling R6, 2026-09-05) equals the buy on rows planned since unless the
+pass cap was hit; the *cut short* badge it drove is retired, and the
+compressed badge's tooltip states the figure whenever the two differ.
+
+**Partly wanted batch (v1.26.1, 2026-09-07):** the LP's continuous take
+of a type rounds UP to whole batches only when the last batch earns its
+place: its landed cost (the rungs it adds, freight, the ore tax) must be
+below what the direct units its wanted fraction displaces would cost —
+the dearest units of each raw's remaining direct buy at the LP's
+coverage, priced by the merged fill (the survivor loop's
+`displaced_value`; a raw the other takes already over-cover counts
+nothing — surplus is worth nothing, decision 2026-09-05). Otherwise the
+type rounds down, those units stay direct, and the recorded wanted
+quantity is the buy. (A first cut valued the fraction at each raw's
+deepest stored rung; on real books that rung is an outlier price and
+nearly every batch passed.)
+v1.25–v1.26.0 rounded up unconditionally; the re-solve made it visible
+(a 0.22-unit gap another ore was asked to cover bought a 300,000 ISK
+Spodumain batch to displace 780 ISK of direct Tritanium — refute lane).
 
 ### Worked verification
 
@@ -1017,7 +1046,7 @@ The core output table.
 | `price_snapshot` | Cost basis at this run — the CHOSEN venue's raw best price (v1.10); since v1.25 fill pricing the blended raw fill average over the whole direct quantity (rows with `hub_buy_qty` NULL keep the single quote) |
 | `price_region_wide` | v1.9: price_snapshot was a region-wide fallback quote (hub-quote provenance only) |
 | `buy_venue` | v1.10: `hub` / `structure` / NULL (unpriced; NULL on pre-v1.10 rows = hub); v1.25: `split` when the fill spans both markets — plan-time venue of price_snapshot |
-| `structure_units_cheaper` | v1.10, structure buys: units of the structure's sell ladder landing at or below the hub landed price; the run page flags the buy *shallow* when `recommended_buy_qty` exceeds it — since v1.25 the engine NULLs it on every fill-priced row; the run page reads it for the shallow flag only on legacy rows (`hub_buy_qty` NULL) |
+| `structure_units_cheaper` | v1.10, structure buys: units of the structure's sell ladder landing at or below the hub landed price; on single-quote pages (pre-v1.25 runs, the Planning tab, the Invention tab) the venue cell reads "Jita Z · C-J6 X" and Multibuy splits the same way when `recommended_buy_qty` exceeds it (v1.26.1; a *shallow* badge before) — since v1.25 the engine NULLs it on every fill-priced row |
 | `depth`, `item_class`, `merged_min_qty` | Merged chain depth (display), class, one cycle's consumption |
 | `unit_install_fee` | v1.5: hypothetical per-unit install fee snapshotted for every buildable |
 | `savings_unpriced_inputs` | Unpriced raw leaves in the savings chain (UI badge) |
@@ -1028,14 +1057,14 @@ The core output table.
 | `alchemy_credit_qty` | v1.4: units credited from unrefined stock/jobs at the yield |
 | `compressed_outputs` | v1.25, compressed buy rows: json `[[material_id, units out at the yield, units used to cover demand], ...]` — what the purchase is for |
 | `compressed_ladder_units`, `compressed_fill_orders` | v1.25, compressed buy rows: units on the chosen venue's ladder at plan time and orders the fill walked (the badge tooltip) |
-| `compressed_wanted_qty` | 2026-09-05 review (R6), compressed buy rows: the quantity the LP wanted before the whole-batch re-fill; the run page badges the row *shallow* when it exceeds `recommended_buy_qty`. NULL on pre-column rows (never flagged) |
+| `compressed_wanted_qty` | 2026-09-05 review (R6), compressed buy rows: the quantity the LP wanted before the whole-batch re-fill. Since v1.26.1 the re-solve keeps it equal to `recommended_buy_qty` unless the pass cap was hit (a deliberate round-down of a partly wanted batch records the buy); rows planned before may exceed the buy; the compressed badge's tooltip states the figure whenever the two differ (no badge). NULL on pre-column rows |
 | `market_buy_qty` | v1.26: units of a buildable item bought because their sell-ladder rungs land at or below its chain cost (the fill-aware rule); the jobs build the rest. 0 on pre-column rows and on whole buys |
 | `market_fallback_qty` | v1.26: units dearer rungs could still supply — the only purchase fallback a capacity shortfall may take; NULL when no ladder or quote was known (the single-quote rule stood) |
 | `compressed_covered_qty` | v1.25, raw rows: units of this cycle's purchase covered by reprocessing compressed buys (`recommended_buy_qty` is the direct remainder) |
 | `effective_unit_cost` | v1.25, raw rows: blended LANDED per-unit cost (direct share at its landed quote + allocated compressed cost) the realized costing prices the raw at; NULL when nothing was covered |
 | `hub_buy_qty`, `hub_fill_price`, `hub_fill_orders` | v1.25 fill pricing: units bought at Jita (the unfilled remainder included ONLY when Jita's stored book was truncated — ruling R5 2026-09-05), their average raw fill price and the orders walked; `hub_buy_qty` NULL = a row priced before fill pricing / with no ladder anywhere (its `buy_venue` says it all) |
 | `structure_buy_qty`, `structure_fill_price`, `structure_fill_orders` | v1.25: the structure market's share of the same buy |
-| `unfilled_qty`, `unfilled_price` | v1.25: units no stored ladder held and the last rung walked they are priced at — the *shallow* flag. Since 2026-09-05 (R5) these units are UNSOURCED unless folded into `hub_buy_qty` (truncated Jita book): `hub_buy_qty + structure_buy_qty + unfilled_qty == recommended_buy_qty`, and Multibuy lists the two venue quantities only |
+| `unfilled_qty`, `unfilled_price` | v1.25: units no stored ladder held and the last rung walked they are priced at — the *N unsourced* badge (v1.26.1 wording; *shallow* before). Since 2026-09-05 (R5) these units are UNSOURCED unless folded into `hub_buy_qty` (truncated Jita book): `hub_buy_qty + structure_buy_qty + unfilled_qty == recommended_buy_qty`, and Multibuy lists the two venue quantities only |
 
 **`index_run_item_pipeline`** — attributes shared demand back to pipelines.
 
@@ -2918,7 +2947,7 @@ user's Windows machine against the live database.
 | Compressed depth = fill cost (2026-09-05) | ~~The Jita sell LADDER is persisted for compressed candidates (`hub_sell_order`) and each candidate is costed by filling the quantity it would take — the one exception to the 2026-08-22 "best price + flag, never a fill price" rule, scoped to compressed types; every direct buy keeps the single best-price quote~~ same day, later: fill pricing extended to EVERY buy (see below); the Jita ladder is now stored for every input | Compressed books are thin: a 1-unit cheap order must not win the whole demand. The exception is bounded (candidates only) so the buy list's meaning is unchanged everywhere else |
 | Compressed surplus uncounted (2026-09-05) | Outputs beyond the cycle's demand are leftover stock and worth nothing in the decision (only demanded raws have LP rows) | Crediting surplus at market value invites buy-ore-to-sell-minerals loops and recommends ore for minerals nobody needs |
 | Compressed hangar stock ignored (2026-09-05) | Compressed ore / gas already in tracked hangars credits nothing; only purchases are planned from compressed | The user reprocesses hangar ore on their own schedule; a credit would assume it |
-| One venue per compressed row (2026-09-05) | The LP sees both venues' rungs; a chosen type is assigned the venue holding the larger share and re-filled there | One `buy_venue`, one Multibuy block per market — the "no order splitting" spirit at row level |
+| One venue per compressed row (2026-09-05) | The LP sees both venues' rungs; a chosen type is assigned the venue holding the larger share and re-filled there. **2026-09-07 (v1.26.1):** the assignment is a PIN (that venue, capped at what it fills at the wanted quantity — a min-volume order can make a deeper book unfillable) and the LP re-solves over the pinned rungs, up to max(`config.COMPRESSED_LP_PASSES`, candidates + 1) passes, so another candidate or the direct raw covers what the pin gave up | One `buy_venue`, one Multibuy block per market — the "no order splitting" spirit at row level; the re-solve keeps the shortfall from falling silently to the direct raw (user: "does the engine look for an alternative source?" — it did not) |
 | Compressed pass once, after convergence; Planning tab excluded (2026-09-05) | `_sourcing_pass` (née `_compressed_pass`) runs after the feedback loop and before the invention vintage; `plan_steady_state` passes `compressed=False` | Raw sizing never feeds job sizing; the Slot Planner's live views are single-quote and must reconcile with the Profit view's what-if, which has no depth model |
 | Compressed candidates imported, not ruled (2026-09-05) | `compressibleTypes` -> `ref_compressible`; `portionSize` -> `ref_type.portion_size`; candidates = targets joined to fixed reprocess outputs of the two kinds. Inert (empty) on a pre-v1.25 database | Data-derived like alchemy routes; a group/name rule would guess portion sizes and mis-catch legacy and weapon types named "Compressed ..." |
 | Compressed toggles per group (2026-09-05) | Three Settings toggles — minerals, moon materials, gas — replace the single flag; the toggles pick the candidate TYPES (those yielding a raw of an enabled group); every demanded raw of the three groups still counts and is covered by whatever the candidates yield (same day, user ruling: moon ore on / minerals off still covers the Pyerite a moon ore yields); the profile turns all three on | User request: the three markets behave differently (compressed gas carries a Jita premium the freight saving rarely beats), so each is a separate decision |
@@ -2927,13 +2956,13 @@ user's Windows machine against the live database.
 | SDE zip cache retention (2026-09-05) | After a successful import the cache keeps the current build's archive plus one previous; older archives are deleted | Every other accumulating store is pruned; ~99 MB per build was kept forever |
 | Fill pricing for every buy (2026-09-05) | Every bought input walks its Jita and structure sell ladders (merged, cheapest landed first); `price_snapshot` = the blended raw fill average; Jita's 300 cheapest orders are stored for every priced input on each refresh | User request after seeing 5.1B Tritanium "available" at C-J6's single best order with no freight — a fiction that also tilted the compressed comparison |
 | Split buys across venues (2026-09-05) | A buy may split across Jita and C-J6 by venue quantity on one row (`buy_venue = split`); Multibuy lists each market's share; realized freight splits by the hub fraction | The 2026-08-22 "no order splitting" rule is withdrawn at the user's request: a shallow C-J6 ladder should call for the rest in Jita, not a flag |
-| Remainder at marginal, ~~listed under Jita~~ unsourced (2026-09-05; ruling R5 the same day) | Units beyond every stored ladder cost the last rung walked and stay in the row's quantity. ~~They ride the Jita quantity (the structure's only when the item has no Jita ladder)~~ They ride the Jita quantity ONLY when Jita's stored ladder is TRUNCATED (exactly `HUB_LADDER_MAX_RUNGS` rungs, so the real book continues); a remainder beyond an EXHAUSTED book (shorter than the cap, or no Jita ladder at all) is UNSOURCED — attributed to no venue, listed in no Multibuy block; the shallow badge names the count and says so. Landed cost of the remainder: marginal price + the hub freight rate when the item has a hub ladder, else the structure rate | Conservative — never invents a price cheaper than the book showed, and never tells the user to buy in Jita what Jita's whole stored book could not supply |
+| Remainder at marginal, ~~listed under Jita~~ unsourced (2026-09-05; ruling R5 the same day) | Units beyond every stored ladder cost the last rung walked and stay in the row's quantity. ~~They ride the Jita quantity (the structure's only when the item has no Jita ladder)~~ They ride the Jita quantity ONLY when Jita's stored ladder is TRUNCATED (exactly `HUB_LADDER_MAX_RUNGS` rungs, so the real book continues); a remainder beyond an EXHAUSTED book (shorter than the cap, or no Jita ladder at all) is UNSOURCED — attributed to no venue, listed in no Multibuy block; the *N unsourced* badge names the count and says so (v1.26.1 wording; *shallow* before). Landed cost of the remainder: marginal price + the hub freight rate when the item has a hub ladder, else the structure rate | Conservative — never invents a price cheaper than the book showed, and never tells the user to buy in Jita what Jita's whole stored book could not supply |
 | **Review fixes (2026-09-05)** | | |
 | Reaction run ceiling (R2) | A reaction formula's `maxProductionLimit` is NOT a run cap; the 30-day modified-time rule is the only reaction ceiling | Client-verified: it accepts more runs than the formula's figure — the clamp was under-sizing bulk reactions |
 | Per-batch reprocessing floor (R3) | ~~`batch_output = n × floor(base × yield)`~~ 2026-09-06: reversed — `floor(n × base × yield)`, the floor once over the job, as the client computes it | ~~Conservative; the whole-quantity floor credited up to n − 1 phantom units per output~~ The per-batch floor valued every compressed gas (a batch of one yielding one) at zero output below a 100% yield, so no compressed gas was ever chosen (v1.25.0); ore differs by at most n − 1 units |
 | No tax on gas decompression (2026-09-06) | `compressed_reprocess_tax` applies to ore and moon ore candidates only; a gas candidate carries no tax term (`engine.tax_of`) | User: the client charges no reprocessing tax when decompressing gas |
 | Fee constants verified (R4) | SCC surcharge 4%, NPC facility tax 0.25%, invention/copy fee base 2% marked verified in-client | Observed in the client; no longer "pending" |
-| Compressed shallow = shrunk below the wanted quantity (R6) | `index_run_item.compressed_wanted_qty` stores what the LP wanted; the web layer flags `compressed_wanted_qty > recommended_buy_qty` | The old `recommended_buy_qty > compressed_ladder_units` test could never fire after the whole-batch shrink — the badge was dead |
+| Compressed shallow = shrunk below the wanted quantity (R6) | `index_run_item.compressed_wanted_qty` stores what the LP wanted; ~~the web layer flags `compressed_wanted_qty > recommended_buy_qty`~~ 2026-09-07 (v1.26.1): no badge — the re-solve keeps the two equal unless the pass cap was hit, and the compressed tooltip states the figure when they differ | The old `recommended_buy_qty > compressed_ladder_units` test could never fire after the whole-batch shrink — the badge was dead |
 | Zero-draw intermediates (R7) | A stage with zero realized draw takes its target from that draw — no floor kept | A phantom cycle of stock for a stage nobody consumes this cycle |
 | Freight-rate vintage per run (C2) | `index_run.freight_in_isk_per_m3` / `structure_freight_in_isk_per_m3` persisted at plan time; `hull_cost` lands inbound freight at the run's own rates (live settings for pre-column runs) | Editing the freight setting must not silently reprice executed history |
 | Ladders carry `min_volume` (C3) | Both sell-order tables store ESI `min_volume`; the merged walk skips a rung whose minimum exceeds the units it would take | A 10,000-minimum order cannot fill a 300-unit buy; the walk was pricing buys off orders it could never hit |
@@ -2945,6 +2974,8 @@ user's Windows machine against the live database.
 | Paste keeps blank interior columns (B1) | `_parse_pipeline_line` drops trailing empties only; an interior blank is an omitted column | "Ishtar\t40\t\t4\t8" (blank runs/BPC) used to shift ME 4 into runs/BPC and TE 8 into ME |
 | Newer-database page (B7) | An `errorhandler(RuntimeError)` renders the message on a plain page (no template — base.html would reopen the database) | `ensure_schema`'s refusal of a newer-build database fired inside `conn()` as a bare 500 |
 | Strip and badge wording (B2–B6, B9) | `shallow` joins the strip's gate; "N via C-J6" counts structure-only rows (split rows have their own badge); the Compressed section names the cheaper market's ladder; the deficit dialog and Chain tooltip state the compressed-covered leg | Each was a truthful-tooltip lapse found in review |
+| Book badges: one word each (2026-09-07, v1.26.1) | `shallow` meant three things; now only *N unsourced* (fill-priced remainder with no market, R5) survives as a warning — *cut short* (R6) lasted a few hours: the same day's re-solve means a compressed buy is never shrunk below what the LP wanted; the single-quote structure case (its ladder covers only part of the buy: pre-v1.25 runs, the Planning tab, the Invention tab) is no badge at all — the venue cell reads "Jita Z · C-J6 X" and Multibuy splits the same way (`_buy_context.venue_split`); `_buy_context` key `unsourced`, `_macros.book_badge` | User request: one badge word with three tooltips was unreadable, and "thin book" was too close to "unsourced" to earn its own word |
+| Partly wanted batch (2026-09-07, v1.26.1) | The LP's continuous take of a compressed type rounds up to whole batches only when the last batch's landed cost is below what the direct units its wanted fraction displaces would cost (the dearest units of each raw's remaining direct buy, by the merged fill — `displaced_value` at the LP's coverage); otherwise the type rounds down and those units stay direct | Surplus is worth nothing (2026-09-05); the unconditional round-up of v1.25 was invisible until the re-solve asked another ore to cover a 0.22-unit gap and bought a 300,000 ISK batch to displace 780 ISK of direct Tritanium (refute lane; on the maintainer's copy the re-solve had landed 273k ISK worse than the old shrink for the same reason) |
 | T2 invention: skills (v1.22) | One new setting (`skill_encryption`, /40 term); the datacore sciences reuse `skill_starship_engineering` / `skill_science` through the existing `_per_bp_skill_level` name families | The families already route every science skill correctly; only Encryption Methods had no home (and its formula weight differs) |
 
 ---

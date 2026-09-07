@@ -157,8 +157,8 @@ class PlanItem:
     price_region_wide: bool = False
     # v1.10: the venue price_snapshot came from (store.BUY_VENUE_*; None
     # when unpriced) and, for structure buys, the units of the structure's
-    # sell ladder that still beat the hub landed price — the run page flags
-    # the buy as shallow when recommended_buy_qty exceeds it.
+    # sell ladder that still beat the hub landed price — the run page shows
+    # the rest as a Jita share when recommended_buy_qty exceeds it (v1.26.1).
     buy_venue: str | None = None
     structure_units_cheaper: int | None = None
     # Hypothetical install fee per product unit at this run's cost indices
@@ -195,8 +195,9 @@ class PlanItem:
     compressed_outputs: tuple = ()
     compressed_ladder_units: int | None = None
     # Ruling R6 (2026-09-05): the whole-batch quantity the LP wanted
-    # BEFORE the venue's ladder shrank the buy — the web layer badges the
-    # row shallow when it exceeds recommended_buy_qty.
+    # BEFORE the venue's ladder shrank the buy. Equal to the buy since the
+    # v1.26.1 re-solve unless the pass cap was hit; the compressed tooltip
+    # states the figure when it exceeds recommended_buy_qty.
     compressed_wanted_qty: int | None = None
     compressed_fill_orders: int | None = None
     compressed_covered_qty: int = 0
@@ -1100,7 +1101,7 @@ def _market_split(ref, item: PlanItem, ladders: _LadderLookup) -> None:
     that already overshot the need). Two documented edges: the fallback
     counts dearer rungs at the split's own take, so a rung whose
     min_volume exceeds a later capacity shortfall lands unsourced in the
-    sourcing pass (badged shallow); and units past a Jita ladder
+    sourcing pass (badged unsourced); and units past a Jita ladder
     truncated at the pull cap count as 'no market' here, though the
     sourcing pass (ruling R5) would price a remainder there."""
     units = item.total_runs_needed * item.portion_size
@@ -1719,7 +1720,7 @@ def _sourcing_pass(
     attributed to the hub ONLY when its stored ladder was truncated at
     config.HUB_LADDER_MAX_RUNGS (the book continues past what was stored),
     otherwise they are UNSOURCED — no venue, no Multibuy line, counted in
-    unfilled_qty for the shallow badge (ruling R5 / contract C4,
+    unfilled_qty for the 'N unsourced' badge (ruling R5 / contract C4,
     2026-09-05). An item whose only ladder is the structure's still
     competes against the cached Jita quote, standing in as one unbounded
     synthetic hub rung (finding A2); an item with no ladder and no hub
@@ -1868,7 +1869,9 @@ def _sourcing_pass(
                 taken += volume
             direct_cols.append((r, marginal_landed(r), None))
         coeff: dict[int, dict[int, float]] = {}
-        rungs: list[tuple[int, str, float, int, float]] = []  # c, venue, price, vol, landed
+        value_bounds: dict[int, float] = {}
+        per_unit_tax: dict[int, float] = {}
+        caps: dict[int, int] = {}
         for c, source in sources.items():
             y = yields[source.kind]
             coeff[c] = {
@@ -1878,35 +1881,62 @@ def _sourcing_pass(
                 continue
             # The most a unit of this type can be worth: every useful
             # output at its raw's marginal (remainder) landed price.
-            value_bound = sum(a * marginal_landed(r) for r, a in coeff[c].items())
-            tax_per_unit = tax_of(source) * sum(
+            value_bounds[c] = sum(a * marginal_landed(r) for r, a in coeff[c].items())
+            per_unit_tax[c] = tax_of(source) * sum(
                 source.per_unit(m, y) * output_price(m) for m, _q in source.outputs
             )
-            cap = max(_ceil(demand[r] / a) for r, a in coeff[c].items())
-            m3 = ref.type_info(c).freight_volume
-            for venue, rate in rates.items():
-                ladder = ladders.venue_ladder(venue, c)
-                if not ladder:
+            caps[c] = max(_ceil(demand[r] / a) for r, a in coeff[c].items())
+
+        # v1.26.1: "one market per compressed row" (ruling 2026-09-05) is
+        # part of the solve now. A chosen type the LP spread over both
+        # markets, or asked more of than its market holds in whole
+        # batches, is PINNED to its heavier market with that market's
+        # whole-batch depth as its cap, and the LP runs again so another
+        # ore (or the direct raw) covers what the pin gave up — before, the
+        # shortfall fell straight to the raw's direct buy and the row was
+        # badged "cut short". A pin never loosens (the venue is fixed once,
+        # the cap only falls), so the loop settles in at most a pass per
+        # chosen type; config.COMPRESSED_LP_PASSES is the safety cap, after
+        # which the last solution stands and any residue goes direct.
+        pins: dict[int, tuple[str, int]] = {}  # c -> (venue, whole-batch units)
+
+        def build_rungs():
+            rungs: list[tuple[int, str, float, int, float]] = []  # c, venue, price, vol, landed
+            for c in coeff:
+                if not coeff[c]:
                     continue
-                taken = 0
-                # Rows are (price, volume) or (price, volume, min_volume)
-                # since the min_volume column (contract C3, 2026-09-05).
-                for price, volume, *rest in sorted(ladder, key=lambda o: o[0]):
-                    landed = price + rate * m3 + tax_per_unit
-                    if landed >= value_bound or taken >= cap:
-                        break  # ascending: nothing further can beat direct
-                    volume = min(int(volume), cap - taken)
-                    if volume <= 0:
+                m3 = ref.type_info(c).freight_volume
+                pin = pins.get(c)
+                cap = caps[c] if pin is None else min(caps[c], pin[1])
+                if cap <= 0:
+                    continue
+                for venue, rate in rates.items():
+                    if pin is not None and venue != pin[0]:
                         continue
-                    if rest and int(rest[0] or 1) > volume:
-                        # The order's minimum fill exceeds what this
-                        # candidate could ever take from it: not buyable
-                        # here (the re-fill below enforces the same rule
-                        # through costing.fill_ladder).
+                    ladder = ladders.venue_ladder(venue, c)
+                    if not ladder:
                         continue
-                    rungs.append((c, venue, price, volume, landed))
-                    taken += volume
-        if rungs:
+                    taken = 0
+                    # Rows are (price, volume) or (price, volume, min_volume)
+                    # since the min_volume column (contract C3, 2026-09-05).
+                    for price, volume, *rest in sorted(ladder, key=lambda o: o[0]):
+                        landed = price + rate * m3 + per_unit_tax[c]
+                        if landed >= value_bounds[c] or taken >= cap:
+                            break  # ascending: nothing further can beat direct
+                        volume = min(int(volume), cap - taken)
+                        if volume <= 0:
+                            continue
+                        if rest and int(rest[0] or 1) > volume:
+                            # The order's minimum fill exceeds what this
+                            # candidate could ever take from it: not buyable
+                            # here (the re-fill below enforces the same rule
+                            # through costing.fill_ladder).
+                            continue
+                        rungs.append((c, venue, price, volume, landed))
+                        taken += volume
+            return rungs
+
+        def solve(rungs):
             # min Σ cost·x  s.t.  Σ direct_r + Σ_k a_{c(k),r} x_k ≥ D_r.
             n_direct, n_rung = len(direct_cols), len(rungs)
             cost = np.array(
@@ -1939,17 +1969,80 @@ def _sourcing_pass(
                     "compressed sourcing LP failed (%s): planning the run "
                     "with direct purchases only", result.message,
                 )
-                x = np.zeros(n_rung)
-            else:
-                x = result.x[n_direct:]
+                return None
+            return result.x[n_direct:]
 
-            # Round each chosen type up to whole batches on its heavier
-            # venue and re-fill it there for the real cost.
-            takes: dict[int, dict[str, float]] = {}
+        def whole_batches(ladder, portion: int, units: int) -> int:
+            """Units a fill of `units` can take off `ladder`, floored to
+            whole batches (the min_volume rule applies, as in the re-fill)."""
+            return (costing.fill_ladder(ladder, units).units // portion) * portion
+
+        takes: dict[int, dict[str, float]] = {}
+        rungs = build_rungs()
+        # One pin per candidate type is the settling bound when every
+        # market fills what it holds; a min-volume order can lower a
+        # pinned cap more than once, so the loop runs to the larger of
+        # config.COMPRESSED_LP_PASSES and one pass per candidate plus one.
+        max_passes = max(config.COMPRESSED_LP_PASSES, len(coeff) + 1)
+        for _pass in range(max_passes):
+            takes = {}
+            if not rungs:
+                break
+            x = solve(rungs)
+            if x is None:
+                break
             for k, (c, venue, _price, _vol, _landed) in enumerate(rungs):
                 if x[k] > 1e-9:
                     takes.setdefault(c, {})
                     takes[c][venue] = takes[c].get(venue, 0.0) + float(x[k])
+            changed = False
+            for c, by_venue in takes.items():
+                total = sum(by_venue.values())
+                if total < 0.5:
+                    continue
+                portion = sources[c].portion_size
+                venue = max(by_venue, key=by_venue.get)
+                ladder = ladders.venue_ladder(venue, c)
+                wanted = _ceil(total / portion) * portion
+                fillable = whole_batches(ladder, portion, wanted)
+                if len(by_venue) > 1 or fillable < wanted:
+                    # The cap is what the market fills AT the wanted
+                    # quantity, not its whole-ladder depth: an order whose
+                    # minimum volume exceeds a fill's remainder is
+                    # unfillable there (contract C3), so a deeper book is
+                    # no promise the wanted quantity can be taken (refute
+                    # lane, 2026-09-07). A type the market fills in full
+                    # keeps the whole depth so the re-solve may grow it.
+                    cap = (
+                        whole_batches(ladder, portion, 10**15)
+                        if fillable >= wanted else fillable
+                    )
+                    pin = (venue, min(cap, pins[c][1]) if c in pins else cap)
+                    if pins.get(c) != pin:
+                        pins[c] = pin
+                        changed = True
+            if not changed:
+                break
+            rungs = build_rungs()
+        else:
+            log.debug(
+                "compressed sourcing: %d passes without settling — keeping "
+                "the last solution", max_passes,
+            )
+
+        if takes:
+            # What the LP's continuous takes cover of each raw, for the
+            # partly-wanted-batch test below (other types' fractions are
+            # themselves rounded later — an approximation, like the LP).
+            covered_lp = {
+                r: sum(
+                    coeff[c2][r] * sum(by.values())
+                    for c2, by in takes.items() if r in coeff[c2]
+                )
+                for r in raw_ids
+            }
+            # Round each chosen type up to whole batches on its (now single)
+            # market and re-fill it there for the real cost.
             for c, by_venue in takes.items():
                 total = sum(by_venue.values())
                 if total < 0.5:
@@ -1958,18 +2051,72 @@ def _sourcing_pass(
                 venue = max(by_venue, key=by_venue.get)
                 ladder = ladders.venue_ladder(venue, c)
                 portion = source.portion_size
+                m3 = ref.type_info(c).freight_volume
+
+                def settle(batches: int):
+                    """Re-fill `batches` whole batches, shrinking until
+                    the market fills the whole quantity — a smaller fill
+                    can run short again on a min-volume order (refute
+                    lane, 2026-09-07). (0, None) when nothing fills."""
+                    while batches > 0:
+                        fill = costing.fill_ladder(ladder, batches * portion)
+                        if fill.units >= batches * portion:
+                            return batches, fill
+                        batches = fill.units // portion
+                    return 0, None
+
                 batches = _ceil(total / portion)
-                # Ruling R6 (2026-09-05): what the LP WANTED, in whole
-                # batches, before the ladder shrank it — persisted as
-                # compressed_wanted_qty so the run page can badge a
-                # compressed buy the book could not fill.
+                # What the LP wanted in whole batches, persisted as
+                # compressed_wanted_qty. Since the re-solve (v1.26.1) the
+                # pins keep it within what the market fills, so it equals
+                # the buy unless the pass cap was hit; rows planned before
+                # may exceed the buy (the compressed tooltip states it).
                 wanted_qty = batches * portion
-                fill = costing.fill_ladder(ladder, batches * portion)
-                if fill.units < batches * portion:
-                    batches = fill.units // portion
-                    if batches <= 0:
-                        continue
-                    fill = costing.fill_ladder(ladder, batches * portion)
+                batches, fill = settle(batches)
+                if batches <= 0:
+                    continue
+                if batches * portion > total + 1e-9:
+                    # The last batch is only partly wanted: the LP asked for
+                    # `frac` units of it and the rest is surplus, worth
+                    # nothing (decision 2026-09-05). Buy that batch only
+                    # when it costs less than the direct units the wanted
+                    # part displaces — the dearest units of each raw's
+                    # remaining direct buy, priced by the merged fill
+                    # (the survivor loop's displaced_value, at the LP's
+                    # coverage). Before (v1.25–v1.26.0) every chosen type
+                    # rounded up unconditionally; the re-solve made it
+                    # visible: a 0.22-unit gap another ore was asked to
+                    # cover bought a 300,000 ISK batch to displace 780 ISK
+                    # of direct Tritanium (refute lane, 2026-09-07).
+                    frac = total - (batches - 1) * portion
+                    value = 0.0
+                    for r, a in coeff[c].items():
+                        need = _ceil(demand[r] - (covered_lp[r] - a * frac))
+                        if need <= 0:
+                            continue  # over-covered without this fraction
+                        delta = min(_ceil(a * frac), need)
+                        value += direct_cost(r, need) - direct_cost(r, need - delta)
+                    prev_cost = (
+                        costing.fill_ladder(ladder, (batches - 1) * portion).cost
+                        if batches > 1 else 0.0
+                    )
+                    batch_cost = (fill.cost - prev_cost) + portion * (
+                        rates[venue] * m3 + per_unit_tax[c]
+                    )
+                    log.debug(
+                        "compressed sourcing: %s last batch %s — %.2f of %d "
+                        "units wanted, batch %.0f ISK vs %.0f ISK displaced",
+                        ref.type_info(c).name,
+                        "dropped" if batch_cost > value else "kept",
+                        frac, portion, batch_cost, value,
+                    )
+                    if batch_cost > value:
+                        batches, fill = settle(batches - 1)
+                        if batches <= 0:
+                            continue
+                        # A deliberate round-down: the plan wants exactly
+                        # this many, so the record says so.
+                        wanted_qty = batches * portion
                 qty = batches * portion
                 y = yields[source.kind]
                 chosen[c] = {
@@ -1979,7 +2126,7 @@ def _sourcing_pass(
                     "wanted_qty": wanted_qty,
                     "fill": fill,
                     "landed_cost": fill.cost
-                    + rates[venue] * ref.type_info(c).freight_volume * qty
+                    + rates[venue] * m3 * qty
                     + tax_of(source)
                     * sum(
                         source.batch_output(batches, m, y) * output_price(m)
@@ -2124,7 +2271,7 @@ def _sourcing_pass(
             # on); they stay at the last rung walked. Otherwise they are
             # unsourced: no market held them at plan time, so they stay
             # in the row's quantity and price blend but in no venue's
-            # Multibuy line, and unfilled_qty badges the row shallow.
+            # Multibuy line, and unfilled_qty badges the row 'N unsourced'.
             extra = unfilled * (fill.marginal_price or 0.0)
             if fill.remainder_venue == store.BUY_VENUE_STRUCTURE:
                 structure_qty += unfilled
@@ -2391,7 +2538,8 @@ def invention_stockpile(conn, ref, snapshot: Snapshot) -> dict:
     # datacore/relic stock is never credited twice (the v1.22 rule). Like
     # every other bought input (review 2026-09-01): the Raw Material
     # Buffer inflates the need before netting, and a structure-venue buy
-    # whose cheap ladder is shorter than the buy is flagged shallow.
+    # whose cheap ladder is shorter than the buy shows the rest as a Jita
+    # share (v1.26.1).
     margin = settings.input_purchase_margin
     buys: list[dict] = []
     for type_id, raw_need in sorted(demand.items()):
@@ -2418,12 +2566,28 @@ def invention_stockpile(conn, ref, snapshot: Snapshot) -> dict:
                 "venue": venue,
                 "region_wide": type_id in snapshot.region_wide,
                 "structure_units_cheaper": units_cheaper,
-                "shallow": units_cheaper is not None and to_buy > units_cheaper,
+                # The structure's ladder holds fewer units beating the Jita
+                # price than the tab buys there: the venue cell shows the
+                # rest as Jita and Multibuy splits the same way (v1.26.1,
+                # mirroring web._buy_context.venue_split; a 'shallow' badge
+                # before).
+                "thin_book": (
+                    units_cheaper is not None and 0 < units_cheaper < to_buy
+                ),
             }
         )
     multibuy: dict[str, list[str]] = {}
     for buy in buys:
         if buy["to_buy"] <= 0:
+            continue
+        if buy["thin_book"]:
+            cheaper = int(buy["structure_units_cheaper"])
+            multibuy.setdefault(store.BUY_VENUE_STRUCTURE, []).append(
+                f"{buy['name']} {cheaper}"
+            )
+            multibuy.setdefault(store.BUY_VENUE_HUB, []).append(
+                f"{buy['name']} {buy['to_buy'] - cheaper}"
+            )
             continue
         multibuy.setdefault(buy["venue"], []).append(
             f"{buy['name']} {buy['to_buy']}"
@@ -2437,7 +2601,6 @@ def invention_stockpile(conn, ref, snapshot: Snapshot) -> dict:
         "buys_unpriced": sum(
             1 for b in buys if b["to_buy"] > 0 and b["price"] is None
         ),
-        "buys_shallow": sum(1 for b in buys if b["shallow"]),
         "multibuy_hub": "\n".join(
             multibuy.get(store.BUY_VENUE_HUB, [])
         ),
