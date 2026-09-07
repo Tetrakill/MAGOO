@@ -3,14 +3,14 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.26 built and live (engine, MILP allocation, sizing feedback
+Status: v1.26.1 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
 landed-price savings, fill pricing for every buy walked over both sell
 ladders with venue splitting, fill-aware build-vs-buy, a pricing basis
 per market, compressed ore / moon material / gas
-sourcing with market depth, T2/T3 invention with a per-pipeline
+sourcing with market depth and a pinned re-solve, T2/T3 invention with a per-pipeline
 decryptor / relic-tier comparison, Planning tab (today's-prices Profit +
 steady-state Slot Planner), ESI tab with per-corp/-character count
 toggles, runs lifecycle with superseded/discard, per-item deficit
@@ -23,7 +23,7 @@ the installer is still buildable), native WebView2 window,
 shared-client-id PKCE login in the user's own browser, versioned schema
 with pre-migration backups, portable zip self-heals the Mark of the Web
 on first launch)
-Last updated: 2026-09-06
+Last updated: 2026-09-07
 
 ---
 
@@ -1578,7 +1578,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 555 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, SDE import atomicity, schema/settings integrity) |
+| Test suite | 560 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -2815,6 +2815,69 @@ help block was rewritten in plain English (short lines; the longer
 explanations of Ladder pricing live in a "How the pricing basis works"
 help block; the skill fields gained their per-level effects). Tests
 540 → 555 (`test_market_split`).
+
+### v1.26.1 (2026-09-07): compressed sourcing re-solves after pinning, partly wanted batches, one badge word each — commit fb65ab7
+
+"One venue per compressed row" (2026-09-05) was applied after the LP:
+a chosen type the solver had spread over both markets, or asked more
+of than its market held in whole batches, was shrunk to its heavier
+market's whole-batch fill and the shortfall fell straight to the raw's
+direct buy — the row was badged "cut short" and no other compressed
+candidate was asked to cover the gap (user: "does the engine look and
+see if there is an alternative source?" — it did not). The pass now
+PINS such a type to that market and solves again over the pinned
+rungs, so another ore, moon ore or gas — or the direct raw, when
+nothing beats it — covers what the pin gave up. The cap is what that
+market fills at the wanted quantity (an order whose minimum volume
+exceeds a fill's remainder is unfillable there, so a deeper book is no
+promise), and pins never loosen, so the loop settles in about a pass
+per pinned type; it runs at most max(`config.COMPRESSED_LP_PASSES` =
+8, candidate types + 1) passes, after which the last solution stands.
+The whole-batch re-fill then shrinks a buy until the market fills all
+of it (a smaller fill can run short again on a min-volume order), so
+`compressed_wanted_qty` equals the buy on rows planned since unless
+the pass cap was hit; the compressed badge's tooltip states the figure
+whenever the two differ.
+
+Partly wanted batch (same day, from the pre-release refute lane): the
+LP's continuous take of a type was rounded UP to whole batches
+unconditionally since v1.25, and the re-solve made the cost visible —
+a 0.22-unit gap another ore was asked to cover bought a 300,000 ISK
+Spodumain batch to displace 780 ISK of direct Tritanium, and on the
+maintainer's copy the re-solve landed 273k ISK worse than the old
+shrink for the same reason. The last batch is now bought only when its
+landed cost is below what the direct units its wanted fraction would
+displace cost (the dearest units of each raw's remaining direct buy at
+the LP's coverage, by the merged fill — `displaced_value`); otherwise
+the type rounds down and those units stay direct (surplus is worth
+nothing, decision 2026-09-05). Replayed on the maintainer's copy (24
+compressed rows either way): the six shortfalls are gone (wanted ==
+bought on every row), ten types drop a partly wanted last batch, and
+against v1.26.0 the compressed saving is 255,979 ISK higher and the
+buy list 149,456 ISK cheaper.
+
+Index Runs badges, one word each (user request, same day): `shallow`
+had meant three things — a fill-priced remainder no market held, a
+single-quote structure buy whose ladder covered only part of it, and a
+compressed buy the re-fill had shrunk. Only the first survives, as the
+warn *N unsourced* badge (strip count alike; ruling R5's meaning is
+unchanged). The single-quote structure case is no badge at all: the
+venue cell reads "Jita Z · C-J6 X" and Multibuy splits the same way
+(`_buy_context.venue_split` on the run page; `invention_stockpile` on
+the Invention tab; the Planning tab has no Multibuy) — the tooltip
+says to buy the rest at Jita and that the row's unit price is the
+structure's best order for every unit. The third case is rare now
+(above) and the compressed tooltip states it. The venue column is
+plain muted text throughout — "Jita", "C-J6" and the split read alike,
+the reason in the tooltip — and every compressed marker is the one
+accent blue (*compressed*, *N via compressed*). `_buy_context` returns
+`unsourced` in place of `shallow` / `compressed_shallow`;
+`_macros.book_badge` is the one warning; `buys_thin_book` is gone.
+Tests 555 → 560 (`test_pinned_type_lets_another_ore_cover_the_rest`,
+`test_min_volume_order_caps_the_pin_at_what_fills`,
+`test_a_row_the_market_cannot_fill_is_dropped_not_under_costed`,
+`test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct`,
+`test_thin_structure_book_splits_the_multibuy_like_the_venue_cell`).
 
 ### Development environment constraints (historical)
 
