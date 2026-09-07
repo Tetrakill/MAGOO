@@ -3,12 +3,12 @@
 {% block content %}
 <div class="pagehead">
   <h1>Settings</h1>
-  <span class="cap">The planner's assumptions about your operation — buffers,
-    fees, skills, structures and rigs. Changes kick in the next time you plan
+  <span class="cap">What the planner assumes about your operation: buffers,
+    fees, skills, structures and rigs. Changes apply the next time you plan
     a run.</span>
   <div class="actions">
     <a class="btn" href="{{ url_for('dashboard', setup=1) }}"
-       title="the six-step checklist from a fresh install to the first planned run, with each step's current state">First-run setup</a>
+       title="the step-by-step checklist from a fresh install to the first planned run, with each step's current state">First-run setup</a>
   </div>
 </div>
 
@@ -29,41 +29,27 @@
 <div class="settings-main">
 <form method="post" id="settings-form">
 <div class="panel" id="global">
-  <h2>Global</h2>
+  <h2>Global <span class="muted">— the planning cycle, your slot pools and job fees</span></h2>
   <div class="fields">
-    <label for="duration">Max Run Duration <small>hours — the index-run cycle window</small></label>
+    <label for="duration">Max Run Duration <small>Hours in one planning cycle. A longer job spans more than one cycle.</small></label>
     <input id="duration" name="duration" type="number" step="0.5" min="1"
            value="{{ settings.max_run_duration_hours }}">
-    <label for="mfg_slots">Manufacturing Slots <small>total pool; multi-cycle active jobs (from ESI) subtract from this</small></label>
+    <label for="mfg_slots">Manufacturing Slots <small>Jobs you can run at once, all characters combined. Jobs still running from earlier cycles are subtracted.</small></label>
     <input id="mfg_slots" name="mfg_slots" type="number" min="0" value="{{ settings.manufacturing_slots }}">
-    <label for="reaction_slots">Reaction Slots <small>total pool</small></label>
+    <label for="reaction_slots">Reaction Slots <small>Reaction jobs you can run at once.</small></label>
     <input id="reaction_slots" name="reaction_slots" type="number" min="0" value="{{ settings.reaction_slots }}">
-    <label for="hub_price_basis">Jita Pricing Basis
-      <small>how every Jita purchase is priced: <b>Ladder</b> walks the sell book for the quantity bought (fill pricing, splits across markets, shallow badges, and build-vs-buy judged unit by unit); <b>Min Sell Order</b> prices any quantity at the cheapest sell order; <b>Max Buy Order</b> prices any quantity at the highest buy order &mdash; what you pay when you fill your own buy orders. Switching to or from Max Buy Order needs a price refresh: the refresh pulls that side of the order book</small></label>
-    <select id="hub_price_basis" name="hub_price_basis">
-      <option value="ladder" {{ 'selected' if settings.hub_price_basis == 'ladder' }}>Ladder</option>
-      <option value="min_sell" {{ 'selected' if settings.hub_price_basis == 'min_sell' }}>Min Sell Order</option>
-      <option value="max_buy" {{ 'selected' if settings.hub_price_basis == 'max_buy' }}>Max Buy Order</option>
-    </select>
-    <label for="structure_price_basis">Structure Market Pricing Basis
-      <small>the same choice for the structure market ({{ settings.capital_market_mode == 'cj6' and 'C-J6MT Keepstar' or 'your structure' }}) when Buy Inputs Here When Cheaper Landed is on; its buy orders come down with every structure refresh</small></label>
-    <select id="structure_price_basis" name="structure_price_basis">
-      <option value="ladder" {{ 'selected' if settings.structure_price_basis == 'ladder' }}>Ladder</option>
-      <option value="min_sell" {{ 'selected' if settings.structure_price_basis == 'min_sell' }}>Min Sell Order</option>
-      <option value="max_buy" {{ 'selected' if settings.structure_price_basis == 'max_buy' }}>Max Buy Order</option>
-    </select>
     <label for="count_fitted_stock">Count Fitted &amp; Deployed Items as Stock
-      <small>when off, items fitted to or loaded in ships and structures (module, rig, subsystem, service, fuel, core, drone and fighter slots/bays) and anything deployed in space — anchored structures, sov hubs, POCOs — are left out of ESI on-hand stock; items stored inside them still count; applies at the next ESI update</small></label>
+      <small>Off: anything fitted to a ship or structure, or anchored in space, is not stock. Items stored inside them still count.</small></label>
     <input id="count_fitted_stock" name="count_fitted_stock" type="checkbox" {{ 'checked' if settings.count_fitted_stock }}>
     <label for="intermediate_me">Intermediate Component ME
-      <small>every blueprint without an explicit setting; a final product's ME/TE comes from the pipeline paste</small></label>
+      <small>Assumed for every blueprint without its own setting. Final products take theirs from the Pipelines page.</small></label>
     <input id="intermediate_me" name="intermediate_me" type="number" min="0" max="10"
            value="{{ settings.default_intermediate_me }}">
-    <label for="intermediate_te">Intermediate Component TE</label>
+    <label for="intermediate_te">Intermediate Component TE <small>The same, for time efficiency.</small></label>
     <input id="intermediate_te" name="intermediate_te" type="number" min="0" max="20"
            value="{{ settings.default_intermediate_te }}">
     <label for="industry_scc_pct">Industry SCC Surcharge
-      <small>flat SCC tax on every job installation fee; server-side rate (not in the SDE), 4% per EVE University; verify against a live install quote</small></label>
+      <small>Flat SCC tax on every job installation fee. Usually 4%; check an install quote in the client.</small></label>
     <span class="withunit"><input id="industry_scc_pct" name="industry_scc_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.industry_scc_surcharge|pct }}">%</span>
   </div>
@@ -75,26 +61,23 @@
   <h2>Stockpile Buffer <span class="muted">— how much extra each cycle plans for</span></h2>
   <div class="fields">
     <label for="buffer_pct">Intermediate Buffer
-      <small>0.1–10%; buildable intermediates only — final product counts are exact, raw inputs are just-in-time</small></label>
+      <small>Extra intermediate components kept in stock, as a share of one cycle's need. Final products and raw materials carry none.</small></label>
     <span class="withunit"><input id="buffer_pct" name="buffer_pct" type="number" step="0.1" min="0.1" max="10"
            value="{{ settings.stockpile_buffer|pct }}">%</span>
     <label for="purchase_margin_pct">Raw Material Buffer
-      <small>extra raw materials bought vs. what this cycle's planned jobs consume</small></label>
+      <small>Extra raw materials bought beyond what this cycle's jobs consume.</small></label>
     <span class="withunit"><input id="purchase_margin_pct" name="purchase_margin_pct" type="number" step="0.1" min="0" max="50"
            value="{{ settings.input_purchase_margin|pct }}">%</span>
-    <label for="extra_runs">Composite Reaction Buffer <small>extra runs planned for composite reaction inputs</small></label>
+    <label for="extra_runs">Composite Reaction Buffer <small>Extra runs for the composite reactions that feed other reactions.</small></label>
     <input id="extra_runs" name="extra_runs" type="number" min="0"
            value="{{ settings.composite_reaction_extra_runs }}">
     <label for="t1_overbuild_pct">T1 BPC Buffer
-      <small>Invention tab: target T1 source copies = this × the attempts
-      one cycle consumes, netted against copies on hand (stack minus the
-      BPO) and copy jobs in flight</small></label>
+      <small>T1 copies to keep for invention, as a multiple of one cycle's attempts. Copies and copy jobs you already have count.</small></label>
     <span class="withunit"><input id="t1_overbuild_pct" name="t1_overbuild_pct"
       type="number" step="25" min="100" max="1000"
       value="{{ settings.t1_bpc_overbuild|pct }}">%</span>
     <label for="t2_overbuild_pct">T2 BPC Buffer
-      <small>Invention tab: target invented copies = this × one cycle's
-      need, netted against BPCs on hand and invention jobs in flight</small></label>
+      <small>Invented copies to keep, as a multiple of one cycle's builds. Copies and invention jobs you already have count.</small></label>
     <span class="withunit"><input id="t2_overbuild_pct" name="t2_overbuild_pct"
       type="number" step="25" min="100" max="1000"
       value="{{ settings.t2_bpc_overbuild|pct }}">%</span>
@@ -102,205 +85,240 @@
 </div>
 
 <div class="panel" id="alchemy">
-  <h2>Alchemy</h2>
+  <h2>Alchemy <span class="muted">— cheaper reaction routes for reaction slots that would sit idle</span></h2>
   <details class="muted help">
     <summary>How alchemy is planned</summary>
-    <p>When reaction slots are left over, cheaper Unrefined reaction routes
-    substitute for direct composite reactions — you run the unrefined
-    formula, then manually reprocess its output into the composite plus
-    recovered inputs. A contended reaction pool disables alchemy (direct
-    reactions are far more slot-efficient).</p>
+    <p>Some composites can be made two ways: the direct reaction, or an
+    "unrefined" reaction whose output you reprocess yourself to get the
+    composite plus some of the inputs back. When reaction slots would
+    otherwise sit idle, the plan uses the unrefined route wherever it works
+    out cheaper. When every reaction slot is needed, alchemy is switched
+    off, because a direct reaction makes far more per slot.</p>
   </details>
   <div class="fields">
-    <label for="alchemy_enabled">Enable Alchemy</label>
+    <label for="alchemy_enabled">Enable Alchemy <small>Use unrefined reactions when reaction slots would otherwise sit idle.</small></label>
     <input id="alchemy_enabled" name="alchemy_enabled" type="checkbox" {{ 'checked' if settings.alchemy_enabled }}>
     <label for="alchemy_yield_pct">Reprocess Yield
-      <small>unrefined items reprocess under scrapmetal rules: flat yield, max 55% (50% structure base × Scrap Metal Processing V, no rig bonuses); fold any reprocessing tax in here</small></label>
+      <small>Share recovered when you reprocess an unrefined item. Scrap-metal rules: at most 55%, rigs do not help. Lower it to allow for a refinery tax.</small></label>
     <span class="withunit"><input id="alchemy_yield_pct" name="alchemy_yield_pct" type="number" step="0.5" min="0" max="100"
            value="{{ settings.alchemy_reprocess_yield|pct }}">%</span>
-    <label for="max_alchemy_jobs">Max Alchemy Jobs per Type <small>per unrefined formula per cycle; 0 disables</small></label>
+    <label for="max_alchemy_jobs">Max Alchemy Jobs per Type <small>Most alchemy jobs for any one formula per cycle. 0 switches alchemy off.</small></label>
     <input id="max_alchemy_jobs" name="max_alchemy_jobs" type="number" min="0"
            value="{{ settings.max_alchemy_jobs_per_type }}">
   </div>
 </div>
 
 <div class="panel" id="compressed">
-  <h2>Compressed Sourcing</h2>
+  <h2>Compressed Sourcing <span class="muted">— buying compressed ore and gas to reprocess yourself</span></h2>
   <details class="muted help">
     <summary>How compressed buying is planned</summary>
-    <p>For each group switched on below, when the plan buys those raws it
-    also considers buying compressed ore, compressed moon ore or compressed
-    gas and reprocessing it. A compressed buy covers every raw it yields —
-    a moon ore bought for its moon materials still covers the minerals it
-    reprocesses into, even with minerals switched off. Every compressed candidate is costed by walking
-    the cheaper market's sell ladder for the quantity actually needed (Jita
-    and the null-sec market compete, as for every buy), landed, so a thin
-    cheap order never wins on its own. A compressed buy stands only when it is
-    strictly cheaper than the raws it covers; purchases round up to whole
-    reprocessing batches, outputs beyond the cycle's need are leftover
-    stock and count for nothing in the decision (though the reprocessing
-    tax is charged on them), and compressed items already in your hangars
-    are ignored. Ice products are not covered.
-    Requires game data downloaded since v1.25 — download it again from
-    the Dashboard if the Buy list never shows compressed rows.</p>
+    <p>For each group switched on below, whenever the plan buys those raw
+    materials it also considers buying compressed ore, compressed moon ore
+    or compressed gas and reprocessing it. A compressed buy pays for every
+    material it yields: moon ore bought for its moon materials also covers
+    the minerals it produces, even with Minerals switched off.</p>
+    <p>Each candidate is priced by walking the cheaper market's sell orders
+    for the quantity you would actually buy, delivery included, so one small
+    cheap order can never win on its own. It is chosen only when it is
+    clearly cheaper than the raw materials it replaces. Purchases are rounded
+    up to whole reprocessing batches; anything produced beyond this cycle's
+    needs is left-over stock that counts for nothing in the decision (though
+    the reprocessing tax is still charged on it). Compressed items already
+    in your hangars are ignored, and ice is not covered.</p>
+    <p>Needs game data downloaded with version 1.25 or later. If the Buy
+    list never shows a compressed row, download the game data again from
+    the Dashboard.</p>
   </details>
   <div class="fields">
     <label for="compressed_minerals_enabled">Minerals from Compressed Ore
-      <small>Tritanium through Morphite, from compressed asteroid ore (a moon ore bought for its goo still covers the minerals it yields, whatever this says)</small></label>
+      <small>Tritanium through Morphite. Moon ore bought for its moon materials still covers the minerals it yields.</small></label>
     <input id="compressed_minerals_enabled" name="compressed_minerals_enabled" type="checkbox" {{ 'checked' if settings.compressed_minerals_enabled }}>
     <label for="compressed_moon_enabled">Moon Materials from Compressed Moon Ore
-      <small>Hydrocarbons, Scandium, Promethium and the rest, from compressed moon ore</small></label>
+      <small>Hydrocarbons, Scandium, Promethium and the rest.</small></label>
     <input id="compressed_moon_enabled" name="compressed_moon_enabled" type="checkbox" {{ 'checked' if settings.compressed_moon_enabled }}>
     <label for="compressed_gas_enabled">Gas from Compressed Gas
-      <small>fullerites, cytoserocins and mykoserocins, decompressed 1:1 at the yield below</small></label>
+      <small>Fullerites, cytoserocins and mykoserocins, decompressed one for one at the yield below.</small></label>
     <input id="compressed_gas_enabled" name="compressed_gas_enabled" type="checkbox" {{ 'checked' if settings.compressed_gas_enabled }}>
     <label for="compressed_ore_yield_pct">Ore Reprocessing Yield
-      <small>your refinery's yield for compressed ore and moon ore (structure, rigs, skills) &mdash; the pure yield; the tax has its own field below</small></label>
+      <small>What your refinery returns from compressed ore and moon ore, before tax.</small></label>
     <span class="withunit"><input id="compressed_ore_yield_pct" name="compressed_ore_yield_pct" type="number" step="0.01" min="0" max="100"
            value="{{ settings.compressed_ore_yield|pct }}">%</span>
     <label for="compressed_gas_yield_pct">Gas Decompression Yield
-      <small>your yield when reprocessing compressed gas back into gas &mdash; the pure yield</small></label>
+      <small>What you get back from compressed gas, before tax.</small></label>
     <span class="withunit"><input id="compressed_gas_yield_pct" name="compressed_gas_yield_pct" type="number" step="0.01" min="0" max="100"
            value="{{ settings.compressed_gas_yield|pct }}">%</span>
     <label for="compressed_tax_pct">Reprocessing Tax
-      <small>the refinery owner's (or NPC station's) tax on refining compressed ore and moon ore, a percentage of every output's value &mdash; charged on leftovers too; decompressing gas is untaxed</small></label>
+      <small>The refinery's tax on refining ore and moon ore, as a share of everything produced. Gas is not taxed.</small></label>
     <span class="withunit"><input id="compressed_tax_pct" name="compressed_tax_pct" type="number" step="0.1" min="0" max="50"
            value="{{ settings.compressed_reprocess_tax|pct }}">%</span>
   </div>
 </div>
 
 <div class="panel" id="skills">
-  <h2>Skills <span class="muted">— how fast your jobs run</span></h2>
+  <h2>Skills <span class="muted">— how fast your jobs run, and your invention chance</span></h2>
   <details class="muted help">
     <summary>How skills apply</summary>
-    <p>Entered here, not read from ESI. Industry −4%/level and Advanced
-    Industry −3%/level apply to all manufacturing; Reactions −4%/level to
-    reactions; the last four apply −1%/level only on blueprints that
-    require them — Outpost Construction on Upwell structures, Standup
-    modules, Skyhooks and structure fighters. Tech I structure rigs and
-    structure components need only Industry; Tech II Standup rigs also take
-    the Tech 2 Science level.</p>
-    <p>Invention chance also reads three of these: the racial Encryption
-    Methods level (÷40) plus the two datacore sciences (÷30 each) — the
-    Racial Starship Engineering level for ship engineering datacores and
-    the Tech 2 Science / Engineering level for everything else.</p>
+    <p>Entered here; they are not read from the game. Industry cuts
+    manufacturing time by 4% per level and Advanced Industry by 3% per
+    level; Reactions cuts reaction time by 4% per level. The remaining four
+    cut time by 1% per level, but only on blueprints that require them:
+    Outpost Construction on Upwell structures, Standup modules, Skyhooks
+    and structure fighters. Tech I structure rigs and structure components
+    need only Industry; Tech II Standup rigs also use the Tech 2 Science
+    level.</p>
+    <p>Invention chance uses three of them: the racial Encryption Methods
+    level (one fortieth per level) and the two datacore sciences (one
+    thirtieth per level each): Racial Starship Engineering for
+    ship-engineering datacores and Tech 2 Science / Engineering for
+    everything else.</p>
   </details>
   <div class="fields cols2">
-    <label for="skill_industry">Industry</label>
+    <label for="skill_industry">Industry <small>Manufacturing time −4% per level.</small></label>
     <input id="skill_industry" name="skill_industry" type="number" min="0" max="5" value="{{ settings.skill_industry }}">
-    <label for="skill_advanced_industry">Advanced Industry</label>
+    <label for="skill_advanced_industry">Advanced Industry <small>Manufacturing time −3% per level.</small></label>
     <input id="skill_advanced_industry" name="skill_advanced_industry" type="number" min="0" max="5" value="{{ settings.skill_advanced_industry }}">
-    <label for="skill_reactions">Reactions</label>
+    <label for="skill_reactions">Reactions <small>Reaction time −4% per level.</small></label>
     <input id="skill_reactions" name="skill_reactions" type="number" min="0" max="5" value="{{ settings.skill_reactions }}">
-    <label for="skill_adv_ship_construction">Advanced Ship Construction</label>
+    <label for="skill_adv_ship_construction">Advanced Ship Construction <small>Time −1% per level on blueprints that require it.</small></label>
     <input id="skill_adv_ship_construction" name="skill_adv_ship_construction" type="number" min="0" max="5" value="{{ settings.skill_adv_ship_construction }}">
-    <label for="skill_starship_engineering">Racial Starship Engineering</label>
+    <label for="skill_starship_engineering">Racial Starship Engineering <small>Time −1% per level where required; also an invention datacore science.</small></label>
     <input id="skill_starship_engineering" name="skill_starship_engineering" type="number" min="0" max="5" value="{{ settings.skill_starship_engineering }}">
-    <label for="skill_science">Tech 2 Science / Engineering</label>
+    <label for="skill_science">Tech 2 Science / Engineering <small>Time −1% per level where required; also an invention datacore science.</small></label>
     <input id="skill_science" name="skill_science" type="number" min="0" max="5" value="{{ settings.skill_science }}">
-    <label for="skill_outpost_construction">Outpost Construction</label>
+    <label for="skill_outpost_construction">Outpost Construction <small>Time −1% per level on Upwell structures, Standup modules, Skyhooks and structure fighters.</small></label>
     <input id="skill_outpost_construction" name="skill_outpost_construction" type="number" min="0" max="5" value="{{ settings.skill_outpost_construction }}">
-    <label for="skill_encryption">Racial Encryption Methods
-      <small>invention chance only; the datacore sciences reuse the two
-      levels above</small></label>
+    <label for="skill_encryption">Racial Encryption Methods <small>Invention chance only.</small></label>
     <input id="skill_encryption" name="skill_encryption" type="number" min="0" max="5" value="{{ settings.skill_encryption }}">
   </div>
 </div>
 
 <div class="panel" id="subcap">
-  <h2>High Sec Trade Hub Pricing</h2>
-  <p class="muted" style="margin:.2rem 0 .6rem">The high-sec hub (Jita 4-4 in
-    the price region): sub-capital hulls, Upwell structures, structure
-    rigs/modules and structure components sell-quote here and list at its NPC
-    station with these fees; bought inputs default to its quote. How its
-    orders are priced (Ladder / Min Sell Order / Max Buy Order) is the
-    Jita Pricing Basis under Global. Effective with current values:
+  <h2>High Sec Trade Hub Pricing <span class="muted">— Jita: where inputs are bought and most products are sold</span></h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">The high-sec hub is the main
+    station of the price region (Jita 4-4 in The Forge). Sub-capital hulls,
+    Upwell structures, structure rigs and modules and structure components
+    are priced for sale here and listed at its NPC station with the fees
+    below. Bought inputs are priced here unless the null-sec market is
+    cheaper once delivery is included. With the current values:
     <b>broker fee {{ "%.2f"|format(broker_rate * 100) }}%</b> ·
-    <b>sales tax {{ "%.2f"|format(sales_tax * 100) }}%</b> —
-    verify against a sell-order window in the client.</p>
+    <b>sales tax {{ "%.2f"|format(sales_tax * 100) }}%</b>. Check them
+    against a sell-order window in the client.</p>
+  <details class="muted help">
+    <summary>How the pricing basis works</summary>
+    <p><b>Ladder</b> walks the sell orders for the quantity you would
+    actually buy, so a large buy pays the real average rather than the
+    cheapest order's price, a buy can split between the two markets, and
+    whether to build or buy an intermediate is decided unit by unit: the
+    units the market sells for less than they cost to build are bought,
+    the rest are built. <b>Min Sell Order</b> prices any quantity at the
+    cheapest sell order. <b>Max Buy Order</b> prices any quantity at the
+    highest buy order, which is what you pay when you place your own buy
+    orders and wait. Switching to or from Max Buy Order needs a price
+    refresh, because the refresh pulls that side of the order book.</p>
+  </details>
   <div class="fields cols2">
     <label for="region">Price Region
-      <small>10000002 = The Forge; quotes come from its hub station (Jita 4-4), and raw inputs with no hub-station order (NPC-seeded goods such as Marines or Janitors) take this region's region-wide best price</small></label>
+      <small>10000002 is The Forge. Quotes come from its main station; goods with no order there take the region's best price.</small></label>
     <input id="region" name="region" type="number" min="1" required value="{{ settings.price_region_id }}">
-    <label for="skill_accounting">Accounting</label>
+    <label for="hub_price_basis">Pricing Basis
+      <small>Ladder walks the sell orders for the quantity bought. Min Sell Order and Max Buy Order price any quantity at the best order. Refresh prices after switching to or from Max Buy Order.</small></label>
+    <select id="hub_price_basis" name="hub_price_basis">
+      <option value="ladder" {{ 'selected' if settings.hub_price_basis == 'ladder' }}>Ladder</option>
+      <option value="min_sell" {{ 'selected' if settings.hub_price_basis == 'min_sell' }}>Min Sell Order</option>
+      <option value="max_buy" {{ 'selected' if settings.hub_price_basis == 'max_buy' }}>Max Buy Order</option>
+    </select>
+    <label for="skill_accounting">Accounting <small>Lowers the sales tax.</small></label>
     <input id="skill_accounting" name="skill_accounting" type="number" min="0" max="5" value="{{ settings.skill_accounting }}">
-    <label for="skill_broker_relations">Broker Relations</label>
+    <label for="skill_broker_relations">Broker Relations <small>Lowers the broker fee.</small></label>
     <input id="skill_broker_relations" name="skill_broker_relations" type="number" min="0" max="5" value="{{ settings.skill_broker_relations }}">
-    <label for="standing_faction">Faction Standing <small>station owner</small></label>
+    <label for="standing_faction">Faction Standing <small>With the station's owning faction; lowers the broker fee.</small></label>
     <input id="standing_faction" name="standing_faction" type="number" step="0.01" min="-10" max="10"
            value="{{ settings.standing_broker_faction }}">
-    <label for="standing_corp">Corp Standing <small>station owner</small></label>
+    <label for="standing_corp">Corp Standing <small>With the station's owning corporation; lowers the broker fee.</small></label>
     <input id="standing_corp" name="standing_corp" type="number" step="0.01" min="-10" max="10"
            value="{{ settings.standing_broker_corp }}">
-    <label for="freight_in">Courier Highsec Market → Industry Hub <small>ISK/m³, bought materials hauled in from this hub (the null-sec leg is set in the panel below)</small></label>
+    <label for="freight_in">Courier Highsec Market → Industry Hub <small>ISK per m³ to haul bought materials from Jita to where you build.</small></label>
     <input id="freight_in" name="freight_in" type="number" step="1" min="0" value="{{ settings.freight_in_isk_per_m3 }}">
-    <label for="freight_out">Courier Industry Hub → High Sec Market <small>ISK/m³ on packaged volume — finished subcap hulls, structures, rigs, components hauled out to sell; Keepstar, Palatine Keepstar and Sotiyo are exempt</small></label>
+    <label for="freight_out">Courier Industry Hub → High Sec Market <small>ISK per packaged m³ to haul finished products to Jita. Keepstars, Palatine Keepstars and Sotiyos are exempt.</small></label>
     <input id="freight_out" name="freight_out" type="number" step="1" min="0" value="{{ settings.freight_out_isk_per_m3 }}">
   </div>
 </div>
 
 <div class="panel" id="capital">
-  <h2>Null Sec Trade Hub Pricing</h2>
+  <h2>Null Sec Trade Hub Pricing <span class="muted">— the structure market: cheaper inputs, and where capitals are sold</span></h2>
   <details class="muted help">
-    <summary>What the null-sec hub (structure market) is used for</summary>
-    <p>One null-sec structure market (the C-J6MT Keepstar by default) serves
-    two jobs. <b>Buying:</b> every input the plan buys is priced at whichever
-    is cheaper <i>landed</i> — Jita price + Jita freight-in, or this
-    market's sell ladder + the C-J6 freight-in below. Since v1.25 every buy
-    is priced by walking both markets' sell ladders together, cheapest
-    landed order first, so a buy may split across them (Multibuy lists each
-    market's share); a buy that outruns the stored ladders is flagged
-    <i>shallow</i>: the remainder is priced at the last order walked but is
-    unsourced — no market held it, so it appears in no Multibuy block
-    (unless Jita's stored book was cut off at 300 orders, when the rest is
-    assumed to sit deeper in Jita).
-    Pipeline finals are never compared. <b>Selling:</b> capitals, freighters, jump freighters, and
-    Orcas sell-quote here instead of the price region, with the fee pair
-    below and the fixed movement cost in place of ISK/m³ freight-out.
-    Needs a character logged in with the structure-markets scope and
-    docking access. Upwell structures are NOT priced here — they use the
+    <summary>What the null-sec market is used for</summary>
+    <p>One null-sec structure market (the C-J6MT Keepstar by default) does
+    two jobs. <b>Buying:</b> every input is priced at whichever market is
+    cheaper once delivery is included: the Jita price plus the Jita courier
+    rate, or this market's price plus the courier rate set below. Both
+    markets' sell orders are walked together, cheapest delivered order
+    first, so one buy may split between them, and Multibuy lists each
+    market's share. When the stored orders run out before the quantity is
+    filled, the row is flagged <i>shallow</i>: the rest is priced at the
+    last order used but belongs to no market and appears in no Multibuy
+    block (unless Jita's stored list was cut off at 300 orders, in which
+    case the rest is assumed to sit deeper in Jita). Your final products
+    are never bought. The Pricing Basis below chooses between walking this
+    market's sell orders and pricing any quantity at its best sell or buy
+    order, as it does for Jita.</p>
+    <p><b>Selling:</b> capitals, freighters, jump freighters and Orcas are
+    priced for sale here rather than in the price region, with the fees
+    below and a fixed movement cost per hull instead of a courier rate.
+    This needs a character logged in with the structure-markets scope and
+    docking rights. Upwell structures are not priced here; they use the
     high-sec panel above.</p>
   </details>
   <div class="fields cols2">
-    <label for="capital_market_mode">Market</label>
+    <label for="capital_market_mode">Market <small>The C-J6MT Keepstar, or any structure by ID.</small></label>
     <select id="capital_market_mode" name="capital_market_mode">
       <option value="cj6" {% if settings.capital_market_mode == 'cj6' %}selected{% endif %}>C-J6MT Keepstar</option>
       <option value="custom" {% if settings.capital_market_mode == 'custom' %}selected{% endif %}>Custom structure ID</option>
     </select>
-    <label for="capital_structure_id">Custom Structure ID <small>only used with Custom</small></label>
+    <label for="capital_structure_id">Custom Structure ID <small>Only used with Custom.</small></label>
     <input id="capital_structure_id" name="capital_structure_id" type="number" min="0" style="width:11rem"
            value="{{ settings.capital_structure_id or '' }}" placeholder="structure id">
-    <label for="structure_buy_enabled">Buy Inputs Here When Cheaper Landed <small>off = every input is priced from Jita, as before</small></label>
+    <label for="structure_buy_enabled">Buy Inputs Here When Cheaper Landed <small>Off: every input is priced from Jita only.</small></label>
     <input id="structure_buy_enabled" name="structure_buy_enabled" type="checkbox" {{ 'checked' if settings.structure_buy_enabled }}>
-    <label for="structure_freight_in">Courier Null Sec Market → Industry Hub <small>ISK/m³, bought materials hauled in from this market</small></label>
+    <label for="structure_price_basis">Pricing Basis
+      <small>Ladder walks this market's sell orders; Min Sell Order and Max Buy Order price any quantity at its best order. Refresh the structure market after choosing Max Buy Order.</small></label>
+    <select id="structure_price_basis" name="structure_price_basis">
+      <option value="ladder" {{ 'selected' if settings.structure_price_basis == 'ladder' }}>Ladder</option>
+      <option value="min_sell" {{ 'selected' if settings.structure_price_basis == 'min_sell' }}>Min Sell Order</option>
+      <option value="max_buy" {{ 'selected' if settings.structure_price_basis == 'max_buy' }}>Max Buy Order</option>
+    </select>
+    <label for="structure_freight_in">Courier Null Sec Market → Industry Hub <small>ISK per m³ to haul bought materials from this market to where you build.</small></label>
     <input id="structure_freight_in" name="structure_freight_in" type="number" step="1" min="0" value="{{ settings.structure_freight_in_isk_per_m3 }}">
-    <label for="capital_sales_tax_pct">Sales Tax <small>capital-class hulls</small></label>
+    <label for="capital_sales_tax_pct">Sales Tax <small>On capitals sold here.</small></label>
     <span class="withunit"><input id="capital_sales_tax_pct" name="capital_sales_tax_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.capital_sales_tax|pct }}">%</span>
-    <label for="capital_broker_pct">Broker Fee</label>
+    <label for="capital_broker_pct">Broker Fee <small>On capitals listed here.</small></label>
     <span class="withunit"><input id="capital_broker_pct" name="capital_broker_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.capital_broker_rate|pct }}">%</span>
-    <label for="capital_movement_cost">Capital Movement Cost <small>ISK per hull</small></label>
+    <label for="capital_movement_cost">Capital Movement Cost <small>ISK per hull to bring a finished capital here.</small></label>
     <input id="capital_movement_cost" name="capital_movement_cost" type="number" step="100000" min="0"
            value="{{ settings.capital_movement_cost_isk }}">
-    <label for="capital_scc_pct">SCC Surcharge</label>
+    <label for="capital_scc_pct">SCC Surcharge <small>The SCC's share of a capital sale here.</small></label>
     <span class="withunit"><input id="capital_scc_pct" name="capital_scc_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.capital_scc_surcharge|pct }}">%</span>
   </div>
 </div>
 
 <div class="panel" id="classes">
-  <h2>Build Settings <span class="muted">— where you build each class of item</span></h2>
+  <h2>Build Settings <span class="muted">— where each class of item is built, and with which rigs</span></h2>
   <details class="muted help">
     <summary>How rig bonuses are applied</summary>
-    <p>Where each class of items is built, and what rigs the structure
-    carries. Rig bonuses: ME T1 −2.0% / T2 −2.4%, TE T1 −20% / T2 −24%,
-    scaled by the rig family's security band — engineering rigs ×1.0
-    highsec / ×1.9 lowsec / ×2.1 nullsec, reaction rigs ×1.0 lowsec / ×1.1
-    nullsec (reactions cannot run in highsec). Thukker rigs (component
-    classes and the structures class) are lowsec specialists: ME −3.7% on
-    capital components / −2.0% on other components and on structures,
-    TE −20%, all scaled ×1.9 in lowsec but only ×0.1 anywhere else.</p>
+    <p>For each class of item: the structure it is built in, the security of
+    that system, the rigs fitted, the system cost index and the facility
+    tax. Material rigs save 2.0% (T1) or 2.4% (T2) of materials; time rigs
+    save 20% (T1) or 24% (T2) of job time. Each bonus is multiplied by the
+    rig family's security factor: engineering rigs ×1.0 in high-sec, ×1.9 in
+    low-sec and ×2.1 in null-sec; reaction rigs ×1.0 in low-sec and ×1.1 in
+    null-sec (reactions cannot run in high-sec). Thukker rigs, available for
+    the component classes and for structures, are low-sec specialists:
+    materials 3.7% on capital components and 2.0% on other components and
+    structures, time 20%, multiplied by 1.9 in low-sec but only by 0.1
+    anywhere else.</p>
   </details>
   <div class="tablewrap">
   <table class="classes">
@@ -324,22 +342,22 @@
          stays empty. Split into two rows 2026-08-31. #}
       {% set band = 'high' if cs.security >= 0.45 else ('low' if cs.security > 0 else 'null') %}
       <td><select name="{{ cls }}_security_band" aria-label="{{ CLASS_LABELS[cls] }} — security band"
-            title="security band of the lab system — scales the cost rig's bonus (×1.0 high / ×1.9 low / ×2.1 null-WH)">
+            title="security of the lab's system; it scales the cost rig's bonus (×1.0 high-sec, ×1.9 low-sec, ×2.1 null-sec or wormhole)">
           <option value="high" {{ 'selected' if band == 'high' }}>highsec</option>
           <option value="low" {{ 'selected' if band == 'low' }}>lowsec</option>
           <option value="null" {{ 'selected' if band == 'null' }}>null/WH</option>
       </select></td>
       <td><select name="{{ cls }}_me_rig" aria-label="{{ CLASS_LABELS[cls] }} — cost rig"
-            title="Standup {{ 'Invention' if cls == 'invention' else 'Blueprint Copy' }} / Laboratory Optimization rig tier — job cost −10% (T1) / −12% (T2), scaled by the security band">
+            title="the lab's Standup {{ 'Invention' if cls == 'invention' else 'Blueprint Copy' }} / Laboratory Optimization rig: job cost 10% (T1) or 12% (T2) lower, scaled by the security band">
         {% for tier in ('none','t1','t2') %}
           <option value="{{ tier }}" {{ 'selected' if cs.me_rig == tier }}>{{ tier }}</option>
         {% endfor %}
       </select></td>
-      <td class="muted" title="job time is not modeled for the labs — no TE rig">—</td>
+      <td class="muted" title="lab job time is not modelled, so there is no time rig">—</td>
       {% else %}
       {% set band = 'high' if cs.security >= 0.45 else ('low' if cs.security > 0 else 'null') %}
       <td><select name="{{ cls }}_security_band" aria-label="{{ CLASS_LABELS[cls] }} — security band"
-            title="security band of the build system">
+            title="security of the system you build in">
         {% if cls != 'reactions' %}
           <option value="high" {{ 'selected' if band == 'high' }}>highsec</option>
         {% endif %}
@@ -360,10 +378,10 @@
       {% endif %}
       <td class="num"><input name="{{ cls }}_index_pct" type="number" step="0.01" min="0"
                  aria-label="{{ CLASS_LABELS[cls] }} — system cost index %"
-                 value="{{ cs.system_cost_index|pct }}" title="system cost index as shown in the industry window, e.g. 5.21"></td>
+                 value="{{ cs.system_cost_index|pct }}" title="the system cost index shown in the industry window, e.g. 5.21"></td>
       <td class="num"><input name="{{ cls }}_tax_pct" type="number" step="0.01" min="0"
                  aria-label="{{ CLASS_LABELS[cls] }} — facility tax %"
-                 value="{{ cs.tax_rate|pct }}" title="facility tax as a percentage, e.g. 0.25"></td>
+                 value="{{ cs.tax_rate|pct }}" title="the facility's tax as a percentage, e.g. 0.25"></td>
     </tr>
     {% endfor %}
   </table>
@@ -373,10 +391,10 @@
 </form>
 
 <div class="panel" id="blacklist">
-  <h2>Production Blacklist</h2>
-  <p class="muted" style="margin:.2rem 0 .6rem">Items you check or list here
-  get <b>bought instead of built</b>, and their sub-chains drop out of the
-  plan. Your final products are always built.</p>
+  <h2>Production Blacklist <span class="muted">— what you would rather buy than build</span></h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">Anything checked or listed
+  here is <b>bought instead of built</b>, and everything beneath it drops
+  out of the plan. Your final products are always built.</p>
   <form method="post" action="{{ url_for('blacklist_categories_save') }}">
     <div class="checks">
       {% for key, label, groups in blacklist_categories %}
@@ -409,7 +427,7 @@
 </div>
 
 <div class="panel" id="tracked">
-  <h2>Tracked Solar Systems</h2>
+  <h2>Tracked Solar Systems <span class="muted">— which assets count as stock</span></h2>
   <p class="muted" style="margin:.2rem 0 .6rem">Only assets in these systems
   count as stock. Leave the list empty to count everything, everywhere.</p>
   <form method="post" action="{{ url_for('tracked_add') }}" class="addrow">

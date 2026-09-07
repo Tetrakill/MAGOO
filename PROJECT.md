@@ -181,7 +181,7 @@ anywhere, iterates quickly, and owns its own data pipeline.
     quantity walks the merged ladder, the units at or below the chain
     cost are bought and the rest built (Phase 6; `market_buy_qty`), and a
     capacity shortfall buys only from rungs that exist. Each market has a
-    **pricing basis** (v1.26, Settings → Global): Ladder (the walk),
+    **pricing basis** (v1.26, in its Settings panel): Ladder (the walk),
     Min Sell Order or Max Buy Order (any quantity at the best order — the
     market becomes one unbounded synthetic rung; no split, no shallow
     badge). Finals are never compared (their quote is a sell reference).
@@ -2760,8 +2760,9 @@ come from the alchemy route; Hyperflurite buys 8,543 and builds the
 rest; Hydrogen Fuel Block, Dysporite and Fluxed Condensates stay whole
 buys — their whole books are cheaper than building.
 
-Pricing basis per market (user request, same day): Settings → Global
-gains High Sec Hub Pricing and Null Sec Market Pricing, each Ladder
+Pricing basis per market (user request, same day): the High Sec and
+Null Sec Trade Hub Pricing panels each gain a Pricing Basis (first
+placed under Global; moved into the panels the same day), Ladder
 (walk the sell book for the quantity bought — fill pricing, splits,
 shallow badges, the rule above; the default), Min Sell Order or Max Buy
 Order (any quantity at the best order: `_LadderLookup` stands the market
@@ -2778,7 +2779,13 @@ ladder can only take units that beat it landed. Schema 8:
 `settings.hub_price_basis` / `structure_price_basis`,
 `index_run_item.market_buy_qty` / `market_fallback_qty`,
 `index_run.hub_price_basis` / `structure_price_basis` (the run's
-vintage). Tests 540 → 555 (`test_market_split`).
+vintage). Later the same day, before the release asset was replaced:
+the two Pricing Basis selects moved into their market panels, and every
+Settings panel subtitle, per-setting sub-header and "How X is planned"
+help block was rewritten in plain English (short lines; the longer
+explanations of Ladder pricing live in a "How the pricing basis works"
+help block; the skill fields gained their per-level effects). Tests
+540 → 555 (`test_market_split`).
 
 ### Development environment constraints (historical)
 
@@ -2933,7 +2940,7 @@ user's Windows machine against the live database.
 | Hub quote kept beside the winner (C5) | `Snapshot.hub_prices` carries the cached Jita quote per type even where the structure won Phase 1; the sourcing pass's synthetic hub rung reads it | An item with a hub price but no stored hub ladder was given the WINNING venue's price as its Jita rung |
 | No sell ladders off the sell source (C6) | ~~`market.sell_ladders` returns empty ladders when `price_source != 'sell'`, so the pass leaves every Phase 1 quote alone~~ 2026-09-06: subsumed by the per-market basis — a buy-side hub is its quote, standing in as one unbounded synthetic rung, and a structure ladder can only take units that beat it landed | No sell ladder was ever pulled for a buy-side price source; walking a stale one mispriced the plan |
 | Fill-aware build-vs-buy (2026-09-06) | A buildable intermediate's cycle quantity walks its merged ladder; rungs at or below the chain cost are bought (`market_buy_qty`), the rest built; a capacity shortfall buys only from dearer rungs that exist (`market_fallback_qty`), the remainder is unmet; the chain cost's inputs keep their Phase 1 quotes | User ("are you sure about the build cost vs landed buy"): three independent recomputations showed the verdicts held only at the best order — Ferrofluid, Hyperflurite and the amplifier cost more to buy than to build at their fills, and 840 amplifiers had no market at all |
-| Per-market pricing basis (2026-09-06) | `hub_price_basis` / `structure_price_basis` ∈ {max_buy, min_sell, ladder}, default ladder, in Settings → Global; replaces the Price Source select (`price_source` derived: buy only under max_buy; a 'buy' database migrates to max_buy); a non-ladder market is one unbounded synthetic rung at its quote — no order count, no split, no shallow badge; the structure refresh caches the best buy order too | User request: price every item from Min Sell vs Ladders, per market, with Max Buy Order for a trader who fills their own buy orders |
+| Per-market pricing basis (2026-09-06) | `hub_price_basis` / `structure_price_basis` ∈ {max_buy, min_sell, ladder}, default ladder, each in its market's Settings panel (first placed under Global; moved the same day at the user's request); replaces the Price Source select (`price_source` derived: buy only under max_buy; a 'buy' database migrates to max_buy); a non-ladder market is one unbounded synthetic rung at its quote — no order count, no split, no shallow badge; the structure refresh caches the best buy order too | User request: price every item from Min Sell vs Ladders, per market, with Max Buy Order for a trader who fills their own buy orders |
 | Hub ladder for every input | `hub_sell_order` is stored for every market input on each refresh, not the compressed candidates only | Fill pricing walks every buy; the candidates-only pull left most rows with a single quote and no depth |
 | Paste keeps blank interior columns (B1) | `_parse_pipeline_line` drops trailing empties only; an interior blank is an omitted column | "Ishtar\t40\t\t4\t8" (blank runs/BPC) used to shift ME 4 into runs/BPC and TE 8 into ME |
 | Newer-database page (B7) | An `errorhandler(RuntimeError)` renders the message on a plain page (no template — base.html would reopen the database) | `ensure_schema`'s refusal of a newer-build database fired inside `conn()` as a bare 500 |
