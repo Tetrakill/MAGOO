@@ -3,12 +3,13 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.25.1 built and live (engine, MILP allocation, sizing feedback
+Status: v1.26 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
 landed-price savings, fill pricing for every buy walked over both sell
-ladders with venue splitting, compressed ore / moon material / gas
+ladders with venue splitting, fill-aware build-vs-buy, a pricing basis
+per market, compressed ore / moon material / gas
 sourcing with market depth, T2/T3 invention with a per-pipeline
 decryptor / relic-tier comparison, Planning tab (today's-prices Profit +
 steady-state Slot Planner), ESI tab with per-corp/-character count
@@ -1548,7 +1549,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 540 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, SDE import atomicity, schema/settings integrity) |
+| Test suite | 555 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, SDE import atomicity, schema/settings integrity) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -2726,6 +2727,58 @@ yield inputs step by 0.01 so 90.63 saves. Settings and run-page wording
 say the tax is on refined ore only. Tests 539 → 540
 (`test_gas_is_decompressed_untaxed_and_floored_once`; the R3 unit test
 now asserts the whole-job floor).
+
+### v1.26 (2026-09-06): fill-aware build-vs-buy, per-market pricing basis — commit 593144c
+
+The savings rule judged an intermediate's buy side at the single best
+order: one cheap rung flipped the whole cycle quantity to "buy", and a
+thin book left units nobody could supply (run 14 on the maintainer's
+copy: 1,592 Superconducting Gravimetric Amplifiers bought against 752 on
+the market, 840 unsourced and nothing built; Ferrofluid bought in full,
+862,200 units, at a blended fill above its chain cost). Phase 5 now
+walks each buildable intermediate's merged Jita + structure ladder over
+its whole cycle quantity, unit by unit: rungs landing at or below the
+vertically-integrated chain cost are bought (`market_buy_qty`), the rest
+— dearer rungs and units no market holds — is built, the jobs re-sized
+to that part (`_market_split`, `_resize_build`; `_runs_for_units` carries
+the whole-copy rounding both paths share). The dearer rungs are the only
+purchase fallback a capacity shortfall may take (`market_fallback_qty`);
+beyond them the shortfall is unmet — badged '+unmet' on the Chain tab
+and counted on the Plan tab. The MILP weight of the built part is its
+saving against those dearer rungs; with none (a shallow cheap book) the
+built units have no purchase fallback and are allocated ahead of priced
+contenders, like an unpriced item. Every unit cheaper on the market
+still flips the item to a buy, as the 2026-08-20 rule always did —
+judged at the fill over the quantity now. No rung anywhere (no ladder,
+no quote): the single-quote figure stands untouched, so the Planning tab
+is unchanged. The job table badges '+buy N' on a split row; the Chain
+tab's '+buy' tooltip separates market-cheaper units from capacity buys.
+The chain cost's own inputs stay at their Phase 1 quotes (documented in
+§7). Replayed on the maintainer's copy: Ferrofluid buys 558,658 units
+from Jita's rungs at or below its chain cost and the remaining 303,542
+come from the alchemy route; Hyperflurite buys 8,543 and builds the
+rest; Hydrogen Fuel Block, Dysporite and Fluxed Condensates stay whole
+buys — their whole books are cheaper than building.
+
+Pricing basis per market (user request, same day): Settings → Global
+gains High Sec Hub Pricing and Null Sec Market Pricing, each Ladder
+(walk the sell book for the quantity bought — fill pricing, splits,
+shallow badges, the rule above; the default), Min Sell Order or Max Buy
+Order (any quantity at the best order: `_LadderLookup` stands the market
+in as one unbounded synthetic rung, so nothing is ever unfilled and no
+order count is shown). The old Price Source select is gone:
+`price_source` — the ESI side the hub refresh pulls — is derived on save,
+'buy' only under Max Buy Order, and a database with price_source 'buy'
+migrates to a 'max_buy' hub basis. The structure refresh caches the best
+buy order per wanted type beside the sell ladder (`market_price` source
+'structure_buy', `cached_structure_quotes`), and Phase 1's structure
+quote follows the basis. The 2026-09-05 C6 guard (no fill pricing off a
+buy-side hub) is subsumed: a buy-side hub is its quote, and a structure
+ladder can only take units that beat it landed. Schema 8:
+`settings.hub_price_basis` / `structure_price_basis`,
+`index_run_item.market_buy_qty` / `market_fallback_qty`,
+`index_run.hub_price_basis` / `structure_price_basis` (the run's
+vintage). Tests 540 → 555 (`test_market_split`).
 
 ### Development environment constraints (historical)
 
