@@ -1,5 +1,6 @@
+{% set ns = nav_status() %}
 <!doctype html>
-<html lang="en">
+<html lang="en" style="--ui-scale:{{ ns.ui_scale }}; --font-size-base:{{ ns.font_size_px }}px;">
 <head>
 <meta charset="utf-8">
 <title>{% block title %}Magoo{% endblock %} · Magoo</title>
@@ -22,10 +23,18 @@
   --ui: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
   --mono: "JetBrains Mono", Consolas, ui-monospace, monospace;
   --r-panel: 6px; --r-btn: 4px;
+  /* v1.27 display prefs: overridden per-request by the inline style on
+     <html> (see base.html's <html> tag); these are just the fallback
+     if that's ever missing. */
+  --ui-scale: 1; --font-size-base: 14px;
 }
 * { box-sizing: border-box; }
+/* UI Scale: rescales every rem-based dimension in this stylesheet
+   (spacing, table widths, the sidenav, …) without touching text size —
+   that's --font-size-base below, which is px and stays independent. */
+html { font-size: calc(100% * var(--ui-scale)); }
 body { margin: 0; background: var(--bg); color: var(--text);
-       font: 14px/1.45 var(--ui); }
+       font: var(--font-size-base)/1.45 var(--ui); }
 
 /* ---- nav ---- */
 nav { display: flex; align-items: center; gap: 1.4rem; padding: 0 1.3rem; height: 44px;
@@ -344,6 +353,8 @@ table.pipelines td form.inline:has(select + select) { display: inline-grid; gap:
 .withunit { display: inline-flex; align-items: center; gap: .35rem; color: var(--dim);
             justify-self: end; font-size: .9rem; }
 .withunit input { width: 6.5rem; }
+.slider-pair { display: flex; align-items: center; gap: .7rem; justify-self: end; }
+.slider-pair input[type=range] { width: 10rem; accent-color: var(--accent); }
 details.help { margin: -.2rem 0 .7rem; font-size: .88rem; }
 details.help summary { color: var(--dim); }
 details.help p { margin: .3rem 0 0; max-width: 80ch; }
@@ -716,7 +727,6 @@ document.addEventListener("DOMContentLoaded", function () {
 </script>
 </head>
 <body>
-{% set ns = nav_status() %}
 {% set ep = request.endpoint or '' %}
 <nav>
   <a class="brand" href="{{ url_for('dashboard') }}"><span class="mark"></span>

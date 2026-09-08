@@ -71,6 +71,7 @@ def template_app():
     stub = {
         "esi_at": None, "esi_stale": True, "prices_at": None,
         "prices_stale": True, "corp_isk": None, "sde_build": 1,
+        "ui_scale": 1.0, "font_size_px": 14,
     }
     # This REPLACES the real context processors, so it must mirror
     # everything base.html reads — a missing key is an UndefinedError in

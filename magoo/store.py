@@ -631,6 +631,10 @@ _MIGRATIONS = (
     # The bases a run was planned under (vintage for the run pages).
     "ALTER TABLE index_run ADD COLUMN hub_price_basis TEXT",
     "ALTER TABLE index_run ADD COLUMN structure_price_basis TEXT",
+    # Schema 9 (v1.27): UI Scale / Font Size settings, applied site-wide
+    # via CSS custom properties (see base.html).
+    "ALTER TABLE settings ADD COLUMN ui_scale REAL NOT NULL DEFAULT 1.0",
+    "ALTER TABLE settings ADD COLUMN font_size_px INTEGER NOT NULL DEFAULT 14",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -1142,6 +1146,11 @@ class Settings:
     # the best order — the market is then a single unbounded rung.
     hub_price_basis: str = "ladder"
     structure_price_basis: str = "ladder"
+    # v1.27: display prefs, applied to every page via base.html's --ui-scale
+    # / --font-size-base CSS variables. ui_scale is a fraction (1.0 = 100%,
+    # 0.5-2.0 range); font_size_px is plain pixels (11-20 range).
+    ui_scale: float = 1.0
+    font_size_px: int = 14
 
     def compressed_groups(self) -> frozenset[int]:
         """The raw groups compressed sourcing may cover — one toggle each
