@@ -498,6 +498,13 @@
 // --ui-scale / --font-size-base custom properties base.html sets on
 // <html> from the saved settings (see layoutAligned's --item-col above
 // for the same style.setProperty technique).
+//
+// The slider itself still snaps to its notch immediately (that's the
+// browser's own dragging behavior) — but committing that notch to the
+// number box and the live preview waits NOTCH_DELAY_MS after the last
+// move, so quickly dragging across several notches doesn't fire a burst
+// of jumps; only the one you settle on lands.
+const NOTCH_DELAY_MS = 1000;
 [
   ["ui_scale_range", "ui_scale_pct", "--ui-scale", v => v / 100],
   ["font_size_range", "font_size_px", "--font-size-base", v => v + "px"],
@@ -505,9 +512,15 @@
   const range = document.getElementById(rangeId);
   const number = document.getElementById(numberId);
   const apply = v => document.documentElement.style.setProperty(cssVar, toCssValue(v));
-  range.addEventListener("input", () => { number.value = range.value; apply(+range.value); });
+  let notchTimer = null;
+  range.addEventListener("input", () => {
+    clearTimeout(notchTimer);
+    const value = range.value;
+    notchTimer = setTimeout(() => { number.value = value; apply(+value); }, NOTCH_DELAY_MS);
+  });
   number.addEventListener("input", () => {
     if (number.value === "") return;
+    clearTimeout(notchTimer);
     const clamped = Math.min(+number.max, Math.max(+number.min, +number.value));
     range.value = clamped;
     apply(clamped);
