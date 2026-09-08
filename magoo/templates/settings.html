@@ -62,16 +62,27 @@
     <label for="ui_scale_range">UI Scale
       <small>Overall layout density — spacing, tables, panels. Text size is separate, below.</small></label>
     <span class="slider-pair">
-      <input id="ui_scale_range" type="range" min="50" max="200" step="5"
+      <input id="ui_scale_range" type="range" min="50" max="200" step="25" list="ui_scale_ticks"
              value="{{ settings.ui_scale|pct }}">
+      <datalist id="ui_scale_ticks">
+        <option value="50"></option><option value="75"></option><option value="100"></option>
+        <option value="125"></option><option value="150"></option><option value="175"></option>
+        <option value="200"></option>
+      </datalist>
       <span class="withunit"><input id="ui_scale_pct" name="ui_scale_pct" type="number" min="50" max="200" step="1"
              value="{{ settings.ui_scale|pct }}">%</span>
     </span>
     <label for="font_size_range">Font Size
       <small>Text size only, in pixels — the browser default is 14.</small></label>
     <span class="slider-pair">
-      <input id="font_size_range" type="range" min="11" max="20" step="1"
+      <input id="font_size_range" type="range" min="11" max="20" step="1" list="font_size_ticks"
              value="{{ settings.font_size_px }}">
+      <datalist id="font_size_ticks">
+        <option value="11"></option><option value="12"></option><option value="13"></option>
+        <option value="14"></option><option value="15"></option><option value="16"></option>
+        <option value="17"></option><option value="18"></option><option value="19"></option>
+        <option value="20"></option>
+      </datalist>
       <span class="withunit"><input id="font_size_px" name="font_size_px" type="number" min="11" max="20" step="1"
              value="{{ settings.font_size_px }}">px</span>
     </span>
