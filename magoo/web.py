@@ -788,7 +788,8 @@ def _settings_save(c, form):
         "compressed_minerals_enabled = ?, compressed_moon_enabled = ?, "
         "compressed_gas_enabled = ?, compressed_ore_yield = ?, "
         "compressed_gas_yield = ?, compressed_reprocess_tax = ?, "
-        "hub_price_basis = ?, structure_price_basis = ? "
+        "hub_price_basis = ?, structure_price_basis = ?, "
+        "ui_scale = ?, font_size_px = ? "
         "WHERE id = 1",
         (
             margin,
@@ -852,6 +853,8 @@ def _settings_save(c, form):
             min(0.5, max(0.0, pct_field("compressed_tax_pct"))),
             hub_basis,
             structure_basis,
+            min(2.0, max(0.5, pct_field("ui_scale_pct"))),
+            min(20, max(11, int_field("font_size_px"))),
         ),
     )
     # Security is chosen as a band (high/low/null) and stored as a
@@ -1299,6 +1302,12 @@ def create_app() -> Flask:
             "prices_stale": px_age is None or px_age > STALE_SECONDS,
             "corp_isk": snap["corporation_isk"] if snap else None,
             "sde_build": ref().sde_build(),
+            # Display prefs (v1.27): base.html reads these off the same
+            # nav_status() call — settings_ is already fetched above — to
+            # set --ui-scale/--font-size-base on <html> before first paint,
+            # so no separate context-processor query is needed.
+            "ui_scale": settings_.ui_scale,
+            "font_size_px": settings_.font_size_px,
         }
 
     @app.context_processor

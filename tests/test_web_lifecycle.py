@@ -255,6 +255,8 @@ def _settings_form(**over) -> dict:
         "compressed_ore_yield_pct": "75",
         "compressed_gas_yield_pct": "60",
         "compressed_tax_pct": "0",
+        "ui_scale_pct": "100",
+        "font_size_px": "14",
     }
     for cls in config.ITEM_CLASSES:
         form[f"{cls}_structure"] = ""
@@ -295,6 +297,30 @@ def test_settings_post_locale_comma_decimal_saves(seeded_client):
     c.close()
     assert saved.freight_in_isk_per_m3 == 1.5  # "1,5" read as 1.5
     assert saved.max_run_duration_hours == 48.0  # the rest saved too
+
+
+def test_settings_post_display_prefs_round_trip(seeded_client):
+    resp = seeded_client.post(
+        "/settings", data=_settings_form(ui_scale_pct="125", font_size_px="18")
+    )
+    assert resp.status_code == 302
+    c = _state()
+    saved = store.get_settings(c)
+    c.close()
+    assert saved.ui_scale == 1.25
+    assert saved.font_size_px == 18
+
+
+def test_settings_post_display_prefs_clamped(seeded_client):
+    resp = seeded_client.post(
+        "/settings", data=_settings_form(ui_scale_pct="500", font_size_px="99")
+    )
+    assert resp.status_code == 302
+    c = _state()
+    saved = store.get_settings(c)
+    c.close()
+    assert saved.ui_scale == 2.0  # clamped to the 50%-200% ceiling
+    assert saved.font_size_px == 20  # clamped to the 11-20px ceiling
 
 
 # --- review 2026-09-05: buy-side badges, the unsourced remainder, the ----------

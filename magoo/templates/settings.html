@@ -15,6 +15,7 @@
 <div class="settings">
 <aside class="sidenav">
   <a href="#global">Global</a>
+  <a href="#display">Display</a>
   <a href="#stockpile">Stockpile Buffer</a>
   <a href="#alchemy">Alchemy</a>
   <a href="#compressed">Compressed Sourcing</a>
@@ -52,6 +53,28 @@
       <small>Flat SCC tax on every job installation fee. Usually 4%; check an install quote in the client.</small></label>
     <span class="withunit"><input id="industry_scc_pct" name="industry_scc_pct" type="number" step="0.01" min="0" max="20"
            value="{{ settings.industry_scc_surcharge|pct }}">%</span>
+  </div>
+</div>
+
+<div class="panel" id="display">
+  <h2>Display <span class="muted">— UI scale and font size, applied everywhere right after you save</span></h2>
+  <div class="fields">
+    <label for="ui_scale_range">UI Scale
+      <small>Overall layout density — spacing, tables, panels. Text size is separate, below.</small></label>
+    <span class="slider-pair">
+      <input id="ui_scale_range" type="range" min="50" max="200" step="5"
+             value="{{ settings.ui_scale|pct }}">
+      <span class="withunit"><input id="ui_scale_pct" name="ui_scale_pct" type="number" min="50" max="200" step="1"
+             value="{{ settings.ui_scale|pct }}">%</span>
+    </span>
+    <label for="font_size_range">Font Size
+      <small>Text size only, in pixels — the browser default is 14.</small></label>
+    <span class="slider-pair">
+      <input id="font_size_range" type="range" min="11" max="20" step="1"
+             value="{{ settings.font_size_px }}">
+      <span class="withunit"><input id="font_size_px" name="font_size_px" type="number" min="11" max="20" step="1"
+             value="{{ settings.font_size_px }}">px</span>
+    </span>
   </div>
 </div>
 
@@ -457,4 +480,27 @@
 </div>
 </div>
 </div>
+
+<script>
+// Display panel: each slider stays in sync with its exact-value textbox
+// (either can drive the other) and previews live via the same
+// --ui-scale / --font-size-base custom properties base.html sets on
+// <html> from the saved settings (see layoutAligned's --item-col above
+// for the same style.setProperty technique).
+[
+  ["ui_scale_range", "ui_scale_pct", "--ui-scale", v => v / 100],
+  ["font_size_range", "font_size_px", "--font-size-base", v => v + "px"],
+].forEach(([rangeId, numberId, cssVar, toCssValue]) => {
+  const range = document.getElementById(rangeId);
+  const number = document.getElementById(numberId);
+  const apply = v => document.documentElement.style.setProperty(cssVar, toCssValue(v));
+  range.addEventListener("input", () => { number.value = range.value; apply(+range.value); });
+  number.addEventListener("input", () => {
+    if (number.value === "") return;
+    const clamped = Math.min(+number.max, Math.max(+number.min, +number.value));
+    range.value = clamped;
+    apply(clamped);
+  });
+});
+</script>
 {% endblock %}
