@@ -215,7 +215,7 @@ code { font: 500 .85em var(--mono); background: var(--bg);
 tr:target td { background: var(--hover); }
 tr.neg td { background: var(--neg-row); }
 tr.neg:hover td { background: color-mix(in srgb, var(--neg-row) 70%, var(--hover)); }
-td.bad { color: var(--bad); } td.good { color: var(--good); }
+td.bad { color: var(--bad); } td.good { color: var(--good); } td.warn { color: var(--warn); }
 tr td:first-child { border-left: 2px solid transparent; }
 tr.neg td:first-child { border-left-color: var(--bad); }
 tr.top td:first-child { border-left-color: var(--good); }
@@ -396,6 +396,37 @@ td.end { text-align: right; }
        border-radius: var(--r-btn); padding: .35rem .6rem;
        font: 400 .75rem/1.45 var(--ui); color: var(--text);
        box-shadow: 0 4px 14px rgba(0,0,0,.45); }
+
+/* Ledger Top-10 lists (v1.27.0): rank · product · figure, mono figures right. */
+ol.toplist { margin: 0; padding-left: 1.4rem; }
+ol.toplist li { padding: .1rem 0; }
+ol.toplist li > .line { display: flex; gap: .6rem; align-items: baseline; }
+ol.toplist .fig { margin-left: auto; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+ol.toplist .sub { color: var(--dim); font-size: .75rem; white-space: nowrap; }
+/* Ledger charts (v1.27.0): token-only SVG charts, fills on shapes, strokes on paths. */
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 1rem; }
+.charts .panel { margin: 0; }
+.chart { margin: 0; }
+.chart figcaption { font-size: .85rem; color: var(--text); margin-bottom: .25rem; }
+.chart svg { width: 100%; max-width: 520px; height: auto; display: block; }
+.chart .grid { stroke: var(--line); }
+.chart .zero { stroke: var(--line-strong); }
+.chart .tick { fill: var(--dim); font: 500 11px var(--mono); }
+.chart path { fill: none; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.chart path.tone-accent { stroke: var(--accent); }
+.chart path.tone-good { stroke: var(--good); }
+.chart path.tone-bad { stroke: var(--bad); }
+.chart path.tone-dim { stroke: var(--dim); }
+.chart rect.tone-accent, .chart circle.tone-accent { fill: var(--accent); }
+.chart rect.tone-good, .chart circle.tone-good { fill: var(--good); }
+.chart rect.tone-bad, .chart circle.tone-bad { fill: var(--bad); }
+.chart rect.tone-dim, .chart circle.tone-dim { fill: var(--dim); }
+.legend { list-style: none; display: flex; gap: 1rem; padding: 0; margin: .2rem 0 0; color: var(--dim); font-size: .75rem; }
+.swatch { display: inline-block; width: .7em; height: .7em; margin-right: .3em; }
+.swatch.tone-accent { background: var(--accent); }
+.swatch.tone-good { background: var(--good); }
+.swatch.tone-bad { background: var(--bad); }
+.swatch.tone-dim { background: var(--dim); }
 </style>
 <script>
 // Confirmation guard (2026-09-01): a form with data-confirm="question" is
@@ -734,6 +765,9 @@ document.addEventListener("DOMContentLoaded", function () {
     <a href="{{ url_for('runs') }}"
        title="each index run is one planned cycle: a buy list and the jobs to install"
        {% if ep.startswith('run') %}aria-current="page" class="active"{% endif %}>Index Runs</a>
+    <a href="{{ url_for('ledger') }}"
+       title="what your pipeline finals actually sold for — sales, orders and contracts read from ESI; cost basis from the latest executed run"
+       {% if ep == 'ledger' %}aria-current="page" class="active"{% endif %}>Ledger</a>
     <a href="{{ url_for('characters') }}" {% if ep.startswith('character') or ep.startswith('corp') or ep.startswith('sso') %}aria-current="page" class="active"{% endif %}>ESI</a>
     <a href="{{ url_for('settings') }}" {% if ep.startswith('setting') or ep.startswith('blueprint') %}aria-current="page" class="active"{% endif %}>Settings</a>
   </div>

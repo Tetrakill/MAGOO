@@ -419,6 +419,21 @@ and hover with the teal Hover Wash.
   stored book was truncated; the strip's "N unsourced" tooltip says the
   same). A row nothing filled at all shows "—" in the Venue column with
   an unsourced tooltip, never a market name.
+- **Ledger (v1.27.0):** open orders carry warn `undercut` (listed above the
+  cached best sell — never under the Max Buy basis, where the quote cell
+  reads "not comparable"), warn `unconfirmed` (absent from both ESI order
+  feeds of an ok pull), `no quote`, neutral `partial`; order history rows
+  carry the outcome badge (`filled` good, `partial` warn, `expired` /
+  `cancelled` neutral); ledger rows carry accent `contract` vs neutral
+  `market` as the source, and neutral/warn exclusions `internal`, `no
+  price`, `sales off`, plus warn `mixed` / `swap` (units only)
+  and neutral `estimated split`; product rows carry `capital`, `no
+  executed run`, `N unpriced`, `spin-up`, `N not priced` and the fill-bad
+  `negative margin`; the totals strip's badge slot holds `N without cost
+  basis` and `K contracts not priced`; the ESI tab adds warn `re-login
+  needed` (missing scopes) and the sales feed statuses (`no scope`, `no
+  role`, `partial`, `error`, `skipped`). Every one states its rule in
+  `title`.
 
 ### Status Pills
 - **Style:** 999px chips in 11.5px mono with a 7px status dot — Profit Green
@@ -441,14 +456,37 @@ mono Stat values; values take `good`/`bad`/`warn` by sign or threshold, carry
 full precision in `title`, and nest dim `.sub` suffixes ("/ 60",
 "· 3 pipelines"). A stat slot can hold a warn badge instead of a figure.
 
+### Chart Panel (v1.27.0)
+`figure.chart` inside a `.panel` of the `.charts` grid (`auto-fit,
+minmax(380px, 1fr)`): a figcaption (title, dim caption), a legend only when
+two or more series exist, and an inline SVG (`viewBox 0 0 380 180`, width
+100 %, capped at 520 px) drawn from `charts.py` geometry with tone classes
+alone — `tone-accent` for the primary measure, `tone-good` / `tone-bad` by
+sign, `tone-dim` for the secondary series. Fills sit on rects and circles,
+strokes on paths; the grid and the zero line are hairlines; tick text is
+11px mono. Values live only in native `<title>` tooltips; nothing animates.
+An empty chart is the dim sentence "No sales in this window." with no SVG.
+
+### Notes Panel (v1.27.0)
+The Ledger's degrade panel: `.panel.alert-warn` whose h2 leads with the fill
+badge `partial data` and the lowercase elaboration "some sales are not
+being read", then one `<li>` per note in the grammar `<owner> — <family>:
+<status> (<what to do>) — <what is missing>`; a character lacking scopes
+gets a single re-login line and its per-feed rows are folded into it.
+
 ### Navigation
 - **Top nav:** 44px sticky Void Panel bar. Brand mark (teal square-in-square)
   + mono wordmark "M.A.G.O.O." at +0.18em with the deadpan subtitle beneath;
   center pill links (Slate Dim → Frost on hover, Signal Teal fill when
   active); right-aligned mono status readouts (ESI / PX / SDE / CORP ages,
   amber when stale).
+- **Tab order:** Dashboard · Pipelines · Planning · Invention · Index Runs ·
+  Ledger · ESI · Settings — define, plan, run, sell, then the configuration
+  pair (Ledger added v1.27.0).
 - **Subnav:** folder-tab bar under the pagehead — 6px top radii, transparent
   until active (Void Panel fill + hairline sides), for views within a page.
+  The Ledger's **window subnav** (7 days · 30 days · 90 days · All) is the
+  same bar carrying a query parameter instead of a view.
 - **Sidenav (settings):** a 2px hairline rail of anchor links; the active
   section's link colors Frost and lights its rail segment Signal Teal,
   tracked on scroll.
@@ -485,7 +523,8 @@ the pipeline delete.
 
 ### Collapsible Sections
 `details.section` (2026-09-01): every h2 section and h3 category group on
-the data tabs — Planning, Index Runs (Plan / Chain), Invention — is a
+the data tabs — Planning, Index Runs (Plan / Chain), Invention, Ledger
+(v1.27.0: products, open orders, sales ledger, order history) — is a
 native `<details>` that is **open by default**; the heading itself is the
 `<summary>` (native marker hidden), and its glyph shows the state: the
 subhead's accent ▸ turns ▾ when open, the h2 gains a dim one. A section the
@@ -581,6 +620,11 @@ the same way. The UI never asserts a judgment it can't explain on hover.
 **The One Primary Rule.** At most one Signal Teal filled button per view.
 Everything else is ghost, danger-ghost, or mini.
 
+**The Data-Hue Rule (v1.27.0).** In a chart, Signal Teal marks the primary
+measure, Profit Green and Alert Red mark a value by its sign, Slate Dim the
+secondary series — and never Caution Amber, which stays a caution and is
+not a data hue.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -599,6 +643,8 @@ Everything else is ghost, danger-ghost, or mini.
   creates the missing thing ("No pipelines yet — add one.").
 - **Do** build with native elements — `<details>`, `<dialog>`, forms — and
   keep JS to small vanilla helpers.
+- **Do** draw charts from tokens only, via classes — fills on shapes,
+  strokes on paths, values in `<title>` — never a chart library.
 
 ### Don't:
 - **Don't** introduce color or font via inline styles — inline styles are

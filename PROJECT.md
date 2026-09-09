@@ -249,6 +249,66 @@ anywhere, iterates quickly, and owns its own data pipeline.
     blended landed cost. Ice products are out of scope. Requires an SDE
     download made since v1.25 (`ref_compressible`, `ref_type.portion_size`).
 
+18. **Ledger (v1.27.0, 2026-09-07)** — what the pipeline finals actually
+    sold for. Every "⟳ Update from ESI" runs a second, independently
+    guarded step after the snapshot (and, since the same day's user
+    request, the price refresh as a third — one button keeps the quotes,
+    undercut verdicts and contract splits current; ⟳ Refresh prices
+    stays for prices alone): for each character and corporation
+    with **Count sales** on (ESI tab; default on), the owner's SELL
+    market orders (open + 90-day history), wallet SALE transactions
+    (corporations per wallet division) and ISSUED contracts with their
+    items are read and persisted under their global ESI ids — every type,
+    sell side only, never deleted — so history outlives ESI's windows.
+    The **Ledger** tab reads them for the finals of every pipeline (active
+    or not) over a calendar-aligned UTC window (7 / 30 / 90 days / all):
+    **wallet transactions are the units-sold truth** (order history only
+    explains outcomes — filled / partial / expired / cancelled — and is
+    never summed; no fallback when a wallet feed is degraded); a finished,
+    priced item-exchange contract holding only finals credits its whole
+    price to them (pro rata by cached quote, equal per unit with an
+    *estimated split* badge without quotes); a contract that bundles other
+    items (*mixed*) or asks for items back (*swap*) counts its hulls as
+    units only; sales to the user's own characters or corporations
+    (*internal*), unpriced contracts and auctions are listed, never
+    counted. **Net** deducts estimated fees by **where the hull sold**
+    (`costing.net_proceeds_at_venue` on the sale's ESI location): an NPC
+    station pays the high-sec hub fee pair, the SCC surcharge and
+    freight-out per m³; a structure pays the null-sec market fee pair, the
+    SCC surcharge and the structure leg per m³; capital-class hulls take
+    the flat movement cost at either venue (they fly themselves) and the
+    freight-exempt XL hulls pay no per-m³ term; the undercut badge on an
+    open order compares with the book the order sits in (Jita for an NPC
+    station, the structure cache for the configured market, no verdict
+    elsewhere); a contract without a location falls back to the
+    Planning tab's class rule; contracts pay the same estimates as an
+    approximation. The **cost basis** is `costing.hull_cost`
+    on the latest executed run with attributable hulls (a zero-total basis
+    is no basis); estimated profit = net − units × cost, margin = profit ÷
+    cost. The page: the header strip (user ruling 2026-09-08) — **Revenue ·
+    Cost of goods sold · Net income · Margin · Unrealized profit · Units
+    sold · Contracts closed** plus the *N without cost basis* / *K
+    contracts not priced* badges, where net income = net proceeds − cost
+    of goods sold over the products with a basis, margin = net income ÷
+    cost of goods sold, and **unrealized profit** = what the open sell
+    orders (units remaining at the listed price) and outstanding
+    item-exchange contracts (at their price) would bank after the
+    estimated fees of their venue, minus their cost basis — hangar stock
+    excluded, not bound by the window (`ledger.unrealized`); three
+    server-rendered SVG charts (revenue & net income per bucket, units
+    sold market-over-contract, cumulative net income), Top 10 by margin /
+    quantity / net income, the
+    products table (with the run each cost basis comes from), open sell
+    orders with an *undercut* badge against the cached sell quote (never
+    under the Max Buy basis), open contracts, the per-sale ledger (net and
+    estimated profit per row) and order history, plus a *partial data*
+    panel: one re-login line per character lacking scopes (naming the
+    feeds it affects), every current owner × feed that lacks a role, was
+    rate-limited, errored or was skipped, owners switched off that still
+    have sales in the window, and the contracts ESI gave no items for. Count sales is honoured at read time too
+    (rows keep accruing). Needs four new scopes on the app registration
+    and a re-login per character (the ESI tab badges *re-login needed*).
+
 ---
 
 ## 3. Architecture
@@ -271,7 +331,13 @@ magoo/
                           fee model (v1.5/v1.6) + the buy-venue chooser
                           (v1.10, pure)
     esi.py                OAuth2 PKCE; corp+char assets, industry jobs,
-                          wallets; structure resolution + market orders
+                          wallets; structure resolution + market orders;
+                          the Ledger feeds (sell orders, wallet
+                          transactions, contracts + items; v1.27.0)
+    ledger.py             sales pull (two-phase per owner × family, the
+                          contiguous transactions cursor) + the Ledger
+                          tab's read side (v1.27.0)
+    charts.py             pure SVG chart geometry for the Ledger (v1.27.0)
     market.py             price snapshots: regional hub quotes, the
                           structure market's best prices + sell ladders,
                           and the per-type buy quote (v1.10)
@@ -878,6 +944,7 @@ included. Deleted with its run or its pipeline.
 | `include_assets` | Count this character's wallet toward buying power (stock is corp-scope since 2026-08-20) |
 | `include_job_slots` | Count this character's PERSONAL jobs toward slot occupancy / multi-cycle netting (2026-08-25: corp-feed jobs count under the corp's `count_jobs` toggle instead — the corp feed runs first and claims corp jobs in the dedup) |
 | `count_assets` | 2026-08-25: opt this character's PERSONAL hangars into stock on hand (default 0) |
+| `count_sales` | v1.27.0: pull this character's sell orders, sale transactions and contracts for the Ledger and count them (default 1; honoured at read time — a character switched off also stops carrying its corporation's wallet sales that only its own feed reports) |
 
 **`esi_corp`** — corporations reachable through the pool (ESI tab); upserted
 on every ESI refresh, `count_assets` is user state and survives; rows pruned
@@ -893,6 +960,7 @@ when every member has left the pool.
 | `assets_via` / `jobs_via` / `wallet_via` | character_id that answered the endpoint family (NULL = no role or skipped) |
 | `asset_rows` / `job_rows` | Rows returned at the last refresh (pull diagnostics) |
 | `refreshed_at` | |
+| `count_sales` | v1.27.0: pull this corporation's sell orders, wallet sales (7 divisions) and issued contracts for the Ledger and count them (default 1; read-time too). Its sales provenance lives in `sales_pull`, not here |
 
 ### Settings
 
@@ -1149,6 +1217,110 @@ time for a fill cost. A book shorter than 300 rungs is the WHOLE book
 network: fetched_at, on_hand / in_progress / active_jobs JSON, wallet ISK,
 and `job_ends` (2026-08-20: active-job end dates per activity, for
 multi-cycle slot netting). Pruned to the most recent five rows.
+
+### Sales ledger (v1.27.0)
+
+Schema 9. Sell-side history persisted by the second step of the ESI
+refresh (`ledger.pull_sales`), keyed by ESI's global ids so the same row
+reached through two feeds lands once. ESI timestamps are stored verbatim
+(`…Z`) and Magoo's own stamps use the same shape (`ledger._now_iso`), so
+text comparison is exact. ESI enums (order state, contract type / status)
+carry no CHECK — a value CCP adds must never abort a pull. Nothing here is
+ever deleted; `count_sales` toggles are honoured at read time.
+
+**Owner normalisation** — `owner_kind` / `owner_id` name whose sale it is:
+a character-feed order flagged `is_corporation`, or a transaction with
+`is_personal = false`, is stored under the character's CURRENT corporation
+(the documented limit: a character who changed corps inside the stored
+window credits today's corp); a contract is exact (`issuer_corporation_id`
+when `for_corporation`, else the issuing character; acceptor / assignee
+rows are dropped); corp feeds store their own corporation with the wallet
+division. The upsert rule is **corp beats character**: a row the corp feed
+sees re-owns itself (`source_feed`, owner columns, division) whatever a
+character feed stored first.
+
+**`sale_transaction`** (`transaction_id` PK) — sell-side wallet transactions:
+owner columns, `division` (corp 1–7 / NULL), `source_feed`, `type_id`,
+`quantity`, `unit_price`, `date`, `location_id`, `client_id` (the buyer —
+internal when it is one of ours), `journal_ref_id` (journal-based fees: a
+follow-up), `fetched_at`. Indexes `(type_id, date)`, `(owner, id)`.
+
+**`sale_order`** (`order_id` PK) — SELL orders, open or closed within ESI's
+90 days: owner columns, `issued_by`, `price` / `volume_remain` (last seen),
+`volume_total`, `location_id`, `duration`, `issued` (EVE re-issues on a
+price edit), `state` (`open`, or the history feed's state verbatim —
+`cancelled` / `expired`; a filled order arrives as `expired` with nothing
+remaining, to be verified live), `first_seen_at`, `last_seen_at`,
+`history_seen_at` (first sighting in the history feed, stamped
+`min(now, issued + duration)` — ESI reports no close time), `missing_since`
+(an open row absent from both feeds of an ok pull: the *unconfirmed*
+badge, cache skew). The open feed can update a row only `WHERE state =
+'open'`, so a stale 1200 s listing never reopens a closed order.
+
+**`sale_contract`** (`contract_id` PK) — contracts ISSUED by the owner,
+every type and status: owner columns, `issuer_id`, `issuer_corporation_id`,
+`for_corporation`, `acceptor_id`, `assignee_id`, `availability`, `type`,
+`status`, `price` (nullable — ESI omits it on some), `title`, the four
+dates, `start_location_id`, `via_character_id` (provenance only, NULLed on
+character delete), `first_seen_at`, `last_seen_at`, `items_fetched_at`,
+`items_status` (`ok` / `missing` — gone from ESI, or three failed attempts /
+`unavailable` — every candidate token was refused), `items_attempts`; ESI
+trouble while fetching (429, 420, 5xx, transport) charges no attempt, the
+contract simply waits for the next refresh. Items are fetched
+for item exchanges that are outstanding, in progress or finished, finished
+first then newest, at most `LEDGER_CONTRACT_ITEMS_PER_REFRESH` per refresh,
+with the token chosen AT FETCH TIME (the character, or the member that
+answered the corp listing, then any member with the scope; a 403 tries
+the next), so a removed character never wedges the backlog.
+
+**`sale_contract_item`** (PK `(contract_id, record_id)`) — `type_id`,
+`quantity`, `raw_quantity` (−1 singleton, −2 BPC), `is_included` (1 = the
+issuer gives it: sold; 0 = asked back: a swap), `is_singleton`.
+
+**`sales_pull`** (PK `(owner_kind, owner_id, family, division)`; family ∈
+orders / transactions / contracts; division 1–7 for corp transactions,
+else 0) — provenance and cursor: `status` ∈ `ok` / `partial` / `off` /
+`no_scope` / `no_role` / `error` / `skipped`, `message`, `via_character_id`,
+`rows` / `rows_new` / `calls` (diagnostics), `pulled_at`, and for
+transactions the cursor `oldest_id` / `newest_id` / `backfilled`. A non-ok
+write never clobbers the cursor (`COALESCE` / `MAX`).
+
+**The transactions cursor** is ONE contiguous covered id range per owner
+and division, buys included (they are read for the cursor and never
+stored). Pass A walks the newest page downward until it meets the stored
+range — uncapped once a range exists, so a burst larger than a page is
+walked to the join and `newest_id` moves only when the join happened; on a
+first pull it IS the backfill and is capped at
+`LEDGER_TX_PAGES_PER_REFRESH` pages. Pass B, the only pass that may set
+`backfilled`, back-fills below `oldest_id` the same number of pages per
+refresh and resumes next time (`partial` — "older history still loading").
+End of history is `not page or min(ids) >= from_id`, so an inclusive or
+exclusive `from_id` both terminate; a boundary-only page is the end.
+
+**Pull mechanics.** Corporations first (every corp Magoo knows, so an
+outage still stamps their rows), then characters; per owner × family:
+toggle off → `off` with no call; ESI down → `skipped`; a dead refresh token
+→ that character's own families `error` with the re-auth message and corp
+families fall through to the next member; corporation membership unknown
+this pull (the public `/characters/{id}/` call failed) → orders and
+transactions `error` with **no fetch**, so the cursor cannot skip the
+corp-flagged rows; scope pre-check before any call (a 403 costs error
+budget) → `no_scope`; then the fetch phase over candidate tokens with no
+transaction open, then one short `BEGIN IMMEDIATE` write (the lock never
+spans a network call). A corp fetcher's 403 → next candidate → all 403 =
+`no_role` naming the roles; 420 / 5xx / transport error → ESI down for the
+rest of the pull; 429 → that rate group stops (`Retry-After`); the four
+rate groups (char-wallet 150, corp-wallet 300, char- / corp-contract 600
+tokens per 15 min) each get `LEDGER_RATE_BUDGET_FRACTION` (40 %) of their
+budget per refresh, read app-wide until verified (§8); the ledger's
+fetchers ask `esi_request` NOT to sleep-and-retry a 429 (`retry_429=False`)
+since a 15-minute bucket cannot recover in a minute — the group is stopped
+instead. Listing calls are charged once each (a paged listing's extra
+pages are not counted; item fetches are charged per request). A corp
+wallet whose division 1 finds no role holder stamps divisions 2..7
+`no_role` without probing (the role is corp-wide). Open-order
+reconciliation (`missing_since`) runs only for an owner whose own two
+order calls answered.
 
 ---
 
@@ -1547,6 +1719,24 @@ learns the outcome by polling `/sso/status`.
 | `esi-wallet.read_corporation_wallets.v1` | Corp ISK (buying-power check) |
 | `esi-universe.read_structures.v1` | Structure → solar-system resolution |
 | `esi-markets.structure_markets.v1` | v1.6 capital sell quotes from the structure market |
+| `esi-markets.read_character_orders.v1` | v1.27.0 Ledger: the character's own sell orders (open + 90-day history) |
+| `esi-markets.read_corporation_orders.v1` | v1.27.0 Ledger: corporation sell orders (Accountant or Trader) |
+| `esi-contracts.read_character_contracts.v1` | v1.27.0 Ledger: contracts the character issued, with items |
+| `esi-contracts.read_corporation_contracts.v1` | v1.27.0 Ledger: contracts issued for the corporation, with items (no role documented — verify) |
+
+The two wallet scopes also cover the Ledger's wallet transactions
+(character; corporation per division with Accountant or Junior
+Accountant). The four v1.27.0 scopes must be enabled on the app
+registration at developers.eveonline.com BEFORE any character re-logs —
+SSO answers `invalid_scope` otherwise — and every existing token needs
+that re-login: `_store_tokens` records the JWT's `scp` claim on every
+login and refresh, a refresh never widens it, and the ESI tab badges each
+character still lacking any requested scope (*re-login needed*,
+`esi.missing_scopes`). Rate-limit groups the Ledger respects per refresh:
+char-wallet 150, corp-wallet 300, char-contract 600, corp-contract 600
+tokens per 15 minutes, 40 % of each per pull (`LEDGER_RATE_BUDGET_FRACTION`),
+counted app-wide — whether the group is per token or per application is
+unverified.
 
 Tokens are stored in the local SQLite database. Refresh handled
 transparently. ETag/Expires response caching is NOT yet implemented — a
@@ -3040,6 +3230,25 @@ user's Windows machine against the live database.
 | Book badges: one word each (2026-09-07, v1.26.1) | `shallow` meant three things; now only *N unsourced* (fill-priced remainder with no market, R5) survives as a warning — *cut short* (R6) lasted a few hours: the same day's re-solve means a compressed buy is never shrunk below what the LP wanted; the single-quote structure case (its ladder covers only part of the buy: pre-v1.25 runs, the Planning tab, the Invention tab) is no badge at all — the venue cell reads "Jita Z · C-J6 X" and Multibuy splits the same way (`_buy_context.venue_split`); `_buy_context` key `unsourced`, `_macros.book_badge` | User request: one badge word with three tooltips was unreadable, and "thin book" was too close to "unsourced" to earn its own word |
 | Partly wanted batch (2026-09-07, v1.26.1) | The LP's continuous take of a compressed type rounds up to whole batches only when the last batch's landed cost is below what the direct units its wanted fraction displaces would cost (the dearest units of each raw's remaining direct buy, by the merged fill — `displaced_value` at the LP's coverage); otherwise the type rounds down and those units stay direct | Surplus is worth nothing (2026-09-05); the unconditional round-up of v1.25 was invisible until the re-solve asked another ore to cover a 0.22-unit gap and bought a 300,000 ISK batch to displace 780 ISK of direct Tritanium (refute lane; on the maintainer's copy the re-solve had landed 273k ISK worse than the old shrink for the same reason) |
 | T2 invention: skills (v1.22) | One new setting (`skill_encryption`, /40 term); the datacore sciences reuse `skill_starship_engineering` / `skill_science` through the existing `_per_bp_skill_level` name families | The families already route every science skill correctly; only Encryption Methods had no home (and its formula weight differs) |
+| Ledger sources and scope (v1.27.0, 2026-09-07) | Issuer-side item-exchange contracts AND sell orders + wallet sale transactions; corporations and characters each behind a Count sales toggle (default on); pipeline finals only, active or not; refreshed as a second step of the dashboard ESI update, no polling | User rulings (2026-09-07): contracts sell the capitals, wallets the rest; toggles mirror the ESI tab's other feeds; "live" means read from ESI, not manually entered |
+| Transactions are the units-sold truth (v1.27.0) | Wallet sale transactions count units and revenue; order history is stored and classified (filled / partial / expired / cancelled) but never summed; no fallback estimate when a wallet feed is degraded | A filled order already produced its fill transactions; a closed order has neither fill dates nor prices and would double the moment the role is granted |
+| Contract attribution (v1.27.0) | A finished, priced item exchange with an external acceptor whose items are only finals credits its whole price to them pro rata by cached quote × qty (equal per unit + *estimated split* without quotes); a *mixed* (other items included) or *swap* (items asked back) contract counts its hulls as units only, never revenue; auctions never count; item-less contracts are counted in the *partial data* note, never listed | A fitted-hull bundle credited wholesale posted a 780 % margin and a hull-for-hull trade a 200 M loss in the adversarial pass — units are certain, the price split is not |
+| Sell fees estimated, by venue (v1.27.0) | `costing.net_proceeds_at_venue` at the realized unit price: the sale's ESI location picks the fee pair and the movement term — NPC station → hub broker/tax + SCC + `freight_out_isk_per_m3` × m³; structure → the null-sec market pair + SCC + `structure_freight_in_isk_per_m3` × m³ (sub-caps); capital-class hulls take `capital_movement_cost_isk` at EITHER venue (a Thanatos at Jita 4-4 charged 1.3M m³ of freight-out was the review's finding — capitals fly themselves); freight-exempt XL hulls pay no per-m³ term; no location → the class rule (`net_proceeds_per_hull`, which Planning keeps); applied to contract sales too | The user asked for "estimated profit" and then that freight follow where the hull sold (2026-09-08) — the per-leg rates already existed in Settings; any structure other than the configured market is charged its rates (the only structure rates on record); journal-based actual fees are the documented follow-up |
+| Cost basis = latest executed run (v1.27.0) | `costing.hull_cost` on the newest `complete` run where the pipeline had `qty_attributable > 0` for its final (two pipelines sharing a final: the newest run, tie → lowest pipeline id); a basis totalling 0 (every line unpriced) is no basis; per-sale-date vintages are a follow-up | The user's words; the lag walk already prices that run's inputs at their vintages |
+| Store every type, sell side only (v1.27.0) | The pull persists every sell-side row it sees; the Ledger filters to finals at read time; buys are read only to drive the transactions cursor | A pipeline added later sees its past sales; buys have no consumer (cost basis is the price snapshot, decision "Cost basis") |
+| Owner normalisation, corp beats character (v1.27.0) | Character-feed rows flagged corporate are stored under the character's current corporation; the corp feed re-owns any row it can see (owner columns included); contracts are exact via `issuer_corporation_id`; `feed_overlap_suspects` is the tripwire that one sale carries one id on both feeds | A corp-wallet sale seen through the selling character's feed must not double under two owners |
+| Sales pull placement (v1.27.0) | A second, independently guarded step of `POST /esi/refresh` after `save_esi_snapshot` has committed; `refresh_state` untouched; two-phase per owner × family × division (every ESI call, then one short write); `except Exception` around the step (the `_after_sde_import` precedent) | Neither step may lose the other's data; the write lock must never span a network call (a toggle click waited on `busy_timeout` otherwise) |
+| Transactions coverage is one contiguous range (v1.27.0) | `oldest_id` / `newest_id` / `backfilled` per owner and division; `newest_id` moves only when the top pass joined the stored range; the backfill pass alone sets `backfilled`; capped and resumable per refresh | A capped walk that advanced the newest edge on a quiet page silently lost the rows between two refreshes (design critique, blocker) |
+| ESI trouble per family (v1.27.0) | 420 / 5xx / transport = ESI down for the rest of the pull; 429 stops its rate group (`Retry-After`); 40 % pre-emptive per-group budget per refresh; scope pre-check before any call; role and dead-token fallback across the pool; contract items pick their token at fetch time, three attempts | A synchronous POST cannot afford `esi_request`'s per-call sleeps repeated across seven divisions; a removed character must not wedge the item backlog |
+| Count sales honoured at read time (v1.27.0) | Rows keep accruing while an owner is off; the read side drops them (badge *sales off* on the ledger row, a degrade note) | Toggling a corp off must not hide sales its members' feeds still report under it |
+| Windows calendar-aligned UTC (v1.27.0) | `until = today`, `since = until − (N − 1)` days, filter `date >= since 00:00:00Z`; buckets 1 / 7 / 30 days by span (≤ 31 / ≤ 182 / else — amends the brief's weekly-for-all: a 3-year `all` at weekly is 156 bars) | Filter, axis and bucket count must agree; today's sales must land on the last bar |
+| Ledger charts: server-rendered SVG (v1.27.0) | `charts.py` computes geometry, `_chart.html` draws with tone classes only (accent primary, good / bad by sign, dim secondary — never amber), viewBox 380 × 180 in an auto-fit grid, native `<title>` tooltips, no library, no JS, no motion | Offline desktop app, the Token Purity Rule, and tests that assert on the rendered HTML |
+| Ledger header vocabulary (2026-09-08) | Revenue · Cost of goods sold · Net income · Margin · Unrealized profit · Units sold · Contracts closed; "net income" is the page's word for net proceeds minus cost of goods sold (tables, charts, Top 10 alike); unrealized profit counts ONLY open sell orders and outstanding contracts at their listed prices, never hangar stock | User ruling: accounting vocabulary in the header; unrealized profit is what is on the market and not yet closed |
+| Structure book keeps every final's sell quote (2026-09-08) | `prices_refresh` adds every pipeline final (active or not, sub-caps included) to the structure pull's wanted set beside the capital finals and the inputs; Planning still quotes sub-caps from Jita | The Ledger judges an open order against the book it sits in, and most of the user's sub-capital orders sit at C-J6 — the book was already downloaded whole, only the rows were being discarded |
+| ESI update refreshes prices too (2026-09-08) | `POST /esi/refresh` = snapshot → sales pull → the price refresh (`_refresh_prices_now`, the body ⟳ Refresh prices shares), each step guarded on its own — a price failure leaves the cache unchanged and says so in the flash; ESI down skips it | User request: one button; the Ledger's undercut verdicts and contract splits read the price cache |
+| Ledger nav position (v1.27.0) | Dashboard · Pipelines · Planning · Invention · Index Runs · **Ledger** · ESI · Settings | Define → plan → run → sell, then the configuration pair |
+| Provenance in `sales_pull`, not `esi_corp` (v1.27.0) | One row per owner × family × division with status, message, via, counts and the cursor; `upsert_esi_corps` unchanged | Three families need three role sets; the corp table's `*_via` columns are one per family and pruned with the corp |
+| No station / structure name cache (v1.27.0) | The Ledger names the solar system through `location_system`; a structure the puller cannot dock at reads "—" with the id in the tooltip | Measure the unresolved volume on real data before adding a name table |
 
 ---
 
@@ -3085,5 +3294,17 @@ user's Windows machine against the live database.
   was a C-J6 rung is priced at that rung under the Jita freight rate when
   the item has a Jita ladder (2026-09-05: settled, see the R5 decision —
   the remainder is unsourced unless Jita's stored book was truncated).
-- **Aggregate profit reporting** (ISK/hour across pipelines over time) —
-  deferred from v1.
+- ~~Aggregate profit reporting~~ (ISK/hour across pipelines over time) —
+  resolved 2026-09-07 by the Ledger tab (v1.27.0): revenue, estimated
+  profit and units over 7 / 30 / 90 days / all, charted and ranked.
+- **Ledger follow-ups** (v1.27.0) — journal-based ACTUAL fees
+  (`transaction_tax` links to a transaction, `brokers_fee` to nothing;
+  the journal reaches 30 days); per-sale-date cost vintages instead of
+  the latest executed run; station / structure names for the Where
+  column; the ESI facts to verify on the first live pull: filled orders
+  arriving as `expired` with nothing remaining, `from_id` inclusivity and
+  page size, how far back the transactions endpoint reaches, whether a
+  rate group is per token or per application, whether an item exchange
+  ever reports `finished_issuer` / `finished_contractor`, assembled hulls
+  as singleton items (`quantity 1`, `raw_quantity −1`), and the corporation
+  contracts endpoint's role requirement.

@@ -53,11 +53,14 @@ def esi_request(
     params: dict | None = None,
     headers: dict | None = None,
     client: httpx.Client | None = None,
+    retry_429: bool = True,
 ) -> httpx.Response:
     """All ESI traffic funnels through here for CCP-guideline compliance:
     descriptive User-Agent, error-limit awareness (back off before the 420
     window trips, honor Retry-After when it does), and retry on transient
-    5xx."""
+    5xx. retry_429=False hands a 429 straight back: the v1.27.0 Ledger's
+    endpoints sit in 15-minute rate groups, where a minute's sleep cannot
+    help and the caller stops the whole group instead."""
     merged = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if headers:
         merged.update(headers)
@@ -71,6 +74,8 @@ def esi_request(
             )
         remain = _int_header(resp.headers, "X-ESI-Error-Limit-Remain", 100)
         reset = _int_header(resp.headers, "X-ESI-Error-Limit-Reset", 1)
+        if resp.status_code == 429 and not retry_429:
+            return resp
         if resp.status_code in (420, 429):
             wait = _int_header(resp.headers, "Retry-After", reset)
             time.sleep(min(wait + 1, 65))
@@ -105,9 +110,37 @@ REQUESTED_SCOPES = (
     # Keepstar or custom). Must also be enabled on the app registration at
     # developers.eveonline.com; characters need a re-auth to pick it up.
     "esi-markets.structure_markets.v1",
+    # v1.27.0 Ledger: the owner's own sell orders and issued contracts.
+    # Wallet transactions ride on the two wallet scopes above. All four
+    # must be enabled on the app registration BEFORE a character re-logs
+    # (SSO answers invalid_scope otherwise); every existing token needs
+    # that re-login — the ESI tab badges the ones still lacking them.
+    "esi-markets.read_character_orders.v1",
+    "esi-markets.read_corporation_orders.v1",
+    "esi-contracts.read_character_contracts.v1",
+    "esi-contracts.read_corporation_contracts.v1",
 )
 
 STRUCTURE_MARKETS_SCOPE = "esi-markets.structure_markets.v1"
+
+# Ledger feed families per owner kind -> the scope a pulling token needs.
+LEDGER_SCOPES = {
+    ("character", "orders"): "esi-markets.read_character_orders.v1",
+    ("corporation", "orders"): "esi-markets.read_corporation_orders.v1",
+    ("character", "transactions"): "esi-wallet.read_character_wallet.v1",
+    ("corporation", "transactions"): "esi-wallet.read_corporation_wallets.v1",
+    ("character", "contracts"): "esi-contracts.read_character_contracts.v1",
+    ("corporation", "contracts"): "esi-contracts.read_corporation_contracts.v1",
+}
+
+
+def missing_scopes(scopes_text: str | None) -> tuple[str, ...]:
+    """REQUESTED_SCOPES a stored token does not carry, in request order —
+    the ESI tab's "re-login needed" badge. _store_tokens records the JWT's
+    scp claim on every login AND refresh, and a refresh never widens it,
+    so only a fresh login can clear this."""
+    held = set((scopes_text or "").split())
+    return tuple(scope for scope in REQUESTED_SCOPES if scope not in held)
 
 # ESI industry jobs use activity 9 for reactions in some eras and 11 in
 # others; accept both and map onto the blueprint activity id.
@@ -335,14 +368,21 @@ def complete_login(conn, code: str, verifier: str) -> tuple[int, str]:
 # ---------------------------------------------------------------------------
 
 
-def _get(conn, character_id: int, path: str, params: dict | None = None):
-    """Authenticated GET returning (json, headers). Retries once on 401."""
+def _get(
+    conn, character_id: int, path: str, params: dict | None = None,
+    retry_429: bool = True,
+):
+    """Authenticated GET returning (json, headers). Retries once on 401.
+    retry_429 is forwarded only when False, so a test's esi_request stand-in
+    with the original signature keeps working."""
+    extra = {} if retry_429 else {"retry_429": False}
     for attempt in (1, 2):
         token = access_token(conn, character_id)
         resp = esi_request(
             f"{ESI_BASE}{path}",
             params=params,
             headers={"Authorization": f"Bearer {token}"},
+            **extra,
         )
         if resp.status_code == 401 and attempt == 1:
             conn.execute(
@@ -355,11 +395,14 @@ def _get(conn, character_id: int, path: str, params: dict | None = None):
     raise RuntimeError("unreachable")
 
 
-def _get_paginated(conn, character_id: int, path: str) -> list:
-    data, headers = _get(conn, character_id, path, {"page": 1})
+def _get_paginated(
+    conn, character_id: int, path: str, retry_429: bool = True
+) -> list:
+    extra = {} if retry_429 else {"retry_429": False}
+    data, headers = _get(conn, character_id, path, {"page": 1}, **extra)
     pages = _int_header(headers, "X-Pages", 1)
     for page in range(2, pages + 1):
-        more, _ = _get(conn, character_id, path, {"page": page})
+        more, _ = _get(conn, character_id, path, {"page": page}, **extra)
         data.extend(more)
     return data
 
@@ -458,6 +501,156 @@ def fetch_corp_wallets(
 
 
 # ---------------------------------------------------------------------------
+# Ledger feeds (v1.27.0): sell orders, wallet transactions, contracts
+# ---------------------------------------------------------------------------
+# Thin wrappers over _get / _get_paginated, one module-level function per
+# endpoint, so tests monkeypatch them the way test_esi patches the
+# refresh_state fetchers. Corp fetchers return None on 403 (no role) like
+# fetch_corp_assets; the contract ITEM fetchers return None on 404 only
+# (the contract is gone) and let a 403 raise, because the ledger tries the
+# next candidate token on a 403 and must tell the two apart. from_id is
+# sent only when given: httpx renders {"from_id": None} as "?from_id=" and
+# ESI answers 400.
+
+
+def _lget(conn, character_id: int, path: str, params: dict | None = None):
+    """The ledger's authenticated GET: a 429 comes straight back (its
+    15-minute rate group is stopped by the caller, never slept through)."""
+    return _get(conn, character_id, path, params, retry_429=False)
+
+
+def _lpaged(conn, character_id: int, path: str) -> list:
+    return _get_paginated(conn, character_id, path, retry_429=False)
+
+
+def _from_id_params(from_id) -> dict | None:
+    return None if from_id is None else {"from_id": int(from_id)}
+
+
+def _none_on_403(fetch):
+    try:
+        return fetch()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 403:
+            return None
+        raise
+
+
+def _none_on_404(fetch):
+    try:
+        return fetch()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return None
+        raise
+
+
+def fetch_character_orders(conn, character_id: int) -> list:
+    """Open orders — an unpaged endpoint (verified against the live spec)."""
+    data, _ = _lget(conn, character_id, f"/characters/{character_id}/orders/")
+    return data
+
+
+def fetch_character_order_history(conn, character_id: int) -> list:
+    """Cancelled and expired orders of the last 90 days (paged)."""
+    return _lpaged(
+        conn, character_id, f"/characters/{character_id}/orders/history/"
+    )
+
+
+def fetch_character_transactions(conn, character_id: int, from_id=None) -> list:
+    """The newest page of wallet transactions, or the page before from_id."""
+    data, _ = _lget(
+        conn,
+        character_id,
+        f"/characters/{character_id}/wallet/transactions/",
+        _from_id_params(from_id),
+    )
+    return data
+
+
+def fetch_character_contracts(conn, character_id: int) -> list:
+    return _lpaged(
+        conn, character_id, f"/characters/{character_id}/contracts/"
+    )
+
+
+def fetch_character_contract_items(
+    conn, character_id: int, contract_id: int
+) -> list | None:
+    def fetch():
+        data, _ = _lget(
+            conn,
+            character_id,
+            f"/characters/{character_id}/contracts/{contract_id}/items/",
+        )
+        return data
+
+    return _none_on_404(fetch)
+
+
+def fetch_corp_orders(conn, character_id: int, corporation_id: int) -> list | None:
+    """Open corp orders (Accountant or Trader); None without the role."""
+    return _none_on_403(
+        lambda: _lpaged(
+            conn, character_id, f"/corporations/{corporation_id}/orders/"
+        )
+    )
+
+
+def fetch_corp_order_history(
+    conn, character_id: int, corporation_id: int
+) -> list | None:
+    return _none_on_403(
+        lambda: _lpaged(
+            conn, character_id, f"/corporations/{corporation_id}/orders/history/"
+        )
+    )
+
+
+def fetch_corp_transactions(
+    conn, character_id: int, corporation_id: int, division: int, from_id=None
+) -> list | None:
+    """One wallet division's newest page, or the page before from_id
+    (Accountant or Junior Accountant); None without the role."""
+
+    def fetch():
+        data, _ = _lget(
+            conn,
+            character_id,
+            f"/corporations/{corporation_id}/wallets/{division}/transactions/",
+            _from_id_params(from_id),
+        )
+        return data
+
+    return _none_on_403(fetch)
+
+
+def fetch_corp_contracts(
+    conn, character_id: int, corporation_id: int
+) -> list | None:
+    return _none_on_403(
+        lambda: _lpaged(
+            conn, character_id, f"/corporations/{corporation_id}/contracts/"
+        )
+    )
+
+
+def fetch_corp_contract_items(
+    conn, character_id: int, corporation_id: int, contract_id: int
+) -> list | None:
+    def fetch():
+        data, _ = _lget(
+            conn,
+            character_id,
+            f"/corporations/{corporation_id}/contracts/{contract_id}/items/",
+        )
+        return data
+
+    return _none_on_404(fetch)
+
+
+# ---------------------------------------------------------------------------
 # Asset -> solar system resolution
 # ---------------------------------------------------------------------------
 
@@ -539,6 +732,14 @@ def _resolve_location(
     if memo is not None:
         memo[location_id] = system_id
     return system_id
+
+
+def resolve_location(
+    conn, character_id: int, location_id: int, memo: dict | None = None
+) -> int | None:
+    """Public name for _resolve_location: the Ledger resolves sale, order
+    and contract locations through the same cache (tests patch either)."""
+    return _resolve_location(conn, character_id, location_id, memo)
 
 
 def _aggregate_by_system(

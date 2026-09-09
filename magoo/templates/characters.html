@@ -5,7 +5,8 @@
 
 <h2>Authed Corporations</h2>
 <p class="muted">What each corporation feeds into planning — and whose
-token pulls it.</p>
+token pulls it. Count sales (v1.27.0) reads the corporation's sell orders,
+wallet sales and issued contracts for the Ledger.</p>
 
 {% macro fam_via(via_name, via_id, rows, enabled, unit) -%}
   {%- if via_id -%}{{ via_name or via_id }}{% if rows is not none %} <span class="muted">({{ '{:,}'.format(rows) }} {{ unit }})</span>{% endif %}
@@ -13,12 +14,29 @@ token pulls it.</p>
   {%- else -%}<span class="badge warn">no role</span>{%- endif -%}
 {%- endmacro %}
 
+{# One Ledger feed family's provenance: the status of its sales_pull rows
+   (a corporation's wallet has one row per division). #}
+{% macro sales_status(rows, family, show_via) -%}
+  {%- set fam = rows|selectattr('family', 'equalto', family)|list -%}
+  {%- if not fam -%}<span class="muted">not pulled yet</span>
+  {%- else -%}
+    {%- set bad = fam|rejectattr('status', 'in', ['ok', 'off'])|list -%}
+    {%- set ok = fam|selectattr('status', 'equalto', 'ok')|list -%}
+    {%- if bad -%}<span class="badge warn" title="{{ bad[0].message or bad[0].status }}">{{ bad[0].status|replace('_', ' ') }}</span>
+    {%- elif ok -%}{% if show_via and ok[0].via_character_id %}via {{ character_names.get(ok[0].via_character_id, ok[0].via_character_id) }}{% else %}ok{% endif %}{% if family == 'transactions' and ok|length > 1 %} <span class="muted">({{ ok|length }} divisions)</span>{% elif ok[0].rows is not none %} <span class="muted">({{ '{:,}'.format(ok[0].rows) }} rows)</span>{% endif %}
+    {%- else -%}<span class="muted">off</span>{%- endif -%}
+  {%- endif -%}
+{%- endmacro %}
+
+{% set sales_title = "pull this owner's sell orders, sale transactions and contracts on each ESI update and count them on the Ledger; stored sales stay and stop counting while off — a character switched off also stops carrying its corporation's wallet sales that only its own feed reports" %}
+
 {% if corps %}
 <div class="tablewrap">
 <table>
   <thead><tr><th>Corporation</th><th>Count assets</th><th>Count wallet</th>
-      <th>Count job slots</th><th>Last refresh</th><th>Corp auth</th></tr></thead>
+      <th>Count job slots</th><th>Count sales</th><th>Last refresh</th><th>Corp auth</th></tr></thead>
   {% for k in corps %}
+  {% set prov = sales_prov.get(('corporation', k.corporation_id), []) %}
   <tr>
     <td>{{ k.corporation_name or '?' }} <span class="muted">({{ k.corporation_id }})</span></td>
     <td><form class="inline" method="post"
@@ -30,6 +48,9 @@ token pulls it.</p>
     <td><form class="inline" method="post"
           action="{{ url_for('corp_toggle', corporation_id=k.corporation_id, flag='count_jobs') }}">
           <button>{{ '✓ yes' if k.count_jobs else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('corp_toggle', corporation_id=k.corporation_id, flag='count_sales') }}">
+          <button title="{{ sales_title }}">{{ '✓ yes' if k.count_sales else '— no' }}</button></form></td>
     <td class="muted">{{ k.refreshed_at }}</td>
     <td>
       {% if k.assets_via and k.assets_via == k.jobs_via and k.jobs_via == k.wallet_via %}
@@ -41,6 +62,10 @@ token pulls it.</p>
         · jobs: {{ fam_via(k.jobs_via_name, k.jobs_via, k.job_rows, k.count_jobs, 'jobs') }}
         · wallet: {{ fam_via(k.wallet_via_name, k.wallet_via, none, k.count_wallet, '') }}
       {% endif %}
+      <br><span class="muted">sales:</span>
+      orders {{ sales_status(prov, 'orders', true) }}
+      · wallet {{ sales_status(prov, 'transactions', true) }}
+      · contracts {{ sales_status(prov, 'contracts', true) }}
     </td>
   </tr>
   {% endfor %}
@@ -51,21 +76,26 @@ the next ESI refresh (Dashboard → “⟳ Update from ESI”).</p>{% endif %}
 
 <h2>Authed Characters</h2>
 <p class="muted">What each character adds of their own — personal hangars,
-ISK, and job slots.<br>If all jobs run from corporation hangars, it is
+ISK, job slots, and (Count sales) its own sell orders, wallet sales and
+contracts for the Ledger.<br>If all jobs run from corporation hangars, it is
 recommended to leave the character-level assets, wallet, and job slots
 off — the corporation table above already covers them.</p>
 
 <div class="panel">
   <a class="btn primary" href="{{ url_for('sso_login') }}">＋ Add character via EVE SSO</a>
+  <span class="muted small" style="margin-left:.6rem">Adding a character again refreshes its scopes.</span>
 </div>
 
 {% if characters %}
 <div class="tablewrap">
 <table>
   <thead><tr><th>Character</th><th>Count assets</th><th>Count wallet</th>
-      <th>Count job slots</th><th>Token expires</th>
+      <th>Count job slots</th><th>Count sales</th><th>Sales</th><th>Scopes</th>
+      <th>Token expires</th>
       <th><span class="vh">Actions</span></th></tr></thead>
   {% for c in characters %}
+  {% set prov = sales_prov.get(('character', c.character_id), []) %}
+  {% set missing = missing_scopes.get(c.character_id, ()) %}
   <tr>
     <td>{{ c.character_name }} <span class="muted">({{ c.character_id }})</span></td>
     <td><form class="inline" method="post"
@@ -77,6 +107,13 @@ off — the corporation table above already covers them.</p>
     <td><form class="inline" method="post"
           action="{{ url_for('character_toggle', character_id=c.character_id, flag='include_job_slots') }}">
           <button>{{ '✓ yes' if c.include_job_slots else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('character_toggle', character_id=c.character_id, flag='count_sales') }}">
+          <button title="{{ sales_title }}">{{ '✓ yes' if c.count_sales else '— no' }}</button></form></td>
+    <td class="small">orders {{ sales_status(prov, 'orders', false) }}
+      · wallet {{ sales_status(prov, 'transactions', false) }}
+      · contracts {{ sales_status(prov, 'contracts', false) }}</td>
+    <td>{% if missing %}<span class="badge warn" title="this login lacks: {{ missing|join(', ') }} — add the character again with ＋ Add character via EVE SSO to grant them">re-login needed</span>{% else %}<span class="muted">ok</span>{% endif %}</td>
     <td class="muted">{{ c.expires_at or 'no token' }}</td>
     <td><form class="inline" method="post"
           action="{{ url_for('character_delete', character_id=c.character_id) }}"

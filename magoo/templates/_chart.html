@@ -1,0 +1,27 @@
+{# Ledger chart partial (v1.27.0). chart(c) draws a charts.Chart as
+   inline SVG from tone classes alone — no inline styles, no colour
+   literals, no script, no motion — so every hue is one of base.html's
+   tokens (the Token Purity Rule) and the figure reads like the rest of
+   the console. Fills sit on rects and circles, strokes on paths; the
+   grid and the zero line are hairlines; native <title> tooltips carry
+   the exact figure of each mark and the tables below the charts are the
+   table view. A legend appears only with two or more series (dataviz: a
+   single series needs no legend box — the title already names it).
+   Import with {% import "_chart.html" as ch %} and call ch.chart(c). #}
+{% macro chart(c) -%}
+<figure class="chart" data-buckets="{{ c.buckets }}">
+  <figcaption>{{ c.title }}{% if c.caption %} — <span class="muted">{{ c.caption }}</span>{% endif %}</figcaption>
+  {% if c.legend|length > 1 %}<ul class="legend">{% for name, tone in c.legend %}<li><span class="swatch tone-{{ tone }}"></span>{{ name }}</li>{% endfor %}</ul>
+  {% endif %}{% if c.empty %}<p class="muted">No sales in this window.</p>
+  {% else %}<svg viewBox="0 0 {{ c.width }} {{ c.height }}" role="img" aria-label="{{ c.title }}">
+    {% for y, label in c.y_ticks %}<line class="grid" x1="{{ c.plot[0] }}" x2="{{ c.plot[2] }}" y1="{{ y }}" y2="{{ y }}"/>
+    <text class="tick" x="{{ c.plot[0] - 5 }}" y="{{ y }}" dy=".35em" text-anchor="end">{{ label }}</text>
+    {% endfor %}<line class="zero" x1="{{ c.plot[0] }}" x2="{{ c.plot[2] }}" y1="{{ c.zero_y }}" y2="{{ c.zero_y }}"/>
+    {% for x, label in c.x_ticks %}<text class="tick" x="{{ x }}" y="{{ c.height - 7 }}" text-anchor="middle">{{ label }}</text>
+    {% endfor %}{% for s in c.series %}{% for b in s.bars %}<rect class="tone-{{ b.tone }}" x="{{ b.x }}" y="{{ b.y }}" width="{{ b.w }}" height="{{ b.h }}"><title>{{ b.label }}</title></rect>
+    {% endfor %}{% if s.path %}<path class="tone-{{ s.tone }}" d="{{ s.path }}"/>
+    {% endif %}{% for p in s.points %}<circle class="tone-{{ s.tone }}" cx="{{ p.x }}" cy="{{ p.y }}" r="3"><title>{{ p.label }}</title></circle>
+    {% endfor %}{% endfor %}</svg>
+  {% endif %}
+</figure>
+{%- endmacro %}

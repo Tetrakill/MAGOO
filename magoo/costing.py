@@ -394,6 +394,79 @@ def net_proceeds_per_hull(
     )
 
 
+SALE_VENUE_HUB = "hub"
+SALE_VENUE_STRUCTURE = "structure"
+# ESI location ids below this are NPC stations (60m ids); Upwell
+# structures sit above it — the same split esi._resolve_location uses.
+STRUCTURE_LOCATION_MIN = 64_000_000
+
+
+def sale_venue(location_id) -> str | None:
+    """Where a sale happened, from its ESI location id: an NPC station is
+    the high-sec hub side, any Upwell structure the null-sec market side;
+    None when ESI gave no location (a contract without one)."""
+    if location_id is None:
+        return None
+    return SALE_VENUE_STRUCTURE if int(location_id) >= STRUCTURE_LOCATION_MIN else SALE_VENUE_HUB
+
+
+def net_proceeds_at_venue(
+    price: float,
+    packaged_volume: float,
+    settings,
+    venue: str | None,
+    capital: bool = False,
+    freight_exempt: bool = False,
+) -> float:
+    """What one sold hull banks given WHERE it sold (the Ledger, v1.27.0).
+    A hub sale pays the NPC-station broker fee and Accounting sales tax
+    plus the SCC surcharge; a structure sale pays the null-sec market's
+    fee pair plus the SCC surcharge. Movement: a capital-class hull takes
+    the flat movement cost at EITHER venue (capitals, freighters and jump
+    freighters fly themselves — 1.3M m³ of packaged volume is not
+    freighted); a sub-cap pays freight-out per m³ to the hub or the
+    structure leg per m³, waived for the freight-exempt XL hulls. No
+    venue: the class rule of net_proceeds_per_hull, which the Planning tab
+    also uses."""
+    if venue is None:
+        return net_proceeds_per_hull(
+            price, packaged_volume, settings, capital=capital, freight_exempt=freight_exempt
+        )
+    if venue == SALE_VENUE_STRUCTURE:
+        if capital:
+            movement = settings.capital_movement_cost_isk
+        else:
+            movement = 0.0 if freight_exempt else (
+                packaged_volume * settings.structure_freight_in_isk_per_m3
+            )
+        return (
+            price
+            * (
+                1.0
+                - settings.capital_sales_tax
+                - settings.capital_broker_rate
+                - settings.capital_scc_surcharge
+            )
+            - movement
+        )
+    if capital:
+        movement = settings.capital_movement_cost_isk  # flown, never freighted
+    else:
+        movement = 0.0 if freight_exempt else (
+            packaged_volume * settings.freight_out_isk_per_m3
+        )
+    return (
+        price
+        * (
+            1.0
+            - sales_tax_rate(settings)
+            - broker_fee_rate(settings)
+            - settings.capital_scc_surcharge
+        )
+        - movement
+    )
+
+
 @dataclass
 class CostLine:
     type_id: int

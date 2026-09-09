@@ -40,6 +40,7 @@ from . import (
     costing,
     engine,
     esi,
+    ledger,
     market,
     sdeimport,
     store,
@@ -2205,12 +2206,20 @@ def create_app() -> Flask:
     @app.route("/characters")
     def characters():
         c = conn()
+        characters_ = c.execute(
+            "SELECT p.*, t.expires_at, t.scopes FROM pool_character p "
+            "LEFT JOIN esi_token t USING (character_id)"
+        ).fetchall()
         return render_template(
             "characters.html",
-            characters=c.execute(
-                "SELECT p.*, t.expires_at FROM pool_character p "
-                "LEFT JOIN esi_token t USING (character_id)"
-            ).fetchall(),
+            characters=characters_,
+            # v1.27.0: which scopes each stored login still lacks (a token
+            # records the JWT's scp claim and a refresh never widens it).
+            missing_scopes={
+                r["character_id"]: esi.missing_scopes(r["scopes"]) for r in characters_
+            },
+            sales_prov=store.sales_pull_state(c),
+            character_names={r["character_id"]: r["character_name"] for r in characters_},
             corps=c.execute(
                 "SELECT ec.*, pa.character_name AS assets_via_name, "
                 "pj.character_name AS jobs_via_name, "
@@ -2225,7 +2234,9 @@ def create_app() -> Flask:
 
     @app.post("/characters/<int:character_id>/toggle/<flag>")
     def character_toggle(character_id, flag):
-        if flag not in ("include_assets", "include_job_slots", "count_assets"):
+        if flag not in (
+            "include_assets", "include_job_slots", "count_assets", "count_sales"
+        ):
             abort(400)
         c = conn()
         c.execute(
@@ -2269,6 +2280,18 @@ def create_app() -> Flask:
             )
         ]
 
+        sales_stranded = [
+            r["corporation_name"]
+            for r in c.execute(
+                "SELECT DISTINCT ec.corporation_name FROM sales_pull sp "
+                "JOIN esi_corp ec ON ec.corporation_id = sp.owner_id "
+                "WHERE sp.owner_kind = 'corporation' AND sp.via_character_id = ? "
+                "AND sp.status = 'ok'",
+                (character_id,),
+            )
+            if r["corporation_name"] and r["corporation_name"] not in stranded
+        ]
+
         c.execute("DELETE FROM esi_token WHERE character_id = ?", (character_id,))
         c.execute(
             "DELETE FROM pool_character WHERE character_id = ?", (character_id,)
@@ -2280,6 +2303,17 @@ def create_app() -> Flask:
             "wallet_via = CASE WHEN wallet_via = ? THEN NULL ELSE wallet_via END",
             (character_id, character_id, character_id),
         )
+        # v1.27.0: the Ledger's provenance columns are informational; the
+        # rows and the sales they cover stay (item fetches pick a token at
+        # fetch time, so nothing depended on this character).
+        c.execute(
+            "UPDATE sales_pull SET via_character_id = NULL WHERE via_character_id = ?",
+            (character_id,),
+        )
+        c.execute(
+            "UPDATE sale_contract SET via_character_id = NULL WHERE via_character_id = ?",
+            (character_id,),
+        )
         c.commit()
 
         message = f"removed {row['character_name']}"
@@ -2290,12 +2324,18 @@ def create_app() -> Flask:
                 + "; another character with the same corp roles must be "
                 "logged in for that to keep updating"
             )
+        if sales_stranded:
+            message += (
+                " — it was also reading the sales feeds of "
+                + ", ".join(sales_stranded)
+                + "; another member with the same roles keeps the Ledger current"
+            )
         flash(message)
         return redirect(url_for("characters"))
 
     @app.post("/corps/<int:corporation_id>/toggle/<flag>")
     def corp_toggle(corporation_id, flag):
-        if flag not in ("count_assets", "count_wallet", "count_jobs"):
+        if flag not in ("count_assets", "count_wallet", "count_jobs", "count_sales"):
             abort(400)
         c = conn()
         c.execute(
@@ -2371,48 +2411,88 @@ def create_app() -> Flask:
 
     @app.post("/esi/refresh")
     def esi_refresh():
-        """The slow pull (assets, jobs, wallets), decoupled from planning."""
+        """Three independently guarded steps: the slow snapshot pull
+        (assets, jobs, wallets), the Ledger's sales pull (v1.27.0), then
+        the price refresh (user request 2026-09-08 — one button keeps the
+        Ledger's quotes, undercut verdicts and contract splits current).
+        The snapshot has committed before the sales step starts, the sales
+        step never raises for scope, role, token, rate-limit or network
+        trouble (each owner × family records its own status), and a price
+        failure only leaves the cache unchanged, so no step can lose
+        another's data. One flash carries all three outcomes;
+        `next=ledger` returns to the Ledger tab instead of the dashboard."""
         import time as _time
 
+        if request.form.get("next") == "ledger":
+            target = url_for("ledger", window=request.form.get("window") or None)
+        else:
+            target = url_for("dashboard")
         if not sde_ready():
             flash(
                 "download the game data first (dashboard checklist) — the "
                 "refresh classifies assets and jobs against its item data"
             )
-            return redirect(url_for("dashboard"))
+            return redirect(target)
+        parts = []
+        esi_down = False
         t0 = _time.monotonic()
         try:
             state = esi.refresh_state(conn(), ref())
-        except httpx.HTTPError as exc:
-            flash(
+            parts.append(
+                f"ESI refreshed in {_time.monotonic() - t0:.0f}s: "
+                f"{len(state['on_hand'])} types on hand, "
+                f"{sum(state['active_jobs'].values())} active jobs"
+            )
+        except httpx.TransportError as exc:
+            # ESI unreachable: the sales pull would only stack failures.
+            parts.append(
                 f"ESI refresh failed ({exc}) — the previous snapshot is "
                 "unchanged; try again once ESI recovers"
             )
-            return redirect(url_for("dashboard"))
+            esi_down = True
+        except httpx.HTTPError as exc:
+            parts.append(
+                f"ESI refresh failed ({exc}) — the previous snapshot is "
+                "unchanged; try again once ESI recovers"
+            )
         except RuntimeError as exc:
             # A dead refresh token: retrying cannot help, so surface the
             # re-auth guidance alone without the "once ESI recovers" tail.
-            flash(f"{exc} — the previous snapshot is unchanged")
-            return redirect(url_for("dashboard"))
-        flash(
-            f"ESI refreshed in {_time.monotonic() - t0:.0f}s: "
-            f"{len(state['on_hand'])} types on hand, "
-            f"{sum(state['active_jobs'].values())} active jobs"
-        )
-        return redirect(url_for("dashboard"))
+            # Other characters' sales feeds may still answer, so step 2 runs.
+            parts.append(f"{exc} — the previous snapshot is unchanged")
+        if esi_down:
+            ledger.mark_skipped(conn(), "ESI unavailable — sales pull skipped")
+            parts.append("sales pull skipped — ESI unavailable")
+        else:
+            try:
+                parts.append(ledger.summary_line(ledger.pull_sales(conn(), ref())))
+            except Exception as exc:  # noqa: BLE001 — the _after_sde_import precedent
+                # A bug in the sales step must not 500 a request whose
+                # snapshot already saved; the stored ledger is untouched.
+                log.exception("sales pull failed")
+                parts.append(
+                    f"sales pull failed ({exc}) — the stored ledger is unchanged"
+                )
+        if esi_down:
+            parts.append("prices not refreshed — ESI unavailable")
+        else:
+            try:
+                price_message, _ok = _refresh_prices_now()
+            except Exception as exc:  # noqa: BLE001 — same guard as the sales step
+                log.exception("price refresh failed")
+                price_message = f"price refresh failed ({exc}) — cached prices are unchanged"
+            parts.append(price_message)
+        flash(" — ".join(parts))
+        return redirect(target)
 
-    @app.post("/prices/refresh")
-    def prices_refresh():
-        """The slow price pull (parallel, ESI-guideline compliant),
-        decoupled from planning like the ESI snapshot refresh."""
+    def _refresh_prices_now():
+        """The price pull (parallel, ESI-guideline compliant), shared by
+        the ⟳ Refresh prices button and — since v1.27.0 (user request) —
+        the third step of ⟳ Update from ESI. Returns (message, ok): ok is
+        False when nothing was refreshed and the message says why. Callers
+        check sde_ready() first."""
         import time as _time
 
-        if not sde_ready():
-            flash(
-            "download the game data first — the dashboard checklist "
-            "has the button"
-        )
-            return redirect(url_for("dashboard"))
         c = conn()
         r = ref()
         # Two id sets (review 2026-09-01): the per-type order-book pull
@@ -2423,8 +2503,7 @@ def create_app() -> Flask:
         type_ids = engine.demand_type_ids(c, r)
         market_ids = engine.market_type_ids(c, r)
         if not market_ids:
-            flash("nothing to price — add or activate a pipeline first")
-            return redirect(url_for("pipelines"))
+            return "nothing to price — add or activate a pipeline first", False
         settings_ = store.get_settings(c)
         t0 = _time.monotonic()
         # v1.9: raw leaves (no blueprint) with no hub-station order fall
@@ -2448,22 +2527,20 @@ def create_app() -> Flask:
                 ladder_type_ids=ladder_ids,
             )
         except httpx.HTTPError as exc:
-            flash(
+            return (
                 f"price refresh failed ({exc}) — cached prices are "
                 "unchanged; try again once ESI recovers"
-            )
-            return redirect(url_for("dashboard"))
+            ), False
         try:
             n_adjusted = market.store_adjusted_prices(
                 c, type_ids, market.fetch_adjusted_prices()
             )
         except httpx.HTTPError as exc:
-            flash(
+            return (
                 f"regional prices refreshed ({fetched} fetched, {skipped} "
                 f"skipped) but the adjusted-price pull failed ({exc}) — "
                 "install-fee bases keep their previous values"
-            )
-            return redirect(url_for("dashboard"))
+            ), False
         message = (
             f"prices refreshed in {_time.monotonic() - t0:.0f}s: "
             f"{fetched} fetched, {fresh} already current, "
@@ -2491,20 +2568,33 @@ def create_app() -> Flask:
             )
 
         # One structure-market pull (the whole book comes down regardless)
-        # serves two consumers: v1.6 capital-class finals' SELL quotes, and
+        # serves three consumers: v1.6 capital-class finals' SELL quotes,
         # v1.10 buy quotes + sell ladders for every input the plan may buy
-        # (the Jita-vs-structure landed comparison at plan time).
+        # (the Jita-vs-structure landed comparison at plan time), and since
+        # v1.27.0 the SELL quote of every other pipeline final — the Ledger
+        # judges an open order against the book it sits in, and most
+        # sub-capital orders sit at the structure market too (Planning
+        # still prices sub-caps at Jita; this only keeps rows the pull
+        # already downloaded). Finals of every pipeline, active or not: the
+        # Ledger tracks them all.
         finals = {
             p["final_product_type_id"] for p in store.active_pipelines(c)
+        }
+        all_finals = {
+            r_["final_product_type_id"]
+            for r_ in c.execute("SELECT final_product_type_id FROM pipeline")
         }
         capital_finals = [
             t for t in finals if costing.is_capital_priced(r, t)
         ]
+        subcap_finals = [
+            t for t in all_finals if t not in capital_finals
+        ]
         # Inputs are wanted whenever the book is pulled at all — even with
         # the comparison switched off — so turning it on later works from
         # the existing cache instead of silently comparing against nothing.
-        inputs = [t for t in type_ids if t not in finals]
-        wanted = capital_finals + inputs  # disjoint by construction
+        inputs = [t for t in type_ids if t not in all_finals]
+        wanted = capital_finals + subcap_finals + inputs  # disjoint by construction
         if settings_.structure_buy_enabled or capital_finals:
             structure_id = settings_.structure_market()
             character_id = esi.character_with_scope(
@@ -2541,7 +2631,30 @@ def create_app() -> Flask:
                             f", {n_inputs}/{len(inputs)} inputs quoted at "
                             "the structure market"
                         )
+                    if subcap_finals:
+                        n_sub = len(market.cached_prices(
+                            c, structure_id, subcap_finals, market.STRUCTURE_SOURCE
+                        ))
+                        message += (
+                            f", {n_sub}/{len(subcap_finals)} sub-capital hulls "
+                            "quoted there for the Ledger"
+                        )
+        return message, True
+
+    @app.post("/prices/refresh")
+    def prices_refresh():
+        """The slow price pull, decoupled from planning like the ESI
+        snapshot refresh (and folded into it since v1.27.0)."""
+        if not sde_ready():
+            flash(
+                "download the game data first — the dashboard checklist "
+                "has the button"
+            )
+            return redirect(url_for("dashboard"))
+        message, ok = _refresh_prices_now()
         flash(message)
+        if not ok and message.startswith("nothing to price"):
+            return redirect(url_for("pipelines"))
         # The Planning → Profit view's refresh button lands back on the
         # numbers it just refreshed ("profit" kept for old form values).
         if request.form.get("next") in ("planning", "profit"):
@@ -3079,30 +3192,44 @@ def create_app() -> Flask:
         capital-class hulls quote from the structure market cache with
         their own fees and movement cost, everything else from the Jita
         region cache (v1.6)."""
-        capital = costing.is_capital_priced(ref(), type_id)
-        if capital:
-            price = market.cached_prices(
-                c,
-                settings_.capital_structure(),
-                [type_id],
-                market.STRUCTURE_SOURCE,
-            ).get(type_id)
-        else:
-            price = market.cached_prices(
-                c, settings_.price_region_id, [type_id], settings_.price_source
-            ).get(type_id)
-        net = (
-            costing.net_proceeds_per_hull(
-                price,
-                ref().type_info(type_id).freight_volume,
-                settings_,
-                capital=capital,
-                freight_exempt=costing.freight_out_exempt(type_id),
+        # v1.27.0: hoisted to ledger.final_quote so the Ledger prices its
+        # finals the same way; this closure is the profit pages' name for it.
+        return ledger.final_quote(c, ref(), settings_, type_id)
+
+    # -- ledger ------------------------------------------------------------
+
+    @app.route("/ledger", endpoint="ledger")
+    def ledger_tab():
+        """Sales of pipeline finals (v1.27.0): wallet transactions, orders
+        and contracts persisted by the ESI refresh, costed against the
+        latest executed run — recomputed on every load, nothing saved.
+        Named ledger_tab: a nested `def ledger` would make `ledger` a local
+        of create_app and shadow the module for every closure here."""
+        c = conn()
+        window = request.args.get("window") or str(ledger.DEFAULT_WINDOW)
+        pool_size = c.execute("SELECT COUNT(*) FROM pool_character").fetchone()[0]
+        if not sde_ready():
+            return render_template(
+                "ledger.html", view=None, window=window, sde_build=None,
+                pool_size=pool_size, settings=None,
             )
-            if price is not None
-            else None
+        settings_ = store.get_settings(c)
+        view = ledger.build_view(
+            c, ref(), settings_, window,
+            fmt_isk=app.jinja_env.filters["isk_short"],
+            fmt_qty=app.jinja_env.filters["qty"],
+            show_all_rows=request.args.get("rows") == "all",
         )
-        return price, net, capital
+        return render_template(
+            "ledger.html",
+            view=view,
+            window=view["window"].key,
+            settings=settings_,
+            broker_rate=costing.broker_fee_rate(settings_),
+            sales_tax=costing.sales_tax_rate(settings_),
+            sde_build=ref().sde_build(),
+            pool_size=pool_size,
+        )
 
     @app.route("/profit")
     def profit():

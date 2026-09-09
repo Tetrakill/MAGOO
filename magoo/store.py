@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -296,6 +296,126 @@ CREATE TABLE IF NOT EXISTS esi_corp (
     asset_rows       INTEGER,
     job_rows         INTEGER,
     refreshed_at     TEXT
+);
+
+-- Ledger (schema 9, 2026-09-07): sell-side history persisted so it outlives
+-- ESI's windows (contracts 30 d, orders 90 d; transactions back-paged as far
+-- as ESI serves). Every type is stored; the Ledger filters to pipeline
+-- finals at read time. owner_* names whose sale it is: a corp-wallet sale
+-- seen through the selling character's feed is stored under the corporation.
+-- ESI timestamps are stored verbatim (...Z); Magoo's own stamps use the same
+-- shape (ledger._now_iso) so text comparison is exact. ESI enums (order
+-- state, contract type/status) carry no CHECK: a value CCP adds must never
+-- abort a pull. Rows are history -- nothing here is ever deleted.
+CREATE TABLE IF NOT EXISTS sale_transaction (
+    transaction_id  INTEGER PRIMARY KEY,   -- ESI market transaction id (global)
+    owner_kind      TEXT NOT NULL CHECK (owner_kind IN ('character','corporation')),
+    owner_id        INTEGER NOT NULL,
+    division        INTEGER,               -- corp wallet 1..7; NULL = character wallet / not yet known
+    source_feed     TEXT NOT NULL CHECK (source_feed IN ('character','corporation')),
+    type_id         INTEGER NOT NULL,
+    quantity        INTEGER NOT NULL,
+    unit_price      REAL NOT NULL,
+    date            TEXT NOT NULL,
+    location_id     INTEGER NOT NULL,
+    client_id       INTEGER,
+    journal_ref_id  INTEGER,               -- journal-based fees: follow-up
+    fetched_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sale_transaction_type_date
+    ON sale_transaction (type_id, date);
+CREATE INDEX IF NOT EXISTS sale_transaction_owner
+    ON sale_transaction (owner_kind, owner_id, transaction_id);
+
+-- SELL orders: open, or closed within ESI's 90-day history window.
+CREATE TABLE IF NOT EXISTS sale_order (
+    order_id        INTEGER PRIMARY KEY,
+    owner_kind      TEXT NOT NULL CHECK (owner_kind IN ('character','corporation')),
+    owner_id        INTEGER NOT NULL,
+    division        INTEGER,
+    issued_by       INTEGER,
+    source_feed     TEXT NOT NULL CHECK (source_feed IN ('character','corporation')),
+    type_id         INTEGER NOT NULL,
+    price           REAL NOT NULL,         -- last seen
+    volume_total    INTEGER NOT NULL,
+    volume_remain   INTEGER NOT NULL,      -- last seen
+    location_id     INTEGER NOT NULL,
+    duration        INTEGER NOT NULL,
+    issued          TEXT NOT NULL,         -- EVE re-issues on a price edit; updated while open
+    state           TEXT NOT NULL,         -- 'open' (Magoo) or ESI's history state verbatim
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    history_seen_at TEXT,                  -- first time the history feed reported it (estimated close)
+    missing_since   TEXT                   -- open row absent from both feeds of an ok pull (cache skew)
+);
+CREATE INDEX IF NOT EXISTS sale_order_type_state ON sale_order (type_id, state);
+
+-- Contracts ISSUED by the owner, every type and status (only finished,
+-- priced item exchanges containing a final are sales; the rest explain).
+CREATE TABLE IF NOT EXISTS sale_contract (
+    contract_id           INTEGER PRIMARY KEY,
+    owner_kind            TEXT NOT NULL CHECK (owner_kind IN ('character','corporation')),
+    owner_id              INTEGER NOT NULL,
+    issuer_id             INTEGER NOT NULL,
+    issuer_corporation_id INTEGER NOT NULL,
+    for_corporation       INTEGER NOT NULL,
+    acceptor_id           INTEGER,
+    assignee_id           INTEGER,
+    availability          TEXT,
+    type                  TEXT NOT NULL,
+    status                TEXT NOT NULL,
+    price                 REAL,            -- ESI omits it on some contracts
+    title                 TEXT,
+    date_issued           TEXT NOT NULL,
+    date_accepted         TEXT,
+    date_completed        TEXT,
+    date_expired          TEXT NOT NULL,
+    start_location_id     INTEGER,
+    via_character_id      INTEGER,         -- provenance only (NULLed on character delete)
+    first_seen_at         TEXT NOT NULL,
+    last_seen_at          TEXT NOT NULL,
+    items_fetched_at      TEXT,            -- NULL = items still to fetch
+    items_status          TEXT CHECK (items_status IN ('ok','missing','unavailable')),
+    items_attempts        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS sale_contract_status
+    ON sale_contract (type, status, date_completed);
+
+CREATE TABLE IF NOT EXISTS sale_contract_item (
+    contract_id  INTEGER NOT NULL REFERENCES sale_contract,
+    record_id    INTEGER NOT NULL,
+    type_id      INTEGER NOT NULL,
+    quantity     INTEGER NOT NULL,
+    raw_quantity INTEGER,                  -- -1 singleton, -2 blueprint copy
+    is_included  INTEGER NOT NULL,         -- 1 = issuer gives (sold), 0 = issuer asks (swap)
+    is_singleton INTEGER NOT NULL,
+    PRIMARY KEY (contract_id, record_id)
+);
+CREATE INDEX IF NOT EXISTS sale_contract_item_type ON sale_contract_item (type_id);
+
+-- Provenance + cursor, one row per owner x family (x corp wallet division
+-- for transactions). Never pruned with the data; a character leaving the
+-- pool only NULLs via_character_id. The transactions cursor is ONE
+-- contiguous covered id range (buys included): newest_id moves only when
+-- a pull's top pass joined the stored range, backfilled flips once the
+-- backfill pass reached the end of ESI's history.
+CREATE TABLE IF NOT EXISTS sales_pull (
+    owner_kind       TEXT NOT NULL CHECK (owner_kind IN ('character','corporation')),
+    owner_id         INTEGER NOT NULL,
+    family           TEXT NOT NULL CHECK (family IN ('orders','transactions','contracts')),
+    division         INTEGER NOT NULL DEFAULT 0,   -- 1..7 for corp transactions, else 0
+    status           TEXT NOT NULL CHECK (status IN
+                         ('ok','partial','off','no_scope','no_role','error','skipped')),
+    message          TEXT,
+    via_character_id INTEGER,
+    rows             INTEGER,              -- rows seen this pull
+    rows_new         INTEGER,              -- COUNT(*) delta inside the write transaction
+    calls            INTEGER,              -- ESI calls this pull (budget diagnostics)
+    oldest_id        INTEGER,
+    newest_id        INTEGER,
+    backfilled       INTEGER NOT NULL DEFAULT 0,
+    pulled_at        TEXT NOT NULL,
+    PRIMARY KEY (owner_kind, owner_id, family, division)
 );
 """
 
@@ -631,6 +751,13 @@ _MIGRATIONS = (
     # The bases a run was planned under (vintage for the run pages).
     "ALTER TABLE index_run ADD COLUMN hub_price_basis TEXT",
     "ALTER TABLE index_run ADD COLUMN structure_price_basis TEXT",
+    # Schema 9 (2026-09-07): Ledger -- per-owner sales toggles, default on
+    # (user ruling): each character and corporation decides whether its
+    # sell orders, sale transactions and contracts are pulled and counted.
+    # Honoured at READ time as well, so stored sales keep accruing and
+    # simply stop counting while an owner is off.
+    "ALTER TABLE pool_character ADD COLUMN count_sales INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE esi_corp ADD COLUMN count_sales INTEGER NOT NULL DEFAULT 1",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -1320,6 +1447,20 @@ def corp_settings(conn: sqlite3.Connection) -> dict[int, sqlite3.Row]:
         row["corporation_id"]: row
         for row in conn.execute("SELECT * FROM esi_corp")
     }
+
+
+def sales_pull_state(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, int], list[sqlite3.Row]]:
+    """sales_pull rows grouped by owner -- the ESI tab's provenance cells and
+    the Ledger's degrade notes read the same shape."""
+    out: dict[tuple[str, int], list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        "SELECT * FROM sales_pull "
+        "ORDER BY owner_kind, owner_id, family, division"
+    ):
+        out.setdefault((row["owner_kind"], row["owner_id"]), []).append(row)
+    return out
 
 
 def upsert_esi_corps(

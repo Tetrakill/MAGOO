@@ -61,7 +61,8 @@ Magoo walks you through it with an on-screen checklist. In short:
    few minutes and shows progress.
 2. **Log in with EVE** — opens your normal browser so you can see you are on
    `login.eveonline.com`. Magoo never sees your password.
-3. **Update from ESI** — snapshots your assets, industry jobs and wallets.
+3. **Update from ESI** — snapshots your assets, industry jobs and wallets,
+   reads your sales for the Ledger, then refreshes prices.
 4. **Add your pipelines** — what you build, and how many per cycle.
 5. **Refresh prices**, then **Plan index run**.
 

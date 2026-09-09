@@ -1,0 +1,351 @@
+{% extends "base.html" %}
+{% import "_chart.html" as ch %}
+{% block title %}Ledger{% endblock %}
+{% block content %}
+{# Ledger (v1.27.0): what the pipeline finals actually sold for. Every
+   figure comes from ledger.build_view — wallet transactions are the
+   units-sold truth, clean item-exchange contracts attribute their price,
+   fees are estimated, the cost basis is the latest executed run. Every
+   badge carries its rule in title (the Tooltip Ledger Rule); ISK is
+   abbreviated with the full figure on hover. #}
+{% macro tags(list) -%}
+  {%- for text, tone, title in list %}<span class="badge {{ tone }}" title="{{ title }}">{{ text }}</span>{% endfor -%}
+{%- endmacro %}
+{% macro flags(sale) -%}
+  {%- for f in sale.flags -%}
+    {%- if f == 'mixed' %}<span class="badge warn" title="this contract bundled the hull with other items ({{ sale.detail }}) — its {{ sale.contract_price|isk }} ISK cannot be split, so the hull counts as a unit only">mixed</span>
+    {%- elif f == 'swap' %}<span class="badge warn" title="this contract asked for items in return ({{ sale.detail }}) — its price is not a sale price, so the hull counts as a unit only">swap</span>
+    {%- elif f == 'estimated split' %}<span class="badge" title="several finals in one contract and no cached quote to weight them — the price is split equally per unit">estimated split</span>
+    {%- elif f == 'internal' %}<span class="badge" title="the buyer is one of your own characters or corporations — a transfer, not revenue; left out of every figure">internal</span>
+    {%- elif f == 'no price' %}<span class="badge warn" title="ESI reports no price on this contract — left out of every figure">no price</span>
+    {%- elif f == 'sales off' %}<span class="badge" title="this owner's Count sales is off (ESI tab) — stored, not counted">sales off</span>
+    {%- else %}<span class="badge">{{ f }}</span>{% endif -%}
+  {%- endfor -%}
+{%- endmacro %}
+<div class="pagehead">
+  <h1>Ledger</h1>
+  {% if view %}
+  <span class="cap">Sales of pipeline finals from ESI wallet transactions and item-exchange contracts ·
+    {{ view.window.label }} (UTC, today included) ·
+    {% if view.sales_at %}sales pulled {{ view.sales_at|age }} ago{% else %}sales never pulled{% endif %} ·
+    {{ view.owners_count }} owner{{ '' if view.owners_count == 1 else 's' }}</span>
+  {% else %}
+  <span class="cap">Sales of pipeline finals from ESI wallet transactions and item-exchange contracts.</span>
+  {% endif %}
+  <div class="actions">
+    <form method="post" action="{{ url_for('esi_refresh') }}">
+      <input type="hidden" name="next" value="ledger">
+      <input type="hidden" name="window" value="{{ window }}">
+      <button {% if not pool_size or not sde_build %}disabled
+        title="{% if not sde_build %}download the game data first — step 1 of setup{% else %}log in a character first — the ESI tab has the SSO button{% endif %}"{% endif %}>⟳ Update from ESI</button>
+    </form>
+  </div>
+</div>
+{% if not view %}
+<p class="muted">Download the game data first — step 1 of setup on the
+<a href="{{ url_for('dashboard') }}">dashboard</a>; the Ledger names its products and prices against it.</p>
+{% else %}
+<div class="subnav">
+  {% for w in view.windows %}<a href="{{ url_for('ledger', window=w) }}" {% if window == w|string %}aria-current="page" class="active"{% endif %}>{{ w }} days</a>
+  {% endfor %}<a href="{{ url_for('ledger', window='all') }}" {% if window == 'all' %}aria-current="page" class="active"{% endif %}>All</a>
+</div>
+{% if view.notes %}
+<div class="panel alert-warn">
+  <h2><span class="badge fill warn">partial data</span> some sales are not being read</h2>
+  <ul style="margin:.4rem 0 0">{% for n in view.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+<details class="muted" style="margin-bottom:.4rem">
+  <summary>How this is computed</summary>
+  <p style="margin:.3rem 0 0; max-width:80ch">Recomputed from the stored ESI
+  feeds on every load; nothing is saved here. <b>Units sold</b> and
+  <b>revenue</b> come from wallet sale transactions (the truth — a filled
+  order already produced its fills, so order history only explains
+  outcomes) plus finished item-exchange contracts you issued: a contract
+  holding only pipeline finals credits its whole price to them (split by
+  cached quote when it holds several); a contract that bundles other
+  items or asks for items in return counts its hulls as units only.
+  <b>Net</b> deducts estimated sell fees by <b>where the hull sold</b>
+  (the sale's station or structure, from ESI): at an NPC station the
+  high-sec hub rates — broker {{ "%.2f"|format(broker_rate * 100) }}% ·
+  sales tax {{ "%.2f"|format(sales_tax * 100) }}% ·
+  SCC {{ "%.2f"|format(settings.capital_scc_surcharge * 100) }}% ·
+  freight to Jita {{ settings.freight_out_isk_per_m3|isk }}/m³; at a
+  structure the {{ settings.structure_market_label() }} rates — broker
+  {{ "%.2f"|format(settings.capital_broker_rate * 100) }}% ·
+  tax {{ "%.2f"|format(settings.capital_sales_tax * 100) }}% ·
+  SCC {{ "%.2f"|format(settings.capital_scc_surcharge * 100) }}% ·
+  freight {{ settings.structure_freight_in_isk_per_m3|isk }}/m³ for
+  sub-caps. Capital-class hulls (capitals, freighters, jump freighters,
+  Orca) take the flat movement cost of
+  {{ settings.capital_movement_cost_isk|isk }}/hull at either venue — they
+  fly themselves; Keepstars, Palatine Keepstars and Sotiyos pay no per-m³
+  term at all. Any structure other than {{ settings.structure_market_label() }}
+  is charged its rates too (the only structure rates in Settings); a
+  contract ESI gives no location for falls back to the Planning tab's
+  class rule. Contracts pay the same estimates, as an approximation. <b>Cost per unit</b> is the lag-based
+  cost of the latest executed index run that built the product (a
+  deleted pipeline loses its run history); <b>cost of goods sold</b> is
+  units sold × that cost and <b>net income</b> is net proceeds minus it, so
+  products without an executed run show revenue but no net income.
+  <b>Unrealized profit</b> is what your open sell orders and outstanding
+  contracts would bank at their listed prices, after the same estimated
+  fees, minus their cost basis — hangar stock is not counted. Sales to your own characters or corporations,
+  unpriced contracts and auctions are listed but never counted. A
+  character's corporation is read as its current corporation; a
+  character switched off on the ESI tab also stops carrying the
+  corporation-wallet sales only its own feed reports.</p>
+</details>
+
+{% if not view.has_pipelines %}
+<p class="muted">No pipelines — the Ledger tracks pipeline finals only; add one on the
+<a href="{{ url_for('pipelines') }}">Pipelines</a> page.</p>
+{% elif not view.ever_pulled %}
+<p class="muted">No sales data yet — ⟳ Update from ESI reads wallet transactions, orders and
+contracts for every character and corporation with Count sales on
+(<a href="{{ url_for('characters') }}">ESI tab</a>); characters logged in before this
+version need a re-login for the new scopes.</p>
+{% else %}
+{% set t = view.totals %}
+{% if not view.counted_sales %}
+<p class="muted">No sales of pipeline finals in {{ view.window.label }}{% if view.window.days %} —
+<a href="{{ url_for('ledger', window='all') }}">show all</a>{% endif %}.</p>
+{% else %}
+<div class="totals">
+  <div class="stat">
+    <span class="label">Revenue</span>
+    <span class="value" title="{{ t.revenue|isk }} ISK — realized price × units sold, every product">{{ t.revenue|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Cost of goods sold</span>
+    <span class="value" title="{{ t.cost|isk }} ISK — units sold × the cost basis per unit, products with an executed run">{{ t.cost|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Net income</span>
+    <span class="value {% if t.profit < 0 %}bad{% elif t.profit > 0 %}good{% endif %}"
+          title="{{ t.profit|isk }} ISK — revenue after the estimated sell fees ({{ t.net_basis|isk }} ISK) minus cost of goods sold, products with a cost basis">{{ t.profit|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Margin</span>
+    <span class="value {% if t.margin_pct is not none and t.margin_pct < 0 %}bad{% elif t.margin_pct %}good{% endif %}" title="net income ÷ cost of goods sold — the Planning tab's definition">
+      {% if t.margin_pct is not none %}{{ "%.1f"|format(t.margin_pct) }}%{% else %}—{% endif %}</span>
+  </div>
+  {% set u = view.unrealized %}
+  <div class="stat">
+    <span class="label">Unrealized profit</span>
+    <span class="value {% if u.profit is not none and u.profit < 0 %}bad{% elif u.profit %}good{% endif %}"
+          title="{% if u.profit is not none %}{{ u.profit|isk }} ISK — {{ u.units|qty }} hulls on {{ u.orders }} open sell order{{ '' if u.orders == 1 else 's' }} at their listed price and in {{ u.contracts }} outstanding contract{{ '' if u.contracts == 1 else 's' }} at their price, after the estimated fees of each venue ({{ u.value|isk }} ISK), minus their cost basis ({{ u.cost|isk }} ISK){% if u.units_unpriced %}; {{ u.units_unpriced|qty }} listed units left out: no cost basis or no attributable price{% endif %}. Hangar stock is not included; not bound by the window{% else %}nothing of yours is listed for sale{% if u.units_unpriced %} with a cost basis and a price ({{ u.units_unpriced|qty }} listed units left out){% endif %}{% endif %}">{{ u.profit|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Units sold</span>
+    <span class="value">{{ t.units|qty }}<span class="sub">· {{ t.products }} product{{ '' if t.products == 1 else 's' }}</span></span>
+  </div>
+  <div class="stat">
+    <span class="label">Contracts closed</span>
+    <span class="value" title="finished item-exchange contracts counted as sales in this window; outstanding ones feed Unrealized profit">{{ t.contracts|qty }}<span class="sub">· {{ t.contracts_open }} outstanding</span></span>
+  </div>
+  {% if t.no_basis or t.unpriced_contracts %}
+  <div class="stat">
+    <span class="label">&nbsp;</span>
+    <span class="tags">
+      {% if t.no_basis %}<span class="badge warn" title="products without an executed run: their units and revenue count above; their cost and net income are left out, so Net income covers only the products with a basis">{{ t.no_basis }} without cost basis</span>{% endif %}
+      {% if t.unpriced_contracts %}<span class="badge warn" title="contracts that bundled a hull with other items or traded it for items: their hulls count as units only, their price is not revenue">{{ t.unpriced_contracts }} contract{{ '' if t.unpriced_contracts == 1 else 's' }} not priced</span>{% endif %}
+    </span>
+  </div>
+  {% endif %}
+</div>
+
+<div class="charts" style="margin-top:.8rem">
+  {% for c in view.charts %}<div class="panel">{{ ch.chart(c) }}</div>
+  {% endfor %}
+</div>
+
+<div class="row" style="margin:1rem 0">
+  <div class="panel">
+    <h3 class="subhead">Top 10 by margin</h3>
+    {% if view.top.margin %}<ol class="toplist">
+      {% for p in view.top.margin %}<li><span class="line">{{ p.name }}<span class="fig">{{ "%.1f"|format(p.margin_pct) }}%</span><span class="sub" title="{{ p.profit|isk }} ISK">{{ p.profit|isk_short }} profit</span></span></li>
+      {% endfor %}</ol>
+    {% else %}<p class="muted">No product with a cost basis sold in this window.</p>{% endif %}
+  </div>
+  <div class="panel">
+    <h3 class="subhead">Top 10 by quantity</h3>
+    {% if view.top.quantity %}<ol class="toplist">
+      {% for p in view.top.quantity %}<li><span class="line">{{ p.name }}<span class="fig">{{ p.units_sold|qty }} units</span><span class="sub" title="{{ p.revenue|isk }} ISK">{{ p.revenue|isk_short }} revenue</span></span></li>
+      {% endfor %}</ol>
+    {% else %}<p class="muted">Nothing sold in this window.</p>{% endif %}
+  </div>
+  <div class="panel">
+    <h3 class="subhead">Top 10 by net income</h3>
+    {% if view.top.profit %}<ol class="toplist">
+      {% for p in view.top.profit %}<li><span class="line">{{ p.name }}<span class="fig" title="{{ p.profit|isk }} ISK">{{ p.profit|isk_short }}</span><span class="sub">{{ p.units_sold|qty }} units</span></span></li>
+      {% endfor %}</ol>
+    {% else %}<p class="muted">No product with a cost basis sold in this window.</p>{% endif %}
+  </div>
+</div>
+{% endif %}
+
+<details class="section" data-key="products" open>
+<summary><h2>Products <span class="muted">— {{ view.products|length }}</span></h2></summary>
+{% if view.products %}
+<div class="tablewrap">
+<table class="sortable profit">
+  <thead><tr>
+    <th>Product</th>
+    <th class="num">Units</th>
+    <th class="num">Avg price</th>
+    <th class="num">vs quote</th>
+    <th class="num">Revenue</th>
+    <th class="num">Net (est.)</th>
+    <th class="num">Cost / unit</th>
+    <th class="num">Cost of goods sold</th>
+    <th class="num">Net income</th>
+    <th class="num">Net income / unit</th>
+    <th class="num">Margin %</th>
+    <th class="tagcol"></th>
+  </tr></thead>
+  {% for p in view.products %}
+  {% set neg = p.profit is not none and p.profit < 0 %}
+  {% set top = loop.index <= 3 and p.profit is not none and p.profit > 0 %}
+  <tr class="{% if neg %}neg{% elif top %}top{% endif %}">
+    <td>{{ p.name }}</td>
+    <td class="num" title="{{ p.sales_count }} sale{{ '' if p.sales_count == 1 else 's' }}{% if p.contract_units %} · {{ p.contract_units }} by contract{% endif %}{% if p.unpriced_units %} · {{ p.unpriced_units }} not priced{% endif %}">{{ p.units_sold|qty }}</td>
+    <td class="num" title="{% if p.avg_price is not none %}{{ p.avg_price|isk }} ISK — revenue ÷ priced units{% else %}no priced sale{% endif %}">{{ p.avg_price|isk_short }}</td>
+    <td class="num" title="{% if not p.quote %}no cached quote — refresh prices{% elif not p.quote_sell_side %}the cached hub figure is the best BUY order of {{ p.quote|isk }} ISK (Max Buy basis — not comparable with a realized sell price){% else %}average realized price against the cached best sell of {{ p.quote|isk }} ISK{% if p.quote_age %} (quotes from {{ p.quote_age }}){% endif %}{% endif %}">{% if p.vs_quote_pct is not none %}{{ "%+.1f"|format(p.vs_quote_pct) }}%{% else %}—{% endif %}</td>
+    <td class="num" title="{{ p.revenue|isk }} ISK">{{ p.revenue|isk_short }}</td>
+    <td class="num" title="{{ p.net|isk }} ISK — after the estimated sell fees">{{ p.net|isk_short }}</td>
+    {% set copies = p.basis.cost.subtotal('bpc') + p.basis.cost.subtotal('invention') if p.unit_cost is not none else 0 %}
+    <td class="num">{% if p.unit_cost is not none %}<span title="lag-based cost as of run {{ p.basis.run_number }}, executed {{ p.basis.completed_at }} · materials {{ p.basis.cost.subtotal('material')|isk_short }} · job fees {{ p.basis.cost.subtotal('install')|isk_short }} · freight {{ p.basis.cost.subtotal('freight_in')|isk_short }}{% if copies %} · BPC / invention {{ copies|isk_short }}{% endif %}">{{ p.unit_cost|isk_short }}</span>
+      <a class="small" href="{{ url_for('run_detail', index_run_id=p.basis.index_run_id, view='profit') }}" title="the run this cost basis comes from">run {{ p.basis.run_number }} ↗</a>{% else %}—{% endif %}</td>
+    <td class="num" title="{% if p.cost_of_units is not none %}{{ p.cost_of_units|isk }} ISK — {{ p.units_priced|qty }} priced units × cost per unit{% else %}no cost basis{% endif %}">{{ p.cost_of_units|isk_short }}</td>
+    <td class="num {% if neg %}bad{% elif p.profit %}good{% endif %}" title="{% if p.profit is not none %}{{ p.profit|isk }} ISK — net {{ p.net|isk_short }} − cost of units sold {{ p.cost_of_units|isk_short }}{% else %}no cost basis{% endif %}">{{ p.profit|isk_short }}</td>
+    <td class="num {% if neg %}bad{% elif p.profit %}good{% endif %}" title="{% if p.profit_per_unit is not none %}{{ p.profit_per_unit|isk }} ISK{% else %}no cost basis{% endif %}">{{ p.profit_per_unit|isk_short }}</td>
+    <td class="num {% if neg %}bad{% elif p.profit %}good{% endif %}" title="profit ÷ cost of units sold">{% if p.margin_pct is not none %}{{ "%.1f"|format(p.margin_pct) }}%{% else %}—{% endif %}</td>
+    <td class="tagcol"><span class="tags">{{ tags(p.badges) }}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+<p class="muted footnote" style="margin:.4rem 0 0">full ISK on hover · sorted by net income · green stripe = top 3 earners</p>
+{% else %}<p class="muted">No product sold in this window.</p>{% endif %}
+</details>
+
+<details class="section" data-key="orders" open>
+<summary><h2>Open sell orders <span class="muted">— {{ view.open_orders|length }}</span></h2></summary>
+{% if view.open_orders %}
+<div class="tablewrap">
+<table class="sortable">
+  <thead><tr>
+    <th>Product</th>
+    <th class="num">Remaining / total</th>
+    <th class="num">Listed</th>
+    <th class="num">Quote</th>
+    <th>Issued</th>
+    <th>Expires</th>
+    <th>Owner</th>
+    <th>Where</th>
+    <th class="tagcol"></th>
+  </tr></thead>
+  {% for o in view.open_orders %}
+  <tr>
+    <td>{{ o.name }}</td>
+    <td class="num">{{ o.volume_remain|qty }} / {{ o.volume_total|qty }}</td>
+    <td class="num" title="{{ o.price|isk }} ISK">{{ o.price|isk_short }}</td>
+    <td class="num" title="{% if o.quote is not none %}{{ o.quote|isk }} ISK — {{ o.quote_note or 'cached best sell' }}{% else %}no cached quote{% endif %}">{{ o.quote|isk_short }}{% if o.quote_note %} <span class="muted small">{{ o.quote_note }}</span>{% endif %}</td>
+    <td class="muted">{{ o.issued[:16].replace('T', ' ') }}</td>
+    <td class="{% if o.expires_soon %}warn{% else %}muted{% endif %}" title="issued + duration">{{ o.expires[:16].replace('T', ' ') if o.expires else '—' }}</td>
+    <td>{{ o.owner }}</td>
+    <td>{{ o.system or '—' }}</td>
+    <td class="tagcol"><span class="tags">{{ tags(o.badges) }}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No open sell orders for pipeline finals.</p>{% endif %}
+{% if view.open_contracts %}
+<h3 class="subhead" style="margin-top:.8rem">Open contracts <span class="muted">— {{ view.open_contracts|length }}</span></h3>
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Products</th><th class="num">Qty</th><th class="num">Price</th><th>Issued</th><th>Expires</th><th>Owner</th><th class="tagcol"></th></tr></thead>
+  {% for c in view.open_contracts %}
+  <tr>
+    <td>{{ c.products }}{% if c.title %} <span class="muted">“{{ c.title }}”</span>{% endif %}</td>
+    <td class="num">{{ c.quantity|qty }}</td>
+    <td class="num" title="{{ c.price|isk }} ISK">{{ c.price|isk_short }}</td>
+    <td class="muted">{{ c.issued[:16].replace('T', ' ') }}</td>
+    <td class="muted">{{ c.expires[:16].replace('T', ' ') }}</td>
+    <td>{{ c.owner }}</td>
+    <td class="tagcol"><span class="tags">{% if c.expired %}<span class="badge warn" title="past its expiry but ESI has not reported a final status yet — never counted as a sale">expired?</span>{% endif %}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+</details>
+
+<details class="section" data-key="sales" open>
+<summary><h2>Sales ledger <span class="muted">— {{ view.sales_total }}</span></h2></summary>
+{% if view.sales %}
+<div class="tablewrap">
+<table class="sortable">
+  <thead><tr>
+    <th>Date</th>
+    <th>Product</th>
+    <th class="num">Qty</th>
+    <th class="num">Unit price</th>
+    <th class="num">Gross</th>
+    <th class="num">Net (est.)</th>
+    <th class="num">Net income (est.)</th>
+    <th>Where</th>
+    <th>Owner</th>
+    <th>Source</th>
+    <th class="tagcol"></th>
+  </tr></thead>
+  {% for s in view.sales %}
+  <tr class="{% if not s.counted %}superseded{% elif s.profit is not none and s.profit < 0 %}neg{% endif %}">
+    <td class="muted">{{ s.when[:16].replace('T', ' ') }}</td>
+    <td>{{ s.name }}</td>
+    <td class="num">{{ s.quantity|qty }}</td>
+    <td class="num" title="{% if s.unit_price is not none %}{{ s.unit_price|isk }} ISK{% else %}not attributable{% endif %}">{{ s.unit_price|isk_short }}</td>
+    <td class="num" title="{% if s.gross is not none %}{{ s.gross|isk }} ISK{% elif s.contract_price %}the contract's whole price, {{ s.contract_price|isk }} ISK, is not attributed to the hull{% else %}—{% endif %}">{% if s.gross is not none %}{{ s.gross|isk_short }}{% elif s.contract_price %}<span class="muted">({{ s.contract_price|isk_short }})</span>{% else %}—{% endif %}</td>
+    <td class="num" title="{% if s.net is not none %}{{ s.net|isk }} ISK — after the estimated sell fees at {{ s.venue_label }}{% else %}—{% endif %}">{{ s.net|isk_short }}</td>
+    <td class="num {% if s.profit is not none and s.profit < 0 %}bad{% elif s.profit %}good{% endif %}" title="{% if s.profit is not none %}{{ s.profit|isk }} ISK — net − qty × the product's current cost basis{% else %}no cost basis or no attributable price{% endif %}">{{ s.profit|isk_short }}</td>
+    <td>{% if s.system %}{{ s.system }}{% elif s.location_id %}<span class="muted" title="location {{ s.location_id }} unresolved — a structure the pulling character cannot dock at, retried daily">—</span>{% else %}<span class="muted" title="ESI reports no location for this contract">—</span>{% endif %}</td>
+    <td title="{% if s.division %}corporation wallet division {{ s.division }}{% else %}{{ s.owner_kind }} {{ s.owner_id }}{% endif %}">{{ s.owner }}</td>
+    <td>{% if s.source == 'contract' %}<span class="badge accent" title="item-exchange contract {{ s.ref_id }}{% if s.detail %} — {{ s.detail }}{% endif %}">contract</span>{% else %}<span class="badge" title="market transaction {{ s.ref_id }}">market</span>{% endif %}</td>
+    <td class="tagcol"><span class="tags">{{ flags(s) }}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% if view.sales_truncated %}
+<p class="muted footnote" style="margin:.4rem 0 0">showing newest {{ view.sales|length }} of {{ view.sales_total }} —
+<a href="{{ url_for('ledger', window=window, rows='all') }}">show all</a></p>
+{% endif %}
+{% else %}<p class="muted">No sale events in this window.</p>{% endif %}
+</details>
+
+<details class="section" data-key="history" open>
+<summary><h2>Order history <span class="muted">— {{ view.history|length }}</span></h2></summary>
+{% if view.history %}
+<div class="tablewrap">
+<table class="sortable">
+  <thead><tr><th>Product</th><th class="num">Sold / total</th><th class="num">Listed</th><th>Outcome</th><th>Closed (est.)</th><th>Owner</th></tr></thead>
+  {% for h in view.history %}
+  <tr>
+    <td>{{ h.name }}</td>
+    <td class="num">{{ h.sold|qty }} / {{ h.volume_total|qty }}</td>
+    <td class="num" title="{{ h.price|isk }} ISK">{{ h.price|isk_short }}</td>
+    <td><span class="badge {% if h.outcome == 'filled' %}good{% elif h.outcome == 'partial' %}warn{% endif %}"
+        title="{% if h.outcome == 'filled' %}every unit sold before the order closed{% elif h.outcome == 'partial' %}closed with units unsold{% else %}closed with nothing sold{% endif %} — units sold are counted from wallet transactions, never from here">{{ h.outcome }}</span></td>
+    <td class="muted" title="ESI reports no close time — the order's expiry or when Magoo first saw it closed, whichever is earlier">{{ h.closed[:16].replace('T', ' ') if h.closed else '—' }}</td>
+    <td>{{ h.owner }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No closed orders for pipeline finals in this window.</p>{% endif %}
+</details>
+{% endif %}
+{% endif %}
+{% endblock %}

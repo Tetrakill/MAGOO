@@ -34,6 +34,8 @@ PAGES = [
     "/runs",
     "/characters",
     "/settings",
+    "/ledger",
+    "/ledger?window=all",
 ]
 
 

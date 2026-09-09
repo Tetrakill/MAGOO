@@ -501,3 +501,22 @@ SKILL_SUFFIX_ENCRYPTION = "Encryption Methods"
 # Verified against the live SDE: activity-8 skill rows span exactly groups
 # 270 and 268.
 SKILL_GROUP_SCIENCE = 270
+
+# --- Ledger (v1.27.0) ------------------------------------------------------
+
+# Wallet-transaction pages walked per owner (per corp wallet division) in
+# one refresh: a first pull back-fills history this many pages at a time
+# and resumes on the next refresh; an incremental pull walks the newest
+# page down to the stored range regardless (bounded by real activity and
+# the rate budget below), so nothing between two refreshes is skipped.
+LEDGER_TX_PAGES_PER_REFRESH = 6
+# Contract item lists fetched per refresh (one call each; items are
+# immutable once a contract is issued, so a contract costs at most
+# LEDGER_ITEM_ATTEMPTS calls ever before it is written off as 'missing').
+LEDGER_CONTRACT_ITEMS_PER_REFRESH = 200
+LEDGER_ITEM_ATTEMPTS = 3
+# Share of an ESI rate-limit group's 15-minute token budget (char-wallet
+# 150, corp-wallet 300, char-/corp-contract 600) one refresh may spend
+# before that group is stopped pre-emptively. The group key is read as
+# app-wide (the conservative reading; PROJECT.md §8) until verified live.
+LEDGER_RATE_BUDGET_FRACTION = 0.4
