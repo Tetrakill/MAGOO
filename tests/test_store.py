@@ -315,3 +315,27 @@ def test_first_run_profile_skips_a_database_seeded_without_it(conn):
     assert s.manufacturing_slots == 10
     assert store.get_class_settings(conn)["other"].structure_type_id is None
     assert store.blacklist_categories(conn) == set()
+
+
+def test_prune_backups_takes_sidecars_and_orphans(tmp_path):
+    """Pruning an old backup also removes its -wal/-shm sidecars, and
+    sidecars whose backup is already gone are swept (a read-only open of a
+    WAL backup leaves them behind)."""
+    import os
+    import time
+
+    for i, name in enumerate(("1.20.0", "1.21.0", "1.23.0", "1.24.0", "1.26.0")):
+        f = tmp_path / f"magoo-pre-{name}.sqlite"
+        f.write_bytes(b"x")
+        (tmp_path / f"magoo-pre-{name}.sqlite-wal").write_bytes(b"")
+        (tmp_path / f"magoo-pre-{name}.sqlite-shm").write_bytes(b"")
+        stamp = time.time() - (10 - i) * 100
+        os.utime(f, (stamp, stamp))
+    (tmp_path / "magoo-pre-1.19.0.sqlite-shm").write_bytes(b"")  # orphan
+    store._prune_backups(tmp_path, keep=3)
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == [
+        "magoo-pre-1.23.0.sqlite", "magoo-pre-1.23.0.sqlite-shm", "magoo-pre-1.23.0.sqlite-wal",
+        "magoo-pre-1.24.0.sqlite", "magoo-pre-1.24.0.sqlite-shm", "magoo-pre-1.24.0.sqlite-wal",
+        "magoo-pre-1.26.0.sqlite", "magoo-pre-1.26.0.sqlite-shm", "magoo-pre-1.26.0.sqlite-wal",
+    ]

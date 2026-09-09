@@ -954,10 +954,26 @@ def _prune_backups(dest_dir, keep: int = 3) -> None:
     except OSError:
         return
     for stale in found[keep:]:
-        try:
-            stale.unlink()
-        except OSError:
-            pass
+        for path in (stale, _sidecar(stale, "-wal"), _sidecar(stale, "-shm")):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    # A read-only open of a WAL-mode backup leaves -wal/-shm sidecars that
+    # outlive the file they belong to; sweep the orphans (2026-09-08).
+    for sidecar in list(dest_dir.glob("magoo-pre-*.sqlite-wal")) + list(
+        dest_dir.glob("magoo-pre-*.sqlite-shm")
+    ):
+        base = sidecar.with_name(sidecar.name.rsplit("-", 1)[0])
+        if not base.exists():
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+
+
+def _sidecar(path, suffix: str):
+    return path.with_name(path.name + suffix)
 
 
 # First-run profile (2026-09-05): what a NEW install starts with — the

@@ -26,6 +26,10 @@ leave it; there is no Magoo server.
   security bands, system cost indices, skills and blueprint ME/TE.
 - **Compares alchemy routes**, reaction saturation, capital and Upwell
   structure production.
+- **Keeps a sales ledger** of what your pipeline finals actually sold for —
+  wallet transactions, sell orders and contracts from ESI, netted by where
+  each hull sold and costed from the latest executed run: revenue, cost of
+  goods sold, net income, unrealized profit, Top 10s and charts.
 
 The plan is advisory; ESI is the ledger.
 
@@ -62,7 +66,8 @@ Magoo walks you through it with an on-screen checklist. In short:
 2. **Log in with EVE** — opens your normal browser so you can see you are on
    `login.eveonline.com`. Magoo never sees your password.
 3. **Update from ESI** — snapshots your assets, industry jobs and wallets,
-   reads your sales for the Ledger, then refreshes prices.
+   reads your sales for the Ledger, then refreshes prices (once you have
+   pipelines).
 4. **Add your pipelines** — what you build, and how many per cycle.
 5. **Refresh prices**, then **Plan index run**.
 
