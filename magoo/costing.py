@@ -533,12 +533,21 @@ class CostLine:
 @dataclass
 class HullCost:
     pipeline_id: int
+    # The hulls this cycle STARTS: on an executed run, this pipeline's
+    # share of what the install check let the user start (v1.27.1 — the
+    # jobs the Plan tab told them to run; the plan's own count on runs
+    # planned before the check); on the current-prices view, the request.
     hulls_per_cycle: int
     lines: list
     # Set for the lagged (executed-run) view; None for the current-prices
     # view, which has no run anchor.
     index_run_id: int | None = None
     run_number: int | None = None
+    # This pipeline's share of the hulls the plan BUILDS this cycle
+    # (v1.27.1): differs from hulls_per_cycle only when stock fed fewer
+    # jobs than the plan sized — a pool that let the plan size fewer runs
+    # lowers both (review 2026-09-10). None on the current-prices view.
+    hulls_planned: int | None = None
 
     @property
     def total(self) -> float:
@@ -1122,16 +1131,61 @@ def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
         "WHERE i.index_run_id = ? AND a.pipeline_id = ?",
         (index_run_id, pipeline_id),
     ).fetchall()
-    hulls = next(
+    final = next(
         (
-            i["qty_attributable"]
+            i
             for i in items
             if i["type_id"] == pipeline["final_product_type_id"]
         ),
-        0,
+        None,
     )
-    if not hulls:
+    # This pipeline's share of the cycle's hull DEMAND — the divisor of
+    # every per-hull line (the material shares are attributed per
+    # demanded hull) and the ceiling of both counts below.
+    attributed = final["qty_attributable"] if final is not None else 0
+    if not attributed:
         return None
+    portion = int(final["portion_size"] or 1)
+    # The merged demand that attribution is a share OF.
+    whole = (
+        final["cycle_need_qty"]
+        if "cycle_need_qty" in final.keys() and final["cycle_need_qty"]
+        else final["merged_min_qty"]
+    )
+
+    def share(total: int) -> int:
+        """This pipeline's share of a merged BUILD quantity: pro rata to
+        the cycle demand where another pipeline consumes the final too,
+        rounded UP so a started hull never reads as none (review
+        2026-09-09 — banker's rounding turned 1 of 2 into 0), capped at
+        the hulls this pipeline was attributed (a batch overbuild nets
+        off next cycle rather than counting here)."""
+        if total <= 0:
+            return 0
+        if not whole or whole <= attributed:
+            return min(attributed, total)
+        return min(attributed, -(-total * attributed // whole))
+
+    # v1.27.1: the hulls the cycle PLANS and the hulls it actually
+    # STARTS. Both are measured on what the plan BUILDS, not on the
+    # demand attribution (review 2026-09-10: `qty_attributable` is the
+    # DEMAND, so using it as the plan's count badged every slot-limited
+    # run `short` although nothing was short, and a final the allocator
+    # gave no job at all read as a whole cycle started). `install_runs`
+    # is NULL both on a run planned before the check AND on any row
+    # holding no jobs, so the build is the fallback for both: a final
+    # with no jobs plans 0 and starts 0. cycle_totals and the Units
+    # column count the started figure; the per-hull cost stands whatever
+    # the count, and stays the Ledger's cost basis even when the cycle
+    # started none (user ruling 2026-09-09).
+    built = int(final["runs_allocated"] or 0) * portion
+    started = (
+        int(final["install_runs"]) * portion
+        if "install_runs" in final.keys() and final["install_runs"] is not None
+        else built
+    )
+    planned_hulls = share(built)
+    hulls = min(planned_hulls, share(started))
 
     snapshots: dict[int, dict] = {}
 
@@ -1155,7 +1209,7 @@ def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
         if item["alchemy_for_type_id"]:
             continue
         depth = item["pipeline_depth"] or 0
-        qty_per_hull = item["qty_attributable"] / hulls
+        qty_per_hull = item["qty_attributable"] / attributed
         snap, lag, clamped = lagged(item["type_id"], depth)
         info = ref.type_info(item["type_id"])
         if item["blueprint_id"] is not None:
@@ -1284,6 +1338,7 @@ def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
         index_run_id=index_run_id,
         run_number=run_number,
         hulls_per_cycle=hulls,
+        hulls_planned=planned_hulls,
         lines=lines,
     )
 

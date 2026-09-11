@@ -12,6 +12,9 @@ Phases:
   6. Slot allocation under contention (scipy MILP on build savings)
   7. Final recommendations and flags (ship batching, reaction saturation,
      capacity_limited, low_stock)
+  7.5 Sourcing pass (fill pricing, compressed substitution)
+  7.6 Install check (planned jobs vs the stock there to feed them;
+      finals by return, intermediates in proportion)
   8. Cost-lot bookkeeping primitives (FIFO vintage costing)
 """
 
@@ -87,6 +90,12 @@ class Snapshot:
     # ({type_id: price}, market.cached_structure_quotes) — the synthetic
     # rung a 'min_sell' / 'max_buy' structure basis stands in with.
     structure_prices: dict[int, float] = field(default_factory=dict)
+    # v1.27.1: the SELL reference per pipeline final for the install
+    # check's ranking ({type_id: price}, ledger.final_quote — the hub
+    # quote for sub-capitals, the capital structure's sell quote for
+    # capital-class hulls, which Jita never quotes). A final absent here
+    # falls back to its own plan-time price.
+    sell_quotes: dict[int, float] = field(default_factory=dict)
     # Informational (UI: buying power vs. the shopping list) — planning
     # itself does not budget ISK.
     character_isk: float = 0.0
@@ -116,6 +125,16 @@ class PlanItem:
     on_hand_qty: int = 0
     in_progress_qty: int = 0
     merged_min_qty: int = 0
+    # One cycle's consumption AT THE JOBS' OWN ROUNDING (Phase 3.5, user
+    # ruling 2026-09-09): merged_min rounds the cycle as one merged job;
+    # this propagates it through the jobs Phase 5-7 will install (per-job
+    # ceilings, uniform round-up, full reaction windows, whole copies),
+    # so a stage stocked to it feeds its consumers' jobs. The target and
+    # deficit basis; >= merged_min_qty within one pipeline (it can dip
+    # below where pipelines share a consumer: merged_min sums separately
+    # rounded runs, this merges first). merged_min stays the BOM figure
+    # and the pipeline-share attribution basis.
+    cycle_need_qty: int = 0
     # The share of merged_min the pipelines directly requested as output
     # (nonzero only for finals). The remainder of a dual-role final's
     # demand is another pipeline's component draw, which nets against
@@ -219,6 +238,41 @@ class PlanItem:
     structure_fill_orders: int | None = None
     unfilled_qty: int = 0
     unfilled_price: float | None = None
+    # Install check (v1.27.1, Phase 7.6): can this cycle's planned jobs
+    # actually be installed from stock? On a row holding jobs: the runs
+    # (and the jobs they occupy) that stock on hand, in-flight output and
+    # this cycle's purchases can feed — the plan's own build output is
+    # NOT available (it delivers next cycle; that lag is the pipeline);
+    # the material that bound the figure (None when every planned run
+    # installs); and, on a pipeline final, its install priority (1 =
+    # highest return — finals take scarce stock in that order). On a
+    # consumed row: the planned jobs' total draw and the units it
+    # exceeds availability by. None = not a consumer / not consumed.
+    install_runs: int | None = None
+    install_jobs: int | None = None
+    # Runs per installed job: uniform for an intermediate (install_jobs ×
+    # install_per_job == install_runs — the per-job count rounded up the
+    # way Phase 7 sizes it, user ruling 2026-09-09), the plan's own count
+    # for an exact-quantity ship or a saturating reaction, whose last
+    # job takes the remainder.
+    install_per_job: int | None = None
+    install_limited_by: int | None = None
+    install_priority: int | None = None
+    # The return on cost that ranked a final (final_return; None =
+    # unpriced, ranked last) — persisted so the page restates exactly
+    # what the order was built on.
+    install_return: float | None = None
+    install_draw_qty: int | None = None
+    install_short_qty: int | None = None
+    # v1.27.1 (user ruling 2026-09-11): of `alchemy_output_qty`, the
+    # units produced to replace units the plan was going to BUY rather
+    # than to cover a build shortfall. Phase 7 credits each against its
+    # own figure, so neither is counted twice. Not persisted.
+    alchemy_buy_qty: int = 0
+    # v1.27.1 stock-aware backfill (Phase 6): jobs this item received
+    # from slots whose allocated jobs cannot start this cycle. Not
+    # persisted; the plan-time figure the tests read.
+    backfilled_jobs: int = 0
 
     @property
     def buildable(self) -> bool:
@@ -365,15 +419,18 @@ def _apply_targets(
         p["final_product_type_id"] for p in store.active_pipelines(conn)
     }
 
+    # Targets and deficits are sized on cycle_need_qty — one cycle's
+    # consumption at the jobs' own rounding (Phase 3.5) — not on the
+    # merged BOM figure (user ruling 2026-09-09).
     for item in merged.values():
         if item.type_id in final_products:
-            item.target_stock_qty = item.merged_min_qty
+            item.target_stock_qty = item.cycle_need_qty
         else:
             # round-before-ceil kills binary-float noise (100 * 1.1 ==
             # 110.00000000000001 would otherwise ceil to 111), mirroring
             # industry.required_quantity's guard.
             item.target_stock_qty = math.ceil(
-                round(item.merged_min_qty * buffer_mult, 9)
+                round(item.cycle_need_qty * buffer_mult, 9)
             )
 
     # Composite reaction inputs get extra runs' worth of material on top.
@@ -406,7 +463,7 @@ def _apply_targets(
             # component share against stock like any other stage (ruling
             # 2026-08-27); single-role finals have no component share and
             # keep the exact rule unchanged.
-            component_share = item.merged_min_qty - item.requested_qty
+            component_share = item.cycle_need_qty - item.requested_qty
             item.deficit_qty = item.requested_qty + max(
                 0,
                 component_share - item.on_hand_qty - item.in_progress_qty,
@@ -422,7 +479,7 @@ def _apply_targets(
             item.deficit_qty = max(
                 0,
                 item.target_stock_qty
-                + item.merged_min_qty
+                + item.cycle_need_qty
                 - item.on_hand_qty
                 - item.in_progress_qty,
             )
@@ -470,21 +527,88 @@ def _composite_extra_targets(
     return extra
 
 
-def _steady_shares(conn, ref, merged: dict[int, PlanItem]) -> dict[int, dict[int, int]]:
-    """Each buildable consumer's ONE-CYCLE steady requirement of every
-    material it consumes — {material_id: {consumer_id: units}} — at the
-    BOM scale (ceil(merged_min / portion) runs as one job, so the
-    once-per-job rounding mirrors bom.expand). The feedback loop
-    prorates a stage's stockpile target by the share of this that comes
-    from consumers holding jobs this cycle (review 2026-09-05, finding
-    A3 / ruling R7). A self-consuming blueprint is not its own consumer."""
+def _steady_packing(
+    ref, item: PlanItem, runs: int, max_runs: int, finals
+) -> list[tuple[int, int]]:
+    """[(jobs, runs each)] — how Phases 5-7 pack `runs` runs of an item
+    into jobs at its window: an exact-quantity ship (a final; capitals,
+    freighters, JFs anywhere) as Phase 7's divmod split (the last jobs
+    short), a saturating reaction as full windows per job, everything
+    else as uniform jobs with the per-job count rounded up (the slight
+    overbuild nets off next cycle). The cycle-need pass draws each
+    material through this packing so the target matches the installs."""
+    if runs <= 0:
+        return []
+    jobs = math.ceil(runs / max_runs)
+    info = ref.type_info(item.type_id)
+    saturating = (
+        item.activity_id == config.ACTIVITY_REACTION
+        and info.group_id not in config.NON_SATURATING_REACTION_GROUPS
+    )
+    exact_total = item.type_id in finals or (
+        info.category_id == config.CATEGORY_SHIP
+        and info.group_id in config.EXACT_QTY_SHIP_GROUPS
+    )
+    if saturating:
+        return [(jobs, max_runs)]
+    if exact_total:
+        base, extra = divmod(runs, jobs)
+        return [
+            (count, each)
+            for count, each in ((jobs - extra, base), (extra, base + 1))
+            if count > 0 and each > 0
+        ]
+    return [(jobs, math.ceil(runs / jobs))]
+
+
+def _cycle_need(conn, ref, merged: dict[int, PlanItem]) -> dict[int, dict[int, int]]:
+    """Phase 3.5 (user ruling 2026-09-09): one cycle's consumption of
+    every item AT THE JOBS' OWN ROUNDING — stamped as cycle_need_qty, the
+    target and deficit basis — plus each consumer's share of it
+    ({material_id: {consumer_id: units}}), the proration basis the
+    feedback loop uses (a self-consuming blueprint is not its own
+    consumer).
+
+    bom.expand's merged_min rounds an item's cycle as ONE job (ceil once
+    per item). The jobs Phase 7 installs round PER JOB — six one-run
+    Thanatos jobs each round their capital engines up, a saturating
+    reaction runs a full window per job, an intermediate rounds its runs
+    up to uniform jobs, a sub-capital final builds whole copies — so a
+    stage stocked to the merged figure started every cycle a few percent
+    short of what its consumers' jobs draw (the 11-run simulation of
+    2026-09-09: a 1-3 % shortfall alternating every other cycle on the
+    capital components and the fullerene reactions). This pass walks the
+    merged chain top-down in depth order (every consumer sits shallower
+    than its material, so each item's cycle is complete before it is
+    packed), starting from the finals' requested output, and propagates
+    each item's cycle quantity through the packing Phases 5-7 will give
+    it: whole runs by _runs_for_units, jobs at its window
+    (_job_windower), then _steady_packing. Within one pipeline
+    cycle_need_qty >= merged_min_qty (a sum of per-job ceilings is never
+    below the one ceiling); across pipelines that share a consumer it can
+    be LOWER, since merged_min sums each pipeline's separately-rounded
+    runs while this pass merges the demand before rounding (review
+    2026-09-09). A line stocked at target installs every planned job —
+    what the install check verifies — given slots for every stage: a
+    stage denied slots leaves its inputs' targets prorated down (ruling
+    R7), so the re-plan that grants them slots finds those inputs short."""
+    window = _job_windower(conn, ref)
     class_settings = store.get_class_settings(conn)
     me_te = store.me_te_resolver(conn)
-    shares: dict[int, dict[int, int]] = {}
+    finals = {
+        p["final_product_type_id"] for p in store.active_pipelines(conn)
+    }
+    need: dict[int, int] = {t: 0 for t in merged}
     for item in merged.values():
-        if not item.buildable or item.merged_min_qty <= 0:
+        need[item.type_id] += item.requested_qty
+    shares: dict[int, dict[int, int]] = {}
+    for item in sorted(merged.values(), key=lambda i: (i.depth, i.type_id)):
+        qty = need[item.type_id]
+        item.cycle_need_qty = qty
+        if not item.buildable or qty <= 0:
             continue
-        runs = math.ceil(item.merged_min_qty / item.portion_size)
+        runs = _runs_for_units(ref, item, qty)
+        _time_per_run, max_runs = window(item)
         me, _te = me_te(item.blueprint_id, item.activity_id)
         mat_mult = industry.build_multiplier(
             ref,
@@ -493,15 +617,33 @@ def _steady_shares(conn, ref, merged: dict[int, PlanItem]) -> dict[int, dict[int
             "material",
             group_id=ref.type_info(item.type_id).group_id,
         )
+        packing = _steady_packing(ref, item, runs, max_runs, finals)
         for material_id, base_qty in ref.materials(
             item.blueprint_id, item.activity_id
         ):
-            if material_id == item.type_id:
-                continue
-            shares.setdefault(material_id, {})[item.type_id] = (
-                industry.required_quantity(runs, base_qty, me, mat_mult)
+            if material_id not in need:
+                continue  # every expanded material is in the plan
+            units = sum(
+                jobs * industry.required_quantity(each, base_qty, me, mat_mult)
+                for jobs, each in packing
             )
+            need[material_id] += units
+            if material_id != item.type_id:
+                shares.setdefault(material_id, {})[item.type_id] = units
+        # A self-consuming blueprint counts its own draw once (bom.expand
+        # does the same) without re-packing.
+        item.cycle_need_qty = need[item.type_id]
     return shares
+
+
+def _steady_shares(conn, ref, merged: dict[int, PlanItem]) -> dict[int, dict[int, int]]:
+    """Each buildable consumer's ONE-CYCLE requirement of every material
+    it consumes — {material_id: {consumer_id: units}} — at the jobs' own
+    rounding (the cycle-need pass; it re-stamps cycle_need_qty, which is
+    idempotent). The feedback loop prorates a stage's stockpile target
+    by the share of this that comes from consumers holding jobs this
+    cycle (review 2026-09-05, finding A3 / ruling R7)."""
+    return _cycle_need(conn, ref, merged)
 
 
 def _apply_unrefined_credits(conn, ref, merged: dict[int, PlanItem], snapshot):
@@ -583,22 +725,29 @@ def _runs_for_units(ref, item: PlanItem, units: int) -> int:
     return runs
 
 
-def _size_jobs(conn, ref, merged: dict[int, PlanItem]):
+def _job_windower(conn, ref):
+    """window(item) -> (time_per_run, max_runs_per_job) for a buildable
+    item: the modified time of one run (ME/TE, facility and skills) and
+    how many runs one job may hold. One job per slot for the full cycle;
+    jobs are installed simultaneously and never restarted mid-cycle, so
+    the window (`max_run_duration_hours`) caps the runs per job; jobs
+    longer than the window span multiple cycles (their output counts as
+    in-progress stock, and snapshot_from_state nets them from the slot
+    pool while they run). A job can never exceed the runs on its
+    blueprint copy, and both activities share the in-game 30-day per-job
+    run cap (the reaction formula's maxProductionLimit no longer caps
+    anything — ruling R2, 2026-09-05). _floor, not math.floor: window /
+    time_per_run lands an ulp BELOW an exact integer for many run times
+    and dropped a whole run per job (review 2026-09-05, finding A5).
+    Shared by _size_jobs (Phase 5) and the cycle-need pass (Phase 3.5),
+    so both pack an item's cycle into the same jobs."""
     settings = store.get_settings(conn)
     class_settings = store.get_class_settings(conn)
     me_te = store.me_te_resolver(conn)
     skills = _skill_levels(settings)
     window_seconds = settings.max_run_duration_hours * 3600.0
 
-    for item in merged.values():
-        if item.deficit_qty <= 0:
-            continue
-        if not item.buildable:
-            # Raw inputs are bought just-in-time in Phase 7, sized to the
-            # consumption of the jobs actually allocated — not to a
-            # stockpile target.
-            continue
-
+    def window(item: PlanItem) -> tuple[float, int]:
         setting = class_settings.get(item.item_class, industry.NPC_STATION)
         _me, te = me_te(item.blueprint_id, item.activity_id)
         time_mult = industry.build_multiplier(
@@ -609,34 +758,40 @@ def _size_jobs(conn, ref, merged: dict[int, PlanItem]):
             group_id=ref.type_info(item.type_id).group_id,
         )
         blueprint = ref.blueprint_for_product(item.type_id)
-        item.time_per_run = industry.job_time_seconds(
+        time_per_run = industry.job_time_seconds(
             blueprint.base_time, 1, te, time_mult
         ) * industry.skill_time_multiplier(
             ref, item.blueprint_id, item.activity_id, skills
         )
-        # One job per slot for the full cycle; jobs longer than the window
-        # span multiple cycles (their output counts as in-progress stock,
-        # and snapshot_from_state nets them from the slot pool while they
-        # run). A job can never exceed the runs on its blueprint copy, and
-        # both activities share the in-game 30-day per-job run cap (the
-        # reaction formula's maxProductionLimit no longer caps anything —
-        # ruling R2, 2026-09-05).
-        if item.time_per_run <= 0:
+        if time_per_run <= 0:
             raise ValueError(
                 f"non-positive job time for {item.name}: check skill "
                 "levels, TE, and structure/rig settings"
             )
-        # _floor, not math.floor: window / tpr lands an ulp BELOW an exact
-        # integer for many run times and dropped a whole run per job
-        # (review 2026-09-05, finding A5).
-        game_cap = _game_job_run_cap(item.time_per_run)
-        item.max_runs_per_job = min(
-            max(1, _floor(window_seconds / item.time_per_run)), game_cap
+        game_cap = _game_job_run_cap(time_per_run)
+        max_runs = min(
+            max(1, _floor(window_seconds / time_per_run)), game_cap
         )
         if item.bpc_runs_limit is not None:
-            item.max_runs_per_job = min(
-                item.max_runs_per_job, item.bpc_runs_limit
-            )
+            max_runs = min(max_runs, item.bpc_runs_limit)
+        return time_per_run, max_runs
+
+    return window
+
+
+def _size_jobs(conn, ref, merged: dict[int, PlanItem]):
+    window = _job_windower(conn, ref)
+
+    for item in merged.values():
+        if item.deficit_qty <= 0:
+            continue
+        if not item.buildable:
+            # Raw inputs are bought just-in-time in Phase 7, sized to the
+            # consumption of the jobs actually allocated — not to a
+            # stockpile target.
+            continue
+
+        item.time_per_run, item.max_runs_per_job = window(item)
         item.total_runs_needed = _runs_for_units(ref, item, item.deficit_qty)
         item.jobs_needed_unconstrained = math.ceil(
             item.total_runs_needed / item.max_runs_per_job
@@ -945,13 +1100,16 @@ def _build_savings_per_unit(ref, item: PlanItem, chain, buy_cost, snapshot):
     that venue's courier rate × packaged m³ (2026-08-23: the item's own
     inbound freight was missing — the inputs were landed, the item was
     not, which biased every bulky intermediate toward "buy"). Also stamps
-    the item's chain cost and unpriced-raw-leaf count."""
-    landed = buy_cost(item.type_id)
-    if landed is None:
-        return None
+    the item's chain cost and unpriced-raw-leaf count — since v1.27.1 even
+    when the item itself has no buy price (savings None): the install
+    check ranks a capital final, which has no Jita quote, by its return
+    on THIS chain cost against its structure-market sell quote."""
     cost, unpriced = chain(item.type_id)
     item.unit_chain_cost = cost
     item.savings_unpriced_inputs = unpriced
+    landed = buy_cost(item.type_id)
+    if landed is None:
+        return None
     return landed - cost
 
 
@@ -1139,7 +1297,7 @@ def _market_split(ref, item: PlanItem, ladders: _LadderLookup) -> None:
     )
 
 
-def _allocate_slots(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
+def _allocate_slots(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot, backfill: bool = True):
     chain, buy_cost = _chain_coster(conn, ref, snapshot)
     ladders = _LadderLookup(snapshot, store.get_settings(conn), ref)
     finals = {
@@ -1269,6 +1427,133 @@ def _allocate_slots(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
             item.jobs_allocated += int(jobs)
 
 
+    if not backfill:
+        # The steady-state planner: a what-if has no stock to backfill
+        # from and must allocate within its pool (review 2026-09-10).
+        return
+    # ---- stock-aware backfill (v1.27.1, user ruling 2026-09-09) --------
+    # A job stock cannot feed this cycle holds no slot in practice. The
+    # install-time rationing (Phase 7.6's core at ALLOCATION-time
+    # availability: raws and market-beaten intermediates unlimited —
+    # Phase 7 buys them — other buildables at stock + the units the
+    # market already beat) says which allocated jobs can start; the
+    # slots of the rest go, in savings order (finals, unpriced, then
+    # priced by savings per job), to the contenders the pool starved,
+    # for as many extra jobs as the LEFTOVER stock feeds. The starved
+    # jobs stay in the plan — they wait for stock and keep their
+    # suppliers sized — so a pool's planned jobs may exceed it; its
+    # startable jobs never do (the run page shows both).
+    rationing = _ration(
+        conn, ref, merged, snapshot, _allocation_availability(conn, ref, merged, snapshot)
+    )
+    draw_of = _draw_calculator(conn, ref)
+    leftover = dict(rationing.remaining)
+
+    def left(m: int) -> int:
+        return leftover[m] if m in leftover else rationing.left(m)
+
+    def feedable(item: PlanItem, want: int):
+        """(extra jobs the leftover stock feeds, their draw, their output)
+        — the most of `want` jobs at the item's window (a saturating
+        reaction runs full windows; anything else only the runs it still
+        needs). Where the item's uncovered need is bought (a priced
+        intermediate: the buy its consumers' startable jobs were counted
+        on), the extra jobs replace that buy with output that lands at
+        the END of the cycle — so they may only convert the part of it
+        no startable consumer draws (what is left of the item itself)."""
+        # The extra jobs are sized as Phase 7 will size the row once it
+        # holds them (_sized_runs — review 2026-09-10: a non-exact row is
+        # re-split uniform and rounded UP across ALL its jobs, so the
+        # round-up of the existing jobs is part of the extra draw); the
+        # draw is what those jobs add over the allocation-time model the
+        # rationing already charged (min(total, jobs × window) runs, a
+        # saturating reaction at full windows).
+        J = item.jobs_allocated
+        sat = _saturating_reaction(ref, item)
+        bought = item.type_id not in finals and snapshot.price(item.type_id) is not None
+        buy_now = _fallback_buy_of(ref, finals, item) if bought else 0
+        charged = (
+            J * item.max_runs_per_job
+            if sat
+            else min(item.total_runs_needed, J * item.max_runs_per_job)
+        )
+        before = draw_of(item, charged, J) if J > 0 and charged > 0 else {}
+
+        def draw_k(k: int) -> dict[int, int]:
+            runs = _sized_runs(ref, finals, item, J + k)
+            if runs <= 0:
+                return {}
+            after = draw_of(item, runs, J + k)
+            return {
+                m: q - before.get(m, 0)
+                for m, q in after.items()
+                if q - before.get(m, 0) > 0
+            }
+
+        def replaced_k(k: int) -> int:
+            return buy_now - _fallback_buy_of(ref, finals, item, k) if bought else 0
+
+        def fits(k: int) -> bool:
+            if replaced_k(k) > left(item.type_id):
+                return False
+            return all(q <= left(m) for m, q in draw_k(k).items())
+
+        lo, hi = 0, want
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, draw_k(lo), replaced_k(lo)
+
+    for activity_id in (config.ACTIVITY_MANUFACTURING, config.ACTIVITY_REACTION):
+        pool = [
+            i
+            for i in merged.values()
+            if i.activity_id == activity_id
+            and i.recommended_action == "build"
+            and i.alchemy_for_type_id is None
+        ]
+        freed = sum(
+            i.jobs_allocated - rationing.startable_jobs.get(i.type_id, i.jobs_allocated)
+            for i in pool
+        )
+        if freed <= 0:
+            continue
+        candidates = [
+            i
+            for i in pool
+            if i.jobs_needed_unconstrained > i.jobs_allocated
+            and _type_known(ref, i.type_id)
+            and (
+                i.type_id in finals
+                or i.build_savings_per_unit is None
+                or i.build_savings_per_unit > 0
+            )
+        ]
+        candidates.sort(
+            key=lambda i: (
+                0 if i.type_id in finals else 1 if i.build_savings_per_unit is None else 2,
+                -((i.build_savings_per_unit or 0.0) * i.portion_size * i.max_runs_per_job),
+                i.name,
+            )
+        )
+        for item in candidates:
+            if freed <= 0:
+                break
+            want = min(item.jobs_needed_unconstrained - item.jobs_allocated, freed)
+            k, need, replaced = feedable(item, want)
+            if k <= 0:
+                continue
+            for m, q in need.items():
+                leftover[m] = left(m) - q
+            if replaced:
+                leftover[item.type_id] = left(item.type_id) - replaced
+            item.jobs_allocated += k
+            item.backfilled_jobs += k
+            freed -= k
+
 # ---------------------------------------------------------------------------
 # Phase 6.5: alchemy substitution into spare reaction slots (v1.4)
 # ---------------------------------------------------------------------------
@@ -1287,9 +1572,12 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     mostly overshoot, so the first swap is cheap; wholesale replacement
     (~10 alchemy slots per direct slot at 55% yield) only happens when the
     spare capacity and the per-type cap genuinely allow it. Total coverage
-    never drops below the deficit, and a contended pool (no spare slots)
-    disables alchemy entirely — direct reactions are far more
-    slot-efficient."""
+    never drops below the deficit. Direct reactions are far more
+    slot-efficient, so alchemy never takes a slot a STARTABLE direct job
+    holds: under a contended pool (every slot allocated on paper) the
+    free slots are the ones direct jobs stock cannot feed this cycle, and
+    the alchemy jobs must themselves be startable (v1.27.1, user ruling
+    2026-09-09; it disabled alchemy entirely before)."""
     settings = store.get_settings(conn)
     if (
         not settings.alchemy_enabled
@@ -1298,13 +1586,45 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     ):
         return
     slots = snapshot.slots_available.get(config.ACTIVITY_REACTION, 0)
-    spare = slots - sum(
+    allocated = sum(
         i.jobs_allocated
         for i in merged.values()
         if i.activity_id == config.ACTIVITY_REACTION
     )
+    # With spare slots on paper the pass runs as it always has (the plan
+    # is advisory; Phase 7.6 rations the alchemy jobs like any other).
+    # Under a CONTENDED pool (every slot allocated on paper) it used to
+    # stay out entirely; since v1.27.1 (user ruling 2026-09-09) the slots
+    # that count are the ones STARTABLE direct jobs hold — a direct job
+    # stock cannot feed this cycle holds no slot — so alchemy may run in
+    # the rest by the original rules, ranked by savings: a swap drops
+    # the composite's own unstartable direct job where it has one (it
+    # held no slot, so the alchemy jobs cost their full count), else a
+    # startable one (net jobs − 1, its inputs back in the pot), and the
+    # alchemy jobs must themselves be startable (their fuel block is in
+    # the leftover stock; the goo is bought just in time).
+    contended = allocated >= slots
+    rationing = _ration(
+        conn, ref, merged, snapshot, _allocation_availability(conn, ref, merged, snapshot)
+    )
+    startable_direct = sum(
+        rationing.startable_jobs.get(i.type_id, i.jobs_allocated)
+        for i in merged.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+    )
+    spare = (slots - startable_direct) if contended else (slots - allocated)
     if spare <= 0:
         return
+    unstartable = {
+        i.type_id: i.jobs_allocated - rationing.startable_jobs.get(i.type_id, i.jobs_allocated)
+        for i in merged.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+    }
+    leftover = dict(rationing.remaining)
+    draw_of = _draw_calculator(conn, ref)
+
+    def left(m: int) -> int:
+        return leftover[m] if m in leftover else rationing.left(m)
 
     yield_ = settings.alchemy_reprocess_yield
     cap = settings.max_alchemy_jobs_per_type
@@ -1328,9 +1648,27 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         if (
             item is None
             or item.activity_id != config.ACTIVITY_REACTION
-            or item.jobs_allocated <= 0
+            # Direct jobs to displace, or units the plan means to BUY
+            # that the route could supply instead (user ruling
+            # 2026-09-11). A market-preferred composite carries its whole
+            # cycle need with no jobs (Phase 7 buys the shortfall); where
+            # ladders split it, the bought part is `market_buy_qty`.
+            # Neither, and there is nothing for the route to beat.
+            or (
+                item.jobs_allocated <= 0
+                and item.total_runs_needed <= 0
+                and item.market_buy_qty <= 0
+            )
             or ref.type_info(composite_id).group_id
             in config.NON_SATURATING_REACTION_GROUPS
+            # The route's unrefined product is already a demanded plan row
+            # (a pipeline sells it, or the chain draws it). The pass
+            # OVERWRITES `merged[unrefined_id]` with its own job row, which
+            # would destroy that row's request, cycle need and pipeline
+            # attribution — and the feedback loop then deletes it every
+            # pass as an alchemy row, so the demand vanishes with no unmet
+            # flag (review 2026-09-10). Leave the route alone.
+            or route.unrefined_id in merged
         ):
             continue
         # Reactions have no ME; the reactions class setting governs both
@@ -1387,7 +1725,14 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         )
         item.direct_unit_cost = direct_unit
         item.alchemy_unit_cost = alchemy_unit
-        if alchemy_unit >= direct_unit:
+        # What the route has to beat: the direct build where the item
+        # holds jobs, else the LANDED market price it would otherwise be
+        # bought at (user ruling 2026-09-11 — a bought composite has no
+        # build to compare against, and comparing it to one it already
+        # lost would keep the route out for ever).
+        buys = item.jobs_allocated <= 0
+        benchmark = (landed(composite_id) or 0.0) if buys else direct_unit
+        if benchmark <= 0 or alchemy_unit >= benchmark:
             continue
         out_per_job = math.floor(max_runs * route.composite_qty * yield_)
         if out_per_job <= 0:
@@ -1399,7 +1744,19 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
                 "time_per_run": time_per_run,
                 "max_runs": max_runs,
                 "out_per_job": out_per_job,
-                "savings_per_unit": direct_unit - alchemy_unit,
+                "buys": buys,
+                "savings_per_unit": benchmark - alchemy_unit,
+                # A probe row for the unrefined formula's draw (its fuel
+                # block is the one input stock must hold).
+                "probe": PlanItem(
+                    type_id=route.unrefined_id,
+                    name=ref.type_info(route.unrefined_id).name,
+                    item_class="reactions",
+                    depth=item.depth,
+                    blueprint_id=route.formula.blueprint_id,
+                    activity_id=config.ACTIVITY_REACTION,
+                    portion_size=route.formula.portion_size,
+                ),
             }
         )
 
@@ -1408,32 +1765,113 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         best = None
         for cand in candidates:
             item = cand["item"]
-            if item.jobs_allocated <= 0:
+            buys = cand["buys"]
+            if not buys and item.jobs_allocated <= 0:
                 continue
             existing = alchemy_items.get(cand["route"].unrefined_id)
             jobs_so_far = existing.jobs_allocated if existing else 0
-            out_d = item.max_runs_per_job * item.portion_size
-            needed = item.total_runs_needed * item.portion_size
-            covered_without = (
-                item.jobs_allocated - 1
-            ) * out_d + item.alchemy_output_qty
+            if buys:
+                # Nothing to drop: the route supplies units the plan was
+                # going to buy. A market-preferred row keeps its whole
+                # cycle need (Phase 7 buys the shortfall and already
+                # credits `alchemy_output_qty` against it); a ladder-split
+                # row carries the bought part in `market_buy_qty`.
+                needed = max(
+                    item.total_runs_needed * item.portion_size,
+                    item.market_buy_qty,
+                )
+                covered_without = item.alchemy_output_qty
+            else:
+                out_d = item.max_runs_per_job * item.portion_size
+                needed = item.total_runs_needed * item.portion_size
+                covered_without = (
+                    item.jobs_allocated - 1
+                ) * out_d + item.alchemy_output_qty
             residual = max(0, needed - covered_without)
-            jobs = max(1, math.ceil(residual / cand["out_per_job"]))
-            if jobs_so_far + jobs > cap or jobs - 1 > spare:
+            # A build candidate's last direct job is mostly overshoot, so
+            # residual 0 is the CHEAP first swap and must stay (v1.4). A
+            # buy candidate with nothing left to replace has no swap.
+            if buys and residual <= 0:
                 continue
-            # Rank by ISK saved on the needed units per spare slot consumed.
+            jobs = max(1, math.ceil(residual / cand["out_per_job"]))
+            # Under a contended pool: displace the composite's direct job
+            # that cannot start where it has one (it held no slot, so the
+            # alchemy jobs cost `jobs` slots), else a startable one (its
+            # slot is reused), and only where the alchemy jobs can start.
+            drops_unstartable = (
+                not buys and contended and unstartable.get(item.type_id, 0) > 0
+            )
+            # A bought composite frees no slot of its own, so its alchemy
+            # jobs cost their full count whatever the pool looks like.
+            net = jobs if (buys or drops_unstartable) else jobs - 1
+            if buys:
+                # Its residual is the WHOLE purchase, so covering it often
+                # wants more than the per-type cap or the spare slots
+                # hold. Take a partial bite rather than veto the route
+                # (a direct swap stays all-or-nothing: its residual is one
+                # job's overshoot, and half a swap would under-cover the
+                # deficit the dropped job was carrying).
+                room = min(cap - jobs_so_far, spare)
+                if room < 1:
+                    continue
+                jobs = min(jobs, room)
+                net = jobs
+            elif jobs_so_far + jobs > cap or net > spare:
+                continue
+            # Only inputs that are plan rows gate the swap (the fuel
+            # block, and goo the chain already buys); an input no direct
+            # formula demands is not in `merged` yet — the pass adds it
+            # below and Phase 7 buys it just in time (review 2026-09-10).
+            need = (
+                {
+                    m: q
+                    for m, q in draw_of(
+                        cand["probe"], jobs * cand["max_runs"], jobs
+                    ).items()
+                    if m in merged
+                }
+                if contended else {}
+            )
+            if any(q > left(m) for m, q in need.items()):
+                continue
+            # Rank by ISK saved on the units these jobs actually supply,
+            # per spare slot consumed. A clamped buy replacement covers
+            # only part of its residual, so crediting the whole of it
+            # would out-rank honest candidates (2026-09-11); an unclamped
+            # swap always covers its residual, so this is the old figure.
+            covered = min(residual, jobs * cand["out_per_job"])
             score = (
-                cand["savings_per_unit"] * max(residual, 1) / max(jobs - 1, 1)
+                cand["savings_per_unit"] * max(covered, 1) / max(net, 1)
             )
             if best is None or score > best["score"]:
-                best = {"cand": cand, "jobs": jobs, "score": score}
+                best = {"cand": cand, "jobs": jobs, "score": score, "net": net,
+                        "buys": buys, "drops_unstartable": drops_unstartable,
+                        "need": need}
         if best is None:
             break
         cand = best["cand"]
         item, route = cand["item"], cand["route"]
-        item.jobs_allocated -= 1
-        item.alchemy_output_qty += best["jobs"] * cand["out_per_job"]
-        spare -= best["jobs"] - 1
+        produced = best["jobs"] * cand["out_per_job"]
+        if not best["buys"]:
+            item.jobs_allocated -= 1
+        else:
+            # Credited against the purchase, not the build shortfall.
+            item.alchemy_buy_qty += min(produced, item.market_buy_qty)
+        item.alchemy_output_qty += produced
+        spare -= best["net"]
+        if best["drops_unstartable"]:
+            unstartable[item.type_id] -= 1
+        elif contended and not best["buys"]:
+            # A startable direct job gave up its slot and its inputs for
+            # the cycle (a job's draw, or the shorter run count the
+            # rationing granted it).
+            granted = rationing.startable_runs.get(item.type_id, 0)
+            runs = min(item.max_runs_per_job, granted)
+            if runs > 0:
+                for m, q in draw_of(item, runs, 1).items():
+                    leftover[m] = left(m) + q
+        for m, q in best["need"].items():
+            leftover[m] = left(m) - q
         alch = alchemy_items.get(route.unrefined_id)
         if alch is None:
             alch = alchemy_items[route.unrefined_id] = PlanItem(
@@ -1491,29 +1929,55 @@ def _planned_consumption(conn, ref, merged: dict[int, PlanItem]) -> dict[int, in
     jobs run one extra run — and every run is charged (the old floor
     division silently dropped runs_allocated % jobs whole runs of demand,
     audit 2026-08-27)."""
-    class_settings = store.get_class_settings(conn)
-    me_te = store.me_te_resolver(conn)
+    draw_of = _draw_calculator(conn, ref)
     consumption: dict[int, int] = {}
     for item in merged.values():
         if item.runs_allocated <= 0:
             continue
-        setting = class_settings.get(item.item_class, industry.NPC_STATION)
-        me, _te = me_te(item.blueprint_id, item.activity_id)
-        mat_mult = industry.build_multiplier(
-            ref,
-            setting,
-            item.activity_id,
-            "material",
-            group_id=ref.type_info(item.type_id).group_id,
-        )
-        if item.jobs_allocated > 0:
-            jobs = item.jobs_allocated
-            base_runs, extra = divmod(item.runs_allocated, jobs)
-        else:
-            jobs, base_runs, extra = 1, item.runs_allocated, 0
-        for material_id, base_qty in ref.materials(
-            item.blueprint_id, item.activity_id
-        ):
+        for material_id, qty in draw_of(
+            item, item.runs_allocated, item.jobs_allocated
+        ).items():
+            consumption[material_id] = (
+                consumption.get(material_id, 0) + qty
+            )
+    return consumption
+
+
+def _draw_calculator(conn, ref):
+    """draw_of(item, runs, jobs) -> {material_id: units} — what `runs`
+    runs of the item's blueprint consume when installed as `jobs` jobs
+    (0 jobs = one job), with the game's once-per-job rounding: the runs
+    split divmod-style, the extra jobs running one more run. The one
+    material walk _planned_consumption and the install check share, so
+    the two can never disagree on a job's draw."""
+    class_settings = store.get_class_settings(conn)
+    me_te = store.me_te_resolver(conn)
+    per_item: dict[int, tuple] = {}
+
+    def draw_of(item: PlanItem, runs: int, jobs: int) -> dict[int, int]:
+        if runs <= 0:
+            return {}
+        cached = per_item.get(item.type_id)
+        if cached is None:
+            setting = class_settings.get(item.item_class, industry.NPC_STATION)
+            me, _te = me_te(item.blueprint_id, item.activity_id)
+            mat_mult = industry.build_multiplier(
+                ref,
+                setting,
+                item.activity_id,
+                "material",
+                group_id=ref.type_info(item.type_id).group_id,
+            )
+            cached = per_item[item.type_id] = (
+                me,
+                mat_mult,
+                ref.materials(item.blueprint_id, item.activity_id),
+            )
+        me, mat_mult, materials = cached
+        jobs = jobs if jobs > 0 else 1
+        base_runs, extra = divmod(runs, jobs)
+        out: dict[int, int] = {}
+        for material_id, base_qty in materials:
             qty = (jobs - extra) * industry.required_quantity(
                 base_runs, base_qty, me, mat_mult
             )
@@ -1521,10 +1985,630 @@ def _planned_consumption(conn, ref, merged: dict[int, PlanItem]) -> dict[int, in
                 qty += extra * industry.required_quantity(
                     base_runs + 1, base_qty, me, mat_mult
                 )
-            consumption[material_id] = (
-                consumption.get(material_id, 0) + qty
+            out[material_id] = qty
+        return out
+
+    return draw_of
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.6: install check — can the planned jobs be installed from stock?
+# ---------------------------------------------------------------------------
+
+
+def final_return(
+    ref, settings, type_id: int, price, chain_cost
+) -> float | None:
+    """A final's return on cost — net proceeds per unit (after sell-side
+    fees, the Profit views' figure) minus the vertically-integrated chain
+    cost, over that chain cost — from its plan-time sell quote and chain
+    cost. None when the final is unpriced or its chain cost is unknown /
+    zero: such a final ranks after every priced one. Primitives, not a
+    PlanItem, so the run page can restate the figure from a persisted
+    row (install priority is explained by it)."""
+    if price is None or chain_cost is None or chain_cost <= 0:
+        return None
+    info = ref.type_info(type_id)
+    net = costing.net_proceeds_per_hull(
+        price,
+        info.freight_volume,
+        settings,
+        capital=costing.is_capital_priced(ref, type_id),
+        freight_exempt=costing.freight_out_exempt(type_id),
+    )
+    return (net - chain_cost) / chain_cost
+
+
+def _final_return(ref, settings, snapshot: Snapshot, item: PlanItem):
+    """The final's sell reference is the snapshot's sell quote where one
+    was supplied (the web route passes ledger.final_quote's figure: the
+    hub quote for sub-capitals, the capital structure's SELL quote for
+    capital-class hulls, which Jita never quotes), else the row's own
+    plan-time price."""
+    price = snapshot.sell_quotes.get(item.type_id, item.price_snapshot)
+    return final_return(
+        ref, settings, item.type_id, price, item.unit_chain_cost
+    )
+
+
+def _packed_draw(draw_of, item: PlanItem, runs: int, per_job: int) -> dict[int, int]:
+    """What `runs` runs draw when installed the way a short item IS
+    installed (user ruling 2026-09-09): full jobs of `per_job` runs and
+    one last job with the remainder — a short last job overrules the
+    plan's whole-copy / uniform-job rounding, so nothing installable
+    waits for a full batch."""
+    if runs <= 0:
+        return {}
+    full, remainder = divmod(runs, per_job)
+    out = dict(draw_of(item, full * per_job, full)) if full else {}
+    if remainder:
+        for m, qty in draw_of(item, remainder, 1).items():
+            out[m] = out.get(m, 0) + qty
+    return out
+
+
+def _uniform_jobs(runs: int, per_job: int) -> tuple[int, int]:
+    """(jobs, runs per job) for an INTERMEDIATE installing `runs` runs the
+    way Phase 7 sizes it (user ruling 2026-09-09): the jobs its plan's
+    runs-per-job count needs, every job the same length, the per-job
+    count rounded UP — so jobs × per-job may exceed `runs` by up to
+    jobs − 1 (the overbuild nets off next cycle, like the plan's own).
+    The install check judges the draw at THAT total, so where the
+    round-up does not fit the stock it settles on the largest uniform
+    count that does."""
+    if runs <= 0:
+        return 0, 0
+    jobs = -(-runs // per_job)
+    return jobs, -(-runs // jobs)
+
+
+def install_draw_of(draw_of, item: PlanItem) -> dict[int, int]:
+    """The draw of a row's INSTALL figures at the packing they describe:
+    the plan's own split when every planned run installs, uniform jobs
+    when install_per_job × install_jobs == install_runs, otherwise full
+    jobs plus a remainder job. What the check guarantees fits — tests
+    and audits recompute it from the persisted row."""
+    runs, jobs = item.install_runs or 0, item.install_jobs or 0
+    if runs <= 0:
+        return {}
+    if runs >= item.runs_allocated:
+        return draw_of(item, item.runs_allocated, item.jobs_allocated)
+    per_job = item.install_per_job or -(
+        -item.runs_allocated // max(1, item.jobs_allocated)
+    )
+    if per_job * jobs == runs:
+        return draw_of(item, runs, jobs)
+    return _packed_draw(draw_of, item, runs, per_job)
+
+
+_UNLIMITED = 10**18
+# install_limited_by sentinel: the slot pool, not an input, stopped the job
+# (the startable jobs of a pool can never exceed it).
+_LIMITED_BY_SLOTS = -1
+
+
+def _type_known(ref, type_id: int) -> bool:
+    """False for a type the reference data does not hold (the MILP tests'
+    synthetic contenders): the rationing has nothing to say about what
+    it consumes, so it neither cuts it nor backfills it."""
+    try:
+        ref.type_info(type_id)
+    except KeyError:
+        return False
+    return True
+
+
+@dataclass
+class _Rationing:
+    """What one rationing pass decided (the install check's core, shared
+    with the stock-aware slot backfill and the alchemy pass): per
+    consumer the startable runs / jobs / runs-per-job and the binding
+    input, per final its priority and return, per consumed material the
+    planned draw, the availability and what is LEFT after the startable
+    jobs draw. ``left(m)`` answers for materials no planned job consumes
+    too (their availability, untouched)."""
+
+    startable_runs: dict = field(default_factory=dict)
+    startable_jobs: dict = field(default_factory=dict)
+    per_job: dict = field(default_factory=dict)
+    limited_by: dict = field(default_factory=dict)
+    priority: dict = field(default_factory=dict)
+    returns: dict = field(default_factory=dict)
+    draw: dict = field(default_factory=dict)
+    available: dict = field(default_factory=dict)
+    remaining: dict = field(default_factory=dict)
+    available_of: object = None
+
+    def left(self, m: int) -> int:
+        if m in self.remaining:
+            return self.remaining[m]
+        return self.available_of(m)
+
+
+def _allocation_availability(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
+    """available_of(type_id) at ALLOCATION time (Phases 6–6.5), before
+    the buys are sized: a raw input is bought just-in-time for whatever
+    is allocated (unlimited), so is an intermediate the market beats
+    outright (Phase 7 buys its whole deficit); any other buildable is
+    what is on hand and in flight plus the units the market already
+    beat (market_buy_qty). Finals are never bought."""
+    finals = {p["final_product_type_id"] for p in store.active_pipelines(conn)}
+
+    def available_of(m: int) -> int:
+        row = merged.get(m)
+        if row is None:
+            return snapshot.on_hand.get(m, 0) + snapshot.in_progress.get(m, 0)
+        if not row.buildable:
+            return _UNLIMITED
+        if (
+            m not in finals
+            and row.build_savings_per_unit is not None
+            and row.build_savings_per_unit <= 0
+        ):
+            return _UNLIMITED
+        available = row.on_hand_qty + row.in_progress_qty + row.market_buy_qty
+        # What its jobs (and its alchemy) will not cover, Phase 7 buys
+        # where a market exists — a capacity loser's fallback, capped at
+        # the rungs the market holds (the same sizing as _finalize) —
+        # and those bought units are there for its consumers too.
+        if m not in finals and snapshot.price(m) is not None:
+            available += _fallback_buy_of(ref, finals, row)
+        return available
+
+    return available_of
+
+
+def _exact_total(ref, finals: set, item: PlanItem) -> bool:
+    """Phase 7 never overbuilds a final or an exact-quantity ship: their
+    last job runs short instead of the uniform round-up."""
+    if item.type_id in finals:
+        return True
+    try:
+        info = ref.type_info(item.type_id)
+    except KeyError:
+        return False
+    return (
+        info.category_id == config.CATEGORY_SHIP
+        and info.group_id in config.EXACT_QTY_SHIP_GROUPS
+    )
+
+
+def _sized_runs(ref, finals: set, item: PlanItem, jobs: int) -> int:
+    """The runs Phase 7 will allocate to `jobs` jobs of the item (its
+    sizing rule, mirrored — review 2026-09-10): full windows for a
+    saturating reaction; the plan's total capped at the windows for a
+    final or an exact-quantity ship; for everything else that figure
+    rounded UP to a uniform per-job count across ALL the jobs."""
+    if jobs <= 0 or item.max_runs_per_job <= 0:
+        return 0
+    try:
+        saturating = _saturating_reaction(ref, item)
+    except KeyError:
+        saturating = False
+    if saturating:
+        return jobs * item.max_runs_per_job
+    runs = min(item.total_runs_needed, jobs * item.max_runs_per_job)
+    if runs > 0 and not _exact_total(ref, finals, item):
+        runs = -(-runs // jobs) * jobs
+    return runs
+
+
+def _fallback_buy_of(ref, finals: set, row: PlanItem, extra_jobs: int = 0) -> int:
+    """The units Phase 7 will buy for a priced, non-final buildable's
+    uncovered need (its allocated jobs — plus `extra_jobs` more — sized
+    as Phase 7 sizes them, and its alchemy output, cover the rest),
+    capped at the rungs the market holds."""
+    covered = min(
+        row.total_runs_needed,
+        _sized_runs(ref, finals, row, row.jobs_allocated + extra_jobs),
+    ) * row.portion_size
+    uncovered = (
+        row.total_runs_needed * row.portion_size - covered - row.alchemy_output_qty
+    )
+    if uncovered <= 0:
+        return 0
+    if row.market_fallback_qty is None:
+        return uncovered
+    return min(uncovered, row.market_fallback_qty)
+
+
+def _final_availability(merged: dict[int, PlanItem], snapshot: Snapshot):
+    """available_of(type_id) once every buy is sized (Phase 7.6): on hand
+    + in-flight output + this cycle's purchases (compressed-covered share
+    included) less the units no stored sell order held."""
+
+    def available_of(m: int) -> int:
+        row = merged.get(m)
+        if row is None:
+            return snapshot.on_hand.get(m, 0) + snapshot.in_progress.get(m, 0)
+        return (
+            row.on_hand_qty
+            + row.in_progress_qty
+            + row.recommended_buy_qty
+            - row.unfilled_qty
+            + row.compressed_covered_qty
+        )
+
+    return available_of
+
+
+def _ration(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot, available_of) -> _Rationing:
+    """The install check's core (Phase 7.6, v1.27.1), also run at
+    allocation time: which of the plan's jobs can be installed from what
+    is there, and how.
+
+    Every row holding runs — or, before Phase 7 has sized runs, jobs —
+    is a CONSUMER; each of its materials is available at
+    ``available_of(m)``. A material whose planned draw exceeds that is
+    SHORT and the consumers are rationed:
+
+    * Pipeline FINALS first, in order of return on cost (unpriced last,
+      finals whose chain cost is understated by unpriced inputs after
+      every fully priced one): each in turn takes the most runs its
+      remaining inputs can feed (binary search — a job's draw is
+      monotonic in its runs), leaving the rest to the next.
+    * INTERMEDIATES (alchemy installs included) then share what remains
+      in PROPORTION: progressive filling raises one fraction of planned
+      runs for every consumer together until a material runs out, freezes
+      that material's consumers at that fraction and carries on with the
+      others — so the consumers of a scarce material all install the same
+      share of their plan, a consumer bound tighter by another material
+      leaves its unused share to its siblings, and nothing is cut for a
+      material it never uses. The fractions become whole runs (floored),
+      the exact per-job rounding is re-checked and a run trimmed from the
+      largest drawer wherever it still overshoots, then runs are handed
+      back while they fit.
+
+    Packing (user rulings 2026-09-09): an INTERMEDIATE installs uniform
+    jobs with the per-job count rounded up when the inputs allow, else
+    the largest uniform count that fits (_uniform_jobs); an
+    exact-quantity ship or a saturating reaction installs full jobs at
+    the plan's runs per job plus ONE last job with the remainder
+    (_packed_draw); every feasibility test judges the draw at that
+    packing, and the full plan draws as Phase 7 split it."""
+    settings = store.get_settings(conn)
+    draw_of = _draw_calculator(conn, ref)
+    finals = {
+        p["final_product_type_id"] for p in store.active_pipelines(conn)
+    }
+    out = _Rationing(available_of=available_of)
+
+    def saturating(item: PlanItem) -> bool:
+        return (
+            item.activity_id == config.ACTIVITY_REACTION
+            and ref.type_info(item.type_id).group_id
+            not in config.NON_SATURATING_REACTION_GROUPS
+        )
+
+    # Planned runs / jobs per consumer: Phase 7's figures once it has
+    # run; before it (allocation time) the runs its jobs will carry.
+    R: dict[int, int] = {}
+    J: dict[int, int] = {}
+    for item in merged.values():
+        if not item.buildable or not _type_known(ref, item.type_id):
+            continue
+        if item.runs_allocated > 0:
+            runs, jobs = item.runs_allocated, item.jobs_allocated
+        elif item.jobs_allocated > 0 and item.max_runs_per_job > 0:
+            jobs = item.jobs_allocated
+            runs = (
+                jobs * item.max_runs_per_job
+                if saturating(item)
+                else min(item.total_runs_needed, jobs * item.max_runs_per_job)
             )
-    return consumption
+        else:
+            continue
+        if runs > 0:
+            R[item.type_id], J[item.type_id] = runs, max(1, jobs)
+    consumers = [merged[t] for t in R]
+    if not consumers:
+        return out
+
+    def per_job(item: PlanItem) -> int:
+        # The plan's own runs per job (Phase 7: intermediates uniform,
+        # finals' last job short) — the job count a short item's runs
+        # need, and the length of a ship's / reaction's full jobs.
+        return -(-R[item.type_id] // J[item.type_id])
+
+    def jobs_for(item: PlanItem, runs: int) -> int:
+        if runs <= 0:
+            return 0
+        if runs >= R[item.type_id]:
+            return J[item.type_id]
+        return -(-runs // per_job(item))
+
+    def uniform(item: PlanItem) -> bool:
+        # Phase 7's own sizing rule: intermediates run uniform jobs with
+        # the per-job count rounded up; exact-quantity ships (finals,
+        # capitals, freighters, jump freighters) and saturating reactions
+        # do not — their last job runs short.
+        info = ref.type_info(item.type_id)
+        exact_total = item.type_id in finals or (
+            info.category_id == config.CATEGORY_SHIP
+            and info.group_id in config.EXACT_QTY_SHIP_GROUPS
+        )
+        return not saturating(item) and not exact_total
+
+    def draw(item: PlanItem, runs: int) -> dict[int, int]:
+        # The full plan draws as Phase 7 split it (_planned_consumption's
+        # figure). Anything less installs the way Phase 7 sizes that
+        # item: an intermediate as uniform jobs with the per-job count
+        # rounded up — so `runs` may install as a few more, the
+        # feasibility tests judge THAT draw, and where the round-up does
+        # not fit they settle on the largest uniform count that does; an
+        # exact-quantity ship or a saturating reaction as full jobs plus
+        # a short last job.
+        full = R[item.type_id]
+        if runs >= full:
+            return draw_of(item, full, J[item.type_id])
+        if uniform(item):
+            jobs, each = _uniform_jobs(runs, per_job(item))
+            return draw_of(item, min(full, jobs * each), jobs)
+        return _packed_draw(draw_of, item, runs, per_job(item))
+
+    def stamp(item: PlanItem, runs: int) -> None:
+        # The install figures at the packing draw() judged.
+        full = R[item.type_id]
+        t = item.type_id
+        if runs >= full:
+            out.startable_runs[t] = full
+            out.startable_jobs[t] = J[t]
+            out.per_job[t] = per_job(item)
+        elif uniform(item):
+            jobs, each = _uniform_jobs(runs, per_job(item))
+            out.startable_runs[t] = min(full, jobs * each)
+            out.startable_jobs[t] = jobs
+            out.per_job[t] = each if jobs else per_job(item)
+        else:
+            out.startable_runs[t] = runs
+            out.startable_jobs[t] = jobs_for(item, runs)
+            out.per_job[t] = per_job(item)
+
+    planned = {c.type_id: draw(c, R[c.type_id]) for c in consumers}
+    materials = set()
+    for d in planned.values():
+        materials.update(d)
+    for m in materials:
+        out.available[m] = available_of(m)
+        out.draw[m] = sum(planned[c.type_id].get(m, 0) for c in consumers)
+    remaining = dict(out.available)
+
+    # --- finals: highest return first ---------------------------------
+    for c in consumers:
+        if c.type_id in finals:
+            out.returns[c.type_id] = _final_return(ref, settings, snapshot, c)
+    # Unpriced finals last; before them, finals whose chain cost is
+    # UNDERSTATED by unpriced inputs (raw leaves, datacores, relics or
+    # decryptors priced at 0 — the row's 'N unpriced' badge): their
+    # return reads too high, so they rank after every fully priced final
+    # rather than take scarce stock on a figure the badge disowns
+    # (review 2026-09-09).
+    ranked_finals = sorted(
+        (c for c in consumers if c.type_id in finals),
+        key=lambda c: (
+            out.returns[c.type_id] is None,
+            c.savings_unpriced_inputs > 0,
+            -(out.returns[c.type_id] or 0.0),
+            c.depth,
+            c.name,
+        ),
+    )
+    for rank, item in enumerate(ranked_finals, 1):
+        out.priority[item.type_id] = rank
+
+    def fits(item: PlanItem, runs: int) -> bool:
+        return all(
+            qty <= remaining.get(m, 0) for m, qty in draw(item, runs).items()
+        )
+
+    def binding(item: PlanItem, runs: int) -> int | None:
+        # The material that stops the next run — the one most over.
+        over = [
+            (qty - remaining.get(m, 0), m)
+            for m, qty in draw(item, runs + 1).items()
+            if qty > remaining.get(m, 0)
+        ]
+        return max(over)[1] if over else None
+
+    for item in ranked_finals:
+        full = R[item.type_id]
+        if fits(item, full):
+            runs = full
+        else:
+            lo, hi = 0, full - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if fits(item, mid):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            runs = lo
+        stamp(item, runs)
+        out.limited_by[item.type_id] = None if runs == full else binding(item, runs)
+        for m, qty in draw(item, runs).items():
+            remaining[m] -= qty
+
+    # --- intermediates: the same share of their plan, per material ----
+    inter = [c for c in consumers if c.type_id not in finals]
+    frac: dict[int, float] = {}
+    limited_by: dict[int, int | None] = {}
+    active = {c.type_id: c for c in inter}
+    while active:
+        # Per material: what the frozen consumers already took, and the
+        # planned draw of the still-active ones. The material with the
+        # least room per unit of active draw binds first.
+        best_f, best_m = 1.0, None
+        for m in materials:
+            weight = sum(planned[t].get(m, 0) for t in active)
+            if weight <= 0:
+                continue
+            taken = sum(
+                planned[t].get(m, 0) * f
+                for t, f in frac.items()
+            )
+            room = remaining.get(m, 0) - taken
+            f = max(0.0, room / weight)
+            if f < best_f:
+                best_f, best_m = f, m
+        if best_m is None:
+            for t in list(active):
+                frac[t], limited_by[t] = 1.0, None
+            break
+        for t in [t for t in active if planned[t].get(best_m, 0) > 0]:
+            frac[t], limited_by[t] = best_f, best_m
+            del active[t]
+    runs_of = {
+        c.type_id: min(R[c.type_id], _floor(frac[c.type_id] * R[c.type_id]))
+        for c in inter
+    }
+    # Whole runs and per-job rounding: trim until every material fits.
+    while True:
+        exact: dict[int, int] = {}
+        for c in inter:
+            for m, qty in draw(c, runs_of[c.type_id]).items():
+                exact[m] = exact.get(m, 0) + qty
+        over = [
+            (exact[m] - remaining.get(m, 0), m)
+            for m in exact
+            if exact[m] > remaining.get(m, 0)
+        ]
+        if not over:
+            break
+        _excess, m = max(over)
+        drawers = [
+            c for c in inter
+            if runs_of[c.type_id] > 0 and draw(c, runs_of[c.type_id]).get(m, 0) > 0
+        ]
+        if not drawers:
+            break  # cannot happen: a positive draw needs positive runs
+        victim = max(
+            drawers, key=lambda c: draw(c, runs_of[c.type_id]).get(m, 0)
+        )
+        runs_of[victim.type_id] -= 1
+        limited_by[victim.type_id] = m
+    # Flooring left slack: hand whole runs back, the most-cut consumer
+    # first, while they fit — so the figure is maximal, not just safe.
+    while True:
+        added = False
+        for c in sorted(
+            inter,
+            key=lambda c: (runs_of[c.type_id] / R[c.type_id], c.name),
+        ):
+            runs = runs_of[c.type_id]
+            if runs >= R[c.type_id]:
+                continue
+            before = draw(c, runs)
+            after = draw(c, runs + 1)
+            if all(
+                exact.get(m, 0) - before.get(m, 0) + qty <= remaining.get(m, 0)
+                for m, qty in after.items()
+            ):
+                for m, qty in after.items():
+                    exact[m] = exact.get(m, 0) - before.get(m, 0) + qty
+                runs_of[c.type_id] = runs + 1
+                added = True
+        if not added:
+            break
+    for c in inter:
+        runs = runs_of[c.type_id]
+        stamp(c, runs)
+        out.limited_by[c.type_id] = (
+            None if runs >= R[c.type_id] else limited_by.get(c.type_id)
+        )
+        for m, qty in draw(c, runs).items():
+            remaining[m] -= qty
+    out.remaining = remaining
+    return out
+
+
+def _install_check(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
+    """Phase 7.6 (v1.27.1): verify the plan's jobs against what is
+    actually there to feed them once every buy is sized, and stamp what
+    to install now — _ration over _final_availability: on hand +
+    in-flight output + this cycle's purchases (compressed-covered share
+    included) less the units no stored sell order held. This cycle's own
+    build output is never available (a stage's jobs feed NEXT cycle's
+    consumers — that one-cycle lag is the pipeline) nor is the alchemy
+    route's composite (it needs a reprocess after the job).
+
+    install_runs / install_jobs / install_per_job, install_limited_by
+    (the binding material; None when every planned run installs),
+    install_priority / install_return on finals, and install_draw_qty /
+    install_short_qty on consumed rows are the result. The run page's
+    job tables, section stats and slot stats show THESE as the jobs to
+    run; the plan's own sizing and buys stand underneath (tooltips and
+    the Chain tab). Since the stock-aware backfill (Phase 6), the plan's
+    job count may exceed a pool — the startable jobs never do."""
+    for item in merged.values():
+        item.install_runs = None
+        item.install_jobs = None
+        item.install_per_job = None
+        item.install_limited_by = None
+        item.install_priority = None
+        item.install_return = None
+        item.install_draw_qty = None
+        item.install_short_qty = None
+    r = _ration(conn, ref, merged, snapshot, _final_availability(merged, snapshot))
+    for t, runs in r.startable_runs.items():
+        item = merged[t]
+        item.install_runs = runs
+        item.install_jobs = r.startable_jobs[t]
+        item.install_per_job = r.per_job[t]
+        item.install_limited_by = r.limited_by.get(t)
+    # The pool is a hard limit on what can START, whatever the plan
+    # lists: the stock-aware backfill (Phase 6) hands slots of jobs
+    # that could not start at allocation time to others, and a job can
+    # become startable later (a loser's fallback buy sized in Phase 7
+    # differs a little from the allocation-time estimate). Where a
+    # pool's startable jobs exceed it, trim backfilled jobs first, then
+    # the lowest-savings intermediates, finals last — one job at a
+    # time, the last (shortest) job of the item first — and name the
+    # pool as what stopped them, unless an input already did.
+    for activity_id in (config.ACTIVITY_MANUFACTURING, config.ACTIVITY_REACTION):
+        pool = snapshot.slots_available.get(activity_id, 0)
+        rows = [
+            merged[t]
+            for t in r.startable_runs
+            if merged[t].activity_id == activity_id
+        ]
+        over = sum(i.install_jobs or 0 for i in rows) - pool
+        if over <= 0:
+            continue
+        finals = {
+            p["final_product_type_id"] for p in store.active_pipelines(conn)
+        }
+        order = sorted(
+            rows,
+            key=lambda i: (
+                2 if i.type_id in finals else 0 if i.backfilled_jobs else 1,
+                (i.build_savings_per_unit or 0.0) * i.portion_size * i.max_runs_per_job,
+                i.name,
+            ),
+        )
+        for item in order:
+            while over > 0 and (item.install_jobs or 0) > 0:
+                last = item.install_runs - (item.install_jobs - 1) * item.install_per_job
+                item.install_runs -= max(1, last)
+                item.install_jobs -= 1
+                # Only claim the pool where nothing else already bound the
+                # row: overwriting a short input's type id lost the one
+                # thing the user could act on (buy it), and blamed the
+                # pool for a row stock had already cut (review
+                # 2026-09-10). A row cut by both keeps the input.
+                if item.install_limited_by is None:
+                    item.install_limited_by = _LIMITED_BY_SLOTS
+                over -= 1
+            if over <= 0:
+                break
+    for t, rank in r.priority.items():
+        merged[t].install_priority = rank
+        merged[t].install_return = r.returns.get(t)
+    for m, total in r.draw.items():
+        row = merged.get(m)
+        if row is None:
+            continue
+        row.install_draw_qty = total
+        row.install_short_qty = max(0, total - r.available[m])
 
 
 def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
@@ -1606,8 +2690,14 @@ def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
                 if buyable > 0:
                     item.recommended_buy_qty = buyable
         if item.market_buy_qty > 0:
-            # v1.26: the units the market beat the build cost on.
-            item.recommended_buy_qty += item.market_buy_qty
+            # v1.26: the units the market beat the build cost on, less
+            # whatever the alchemy route now supplies for them (user
+            # ruling 2026-09-11). `alchemy_buy_qty` counts only the
+            # output aimed at bought units, so the build shortfall above
+            # never credits the same output twice.
+            item.recommended_buy_qty += max(
+                0, item.market_buy_qty - item.alchemy_buy_qty
+            )
         if item.recommended_buy_qty > 0:
             item.recommended_action = (
                 "both" if item.recommended_build_qty > 0 else "buy"
@@ -1670,7 +2760,7 @@ def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         # for this cycle (target 0) must not read as low stock; a partly
         # drawn stage is judged against its prorated target, never above
         # one cycle's need.
-        if projected < min(item.merged_min_qty, item.target_stock_qty):
+        if projected < min(item.cycle_need_qty, item.target_stock_qty):
             item.low_stock = True
 
     # v1.5: snapshot the per-unit install fee for every buildable, planned
@@ -2751,7 +3841,7 @@ def _multi_cycle_overhang(job_ends: list, horizon: datetime) -> int:
 def snapshot_from_state(
     conn, prices=None, adjusted=None, region_wide=None,
     buy_venue=None, structure_units_cheaper=None, sell_ladders=None,
-    hub_prices=None, structure_prices=None,
+    hub_prices=None, structure_prices=None, sell_quotes=None,
 ) -> Snapshot | None:
     """Build a Snapshot from the last persisted ESI pull plus the manual
     slot settings. Returns None if ESI has never been refreshed.
@@ -2802,6 +3892,10 @@ def snapshot_from_state(
         hub_prices=dict(hub_prices or {}),
         # v1.26: the structure market's quote per type at its basis.
         structure_prices=dict(structure_prices or {}),
+        # v1.27.1: {final type_id: sell price} for the install check's
+        # ranking (ledger.final_quote per active final — a capital hull
+        # is quoted at the structure market, which `prices` never holds).
+        sell_quotes=dict(sell_quotes or {}),
         character_isk=state["character_isk"],
         corporation_isk=state["corporation_isk"],
     )
@@ -2815,18 +3909,24 @@ def plan_index_run(
     output_qty=None,
     alchemy: bool = True,
     sourcing: bool = True,
+    backfill: bool = True,
 ) -> Plan:
     """Run planning phases 2-7 (with the consumption feedback loop) and
     (optionally) persist the index run. output_qty (built-scale expansion
     override, see _expand_and_merge), alchemy=False (skip the
-    substitution pass regardless of the setting) and sourcing=False
+    substitution pass regardless of the setting), sourcing=False
     (skip the v1.25 sourcing pass — fill pricing and compressed
-    substitution — likewise) are the steady-state path's seams; the real
-    /run path never passes any."""
+    substitution — likewise) and backfill=False (skip the v1.27.1
+    stock-aware slot backfill) are the steady-state path's seams; the
+    real /run path never passes any."""
     merged = _expand_and_merge(conn, ref, output_qty)
+    # Phase 3.5 (user ruling 2026-09-09): one cycle's consumption at the
+    # jobs' own rounding — the target and deficit basis — and the shares
+    # the feedback loop prorates by.
+    steady_shares = _cycle_need(conn, ref, merged)
     _apply_targets(conn, ref, merged, snapshot, alchemy)
     _size_jobs(conn, ref, merged)
-    _allocate_slots(conn, ref, merged, snapshot)
+    _allocate_slots(conn, ref, merged, snapshot, backfill=backfill)
     if alchemy:
         _alchemy_pass(conn, ref, merged, snapshot)
     _finalize(conn, ref, merged, snapshot)
@@ -2876,7 +3976,6 @@ def plan_index_run(
     settings_ = store.get_settings(conn)
     class_settings_ = store.get_class_settings(conn)
     buffer_mult = 1.0 + settings_.stockpile_buffer
-    steady_shares = _steady_shares(conn, ref, merged)
     max_passes = 1 + max(
         (i.depth for i in merged.values() if i.buildable), default=0
     )
@@ -2910,7 +4009,7 @@ def plan_index_run(
                 # Phase 4's own arithmetic at fraction 1, so a fully
                 # drawn stage keeps the exact target it was given.
                 item.target_stock_qty = _ceil(
-                    _ceil(item.merged_min_qty * buffer_mult) * fraction
+                    _ceil(item.cycle_need_qty * buffer_mult) * fraction
                 ) + composite_extra.get(item.type_id, 0)
                 corrected = max(
                     0,
@@ -2937,6 +4036,7 @@ def plan_index_run(
             del merged[type_id]  # the alchemy pass re-derives its rows
         for item in merged.values():
             item.jobs_allocated = 0
+            item.backfilled_jobs = 0
             item.runs_allocated = 0
             item.recommended_build_qty = 0
             item.recommended_buy_qty = 0
@@ -2946,6 +4046,7 @@ def plan_index_run(
             item.market_fallback_qty = None
             item.low_stock = False
             item.alchemy_output_qty = 0
+            item.alchemy_buy_qty = 0
             # The alchemy comparison is re-derived each pass too (a route
             # dropped later must not leave last pass's figures behind).
             item.direct_unit_cost = None
@@ -2962,7 +4063,7 @@ def plan_index_run(
             item.max_runs_per_job = 0
             item.time_per_run = None
         _size_jobs(conn, ref, merged)
-        _allocate_slots(conn, ref, merged, snapshot)
+        _allocate_slots(conn, ref, merged, snapshot, backfill=backfill)
         if alchemy:
             _alchemy_pass(conn, ref, merged, snapshot)
         _finalize(conn, ref, merged, snapshot)
@@ -2975,6 +4076,13 @@ def plan_index_run(
     compressed_saving = (
         _sourcing_pass(conn, ref, merged, snapshot) if sourcing else None
     )
+
+    # v1.27.1, Phase 7.6: with the jobs and every buy final, check what
+    # stock on hand, in-flight output and this cycle's buys can actually
+    # feed, and ration the installs (finals by return, intermediates in
+    # proportion). Reads the buys, so it follows the sourcing pass;
+    # changes nothing the earlier phases decided.
+    _install_check(conn, ref, merged, snapshot)
 
     # v1.22/v1.23: the invention VINTAGE is taken once the allocation has
     # converged (the pass adds nothing to the plan items).
@@ -2995,9 +4103,10 @@ def plan_index_run(
             "wallet_character_isk, wallet_corporation_isk, "
             "compressed_saving_isk, freight_in_isk_per_m3, "
             "structure_freight_in_isk_per_m3, hub_price_basis, "
-            "structure_price_basis) "
+            "structure_price_basis, manufacturing_slots_available, "
+            "reaction_slots_available) "
             "SELECT COALESCE(MAX(run_number), 0) + 1, datetime('now'), "
-            "'planned', ?, ?, ?, ?, ?, ?, ? FROM index_run",
+            "'planned', ?, ?, ?, ?, ?, ?, ?, ?, ? FROM index_run",
             (
                 snapshot.character_isk,
                 snapshot.corporation_isk,
@@ -3006,6 +4115,11 @@ def plan_index_run(
                 settings_.structure_freight_in_isk_per_m3,
                 settings_.hub_price_basis,
                 settings_.structure_price_basis,
+                # v1.27.1 (schema 11): the pools the plan was built and
+                # capped against — the settings' pools less multi-cycle
+                # overhang — so the run page measures it against them.
+                snapshot.slots_available.get(config.ACTIVITY_MANUFACTURING),
+                snapshot.slots_available.get(config.ACTIVITY_REACTION),
             ),
         )
         index_run_id = cur.lastrowid
@@ -3037,10 +4151,13 @@ def plan_index_run(
                     effective_unit_cost, hub_buy_qty, hub_fill_price,
                     hub_fill_orders, structure_buy_qty, structure_fill_price,
                     structure_fill_orders, unfilled_qty, unfilled_price,
-                    compressed_wanted_qty, market_buy_qty, market_fallback_qty
+                    compressed_wanted_qty, market_buy_qty, market_fallback_qty,
+                    install_runs, install_jobs, install_limited_by,
+                    install_priority, install_draw_qty, install_short_qty,
+                    install_return, install_per_job, cycle_need_qty
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                           ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?)
+                          ?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     index_run_id,
@@ -3099,6 +4216,15 @@ def plan_index_run(
                     item.compressed_wanted_qty,
                     item.market_buy_qty,
                     item.market_fallback_qty,
+                    item.install_runs,
+                    item.install_jobs,
+                    item.install_limited_by,
+                    item.install_priority,
+                    item.install_draw_qty,
+                    item.install_short_qty,
+                    item.install_return,
+                    item.install_per_job,
+                    item.cycle_need_qty,
                 ),
             )
             item_id = cur.lastrowid
@@ -3157,11 +4283,11 @@ def _steady_output_qty(conn, plan: Plan, current: dict | None) -> dict | None:
     what the line actually PRODUCES: BPC run caps (pasted or invented)
     round a final's build above its request, and every stage below must
     replace the built amount. Per final: next request = current request +
-    (built − merged_min); the merged_min excess over the request is other
-    pipelines' consumption of this final, which re-adds itself on
-    expansion. Rounding is idempotent, so the caller's replan loop reaches
-    a fixpoint (next == current) in one extra pass. A shared final's bump
-    lands on its first pipeline — attribution only; steady plans are never
+    (built − deficit) — the deficit is what job sizing rounded up, so the
+    difference is the batch / whole-copy excess alone. Rounding is
+    idempotent, so the caller's replan loop reaches a fixpoint
+    (next == current) in one extra pass. A shared final's bump lands on
+    its first pipeline — attribution only; steady plans are never
     persisted. None means the built scale IS the requested scale."""
     by_final: dict[int, list] = {}
     for pipeline in store.active_pipelines(conn):
@@ -3177,7 +4303,16 @@ def _steady_output_qty(conn, plan: Plan, current: dict | None) -> dict | None:
             )
         if item is None or not item.buildable:
             continue
-        bump = item.total_runs_needed * item.portion_size - item.merged_min_qty
+        # Against the DEFICIT — what the jobs were actually sized from —
+        # so the bump is the batch / whole-copy rounding and nothing else.
+        # Measured against the cycle need (or the merged BOM figure before
+        # it) the term also carried the consumers' one-time stockpile
+        # fill, which is not a scale change: it scales with the request,
+        # so each pass re-raised it and the loop never reached a fixpoint,
+        # exiting on its pass cap with an inflated cycle (review
+        # 2026-09-10 — a final consumed by another pipeline's intermediate
+        # climbed 1,000 -> 1,809 -> 2,609 -> ... every pass).
+        bump = item.total_runs_needed * item.portion_size - item.deficit_qty
         if bump > 0:
             override[pipelines[0]["pipeline_id"]] += bump
     unchanged = all(
@@ -3217,7 +4352,8 @@ def plan_steady_state(conn, ref, snapshot: Snapshot) -> Plan:
         corporation_isk=0.0,
     )
     first = plan_index_run(
-        conn, ref, base, persist=False, alchemy=False, sourcing=False
+        conn, ref, base, persist=False, alchemy=False, sourcing=False,
+        backfill=False,
     )
     output_qty = None
     for _ in range(4):
@@ -3229,6 +4365,7 @@ def plan_steady_state(conn, ref, snapshot: Snapshot) -> Plan:
             conn, ref, base, persist=False, output_qty=output_qty,
             alchemy=False,
             sourcing=False,
+            backfill=False,
         )
 
     # Finals are seeded at ZERO stock: from empty their dual-role netting
@@ -3252,6 +4389,7 @@ def plan_steady_state(conn, ref, snapshot: Snapshot) -> Plan:
         output_qty=output_qty,
         alchemy=False,
         sourcing=False,
+        backfill=False,
     )
 
     consumption = _planned_consumption(conn, ref, draft.items)
@@ -3274,6 +4412,7 @@ def plan_steady_state(conn, ref, snapshot: Snapshot) -> Plan:
         output_qty=output_qty,
         alchemy=False,
         sourcing=False,
+        backfill=False,
     )
 
 

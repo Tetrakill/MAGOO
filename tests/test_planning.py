@@ -136,6 +136,61 @@ def test_intermediates_replace_one_cycle(conn, ref, qty, runs_per_bpc):
     assert saw_intermediate and saw_raw
 
 
+def test_the_built_scale_loop_reaches_a_fixpoint_with_a_dual_role_final(conn, ref):
+    """Review 2026-09-10: the built-scale bump was measured against the
+    cycle need, but the build is sized from the DEFICIT, which from empty
+    stock also carries every consumer's one-time stockpile fill. Where a
+    pipeline final is consumed by another pipeline's INTERMEDIATE that
+    fill scales with the request, so each pass re-raised it and the loop
+    never converged — it exited on its four-pass cap with an inflated
+    cycle (1,000 -> 1,809 -> 2,609 -> 3,409 -> 4,209). Measured against
+    the deficit the bump is the batch rounding alone and settles."""
+    add_pipeline(conn, ref, "Fermionic Condensates", 1000)
+    add_pipeline(conn, ref, "Hulk", 8)
+    snap = base_snapshot(ref, mfg=5000, reaction=5000)
+    base = engine.replace(
+        snap, on_hand={}, in_progress={}, character_isk=0.0, corporation_isk=0.0
+    )
+    plan = engine.plan_index_run(
+        conn, ref, base, persist=False, alchemy=False, sourcing=False, backfill=False
+    )
+    seen, override = [], None
+    for _ in range(6):
+        revised = engine._steady_output_qty(conn, plan, override)
+        if revised == override:
+            break
+        seen.append(revised)
+        override = revised
+        plan = engine.plan_index_run(
+            conn, ref, base, persist=False, output_qty=override,
+            alchemy=False, sourcing=False, backfill=False,
+        )
+    else:
+        pytest.fail(f"no fixpoint in six passes: {seen}")
+    assert len(seen) <= 2, seen  # the docstring's "one extra pass"
+    # And the steady cycle the Slot Planner renders is the configured
+    # line's, not a compounded one: one reaction job for the final.
+    steady = engine.plan_steady_state(conn, ref, snap)
+    item = steady.items[ref.type_id("Fermionic Condensates")]
+    assert item.jobs_allocated == 1
+    assert item.recommended_build_qty == 2000
+    reaction_jobs = sum(
+        i.jobs_allocated for i in steady.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+    )
+    # The same figure the line gives with no built-scale override at all.
+    real = engine._steady_output_qty
+    engine._steady_output_qty = lambda *a, **k: None
+    try:
+        plain = engine.plan_steady_state(conn, ref, snap)
+    finally:
+        engine._steady_output_qty = real
+    assert reaction_jobs == sum(
+        i.jobs_allocated for i in plain.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+    )
+
+
 def test_input_margin_not_rebought_every_cycle(conn, ref):
     """Phase 7 targets raws at consumption × (1 + margin); a perpetual
     cycle buys the margin excess once and carries it, so the steady buy
@@ -580,8 +635,9 @@ def test_steady_state_dual_role_final_replaces_component_share(conn, ref):
     plan = engine.plan_steady_state(conn, ref, base_snapshot(ref))
     covetor = plan.items[ref.type_id("Covetor")]
     # From zero seeded stock the netting is a no-op: the steady cycle
-    # builds the requested share plus everything the Hulk jobs draw.
-    assert covetor.deficit_qty == covetor.merged_min_qty
+    # builds the requested share plus everything the Hulk jobs draw (the
+    # cycle need at the jobs' rounding, the deficit basis since 2026-09-09).
+    assert covetor.deficit_qty == covetor.cycle_need_qty >= covetor.merged_min_qty
     draw = engine._planned_consumption(conn, ref, plan.items)
     consumed = draw.get(ref.type_id("Covetor"), 0)
     sold = covetor.requested_qty

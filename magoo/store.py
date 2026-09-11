@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -758,6 +758,36 @@ _MIGRATIONS = (
     # simply stop counting while an owner is off.
     "ALTER TABLE pool_character ADD COLUMN count_sales INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE esi_corp ADD COLUMN count_sales INTEGER NOT NULL DEFAULT 1",
+    # Schema 10 (2026-09-09): the install check (engine Phase 7.6). On a
+    # row holding jobs: the runs / jobs stock on hand, in-flight output
+    # and this cycle's buys can feed, the material that bound them and
+    # (finals) the install priority; on a consumed row: the planned
+    # jobs' draw and the units it exceeds availability by. NULL on rows
+    # planned before the check existed.
+    "ALTER TABLE index_run_item ADD COLUMN install_runs INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN install_jobs INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN install_limited_by INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN install_priority INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN install_draw_qty INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN install_short_qty INTEGER",
+    # ... and the return on cost that ranked a final (NULL = unpriced).
+    "ALTER TABLE index_run_item ADD COLUMN install_return REAL",
+    # ... and the runs per installed job (uniform for an intermediate,
+    # the plan's count with a remainder last job for ships / reactions).
+    "ALTER TABLE index_run_item ADD COLUMN install_per_job INTEGER",
+    # One cycle's consumption at the jobs' own rounding (engine Phase
+    # 3.5, user ruling 2026-09-09) — the target and deficit basis; NULL
+    # on rows planned before it existed (the Chain tab then shows the
+    # merged BOM figure).
+    "ALTER TABLE index_run_item ADD COLUMN cycle_need_qty INTEGER",
+    # v1.27.1 (schema 11): the slot pools the run was planned against —
+    # the settings' pools less the multi-cycle jobs running past the
+    # next index run (engine.snapshot_from_state) — so the run page
+    # measures the plan against the pool it really had; NULL on older
+    # runs (the page falls back to the settings' pools). Review
+    # 2026-09-10.
+    "ALTER TABLE index_run ADD COLUMN manufacturing_slots_available INTEGER",
+    "ALTER TABLE index_run ADD COLUMN reaction_slots_available INTEGER",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.

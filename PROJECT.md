@@ -81,7 +81,9 @@ anywhere, iterates quickly, and owns its own data pipeline.
    determines the minimum required at each stage; the user supplies a single
    **global percentage buffer**:
 
-   `target = merged_min_required × (1 + buffer%)`
+   `target = cycle_need × (1 + buffer%)` — where `cycle_need` is one
+   cycle's consumption at the jobs' own rounding (§7 Phase 3.5, user
+   ruling 2026-09-09; the merged BOM figure until then).
 
    The buffer applies to intermediates (raw materials' buffered targets are
    superseded in Phase 7 by just-in-time purchase sizing) — **final
@@ -134,7 +136,9 @@ anywhere, iterates quickly, and owns its own data pipeline.
     reaction routes substitute for direct composite reactions: run the
     unrefined formula, manually reprocess its output into the composite plus
     recovered inputs. Route selection is by unit-cost comparison; a per-type
-    job cap throttles it; a contended reaction pool disables it (§7 Phase 6.5).
+    job cap throttles it; under a contended reaction pool it runs in the
+    slots of direct jobs stock cannot start this cycle, by the original
+    savings ranking (§7 Phase 6.5; v1.27.1, user ruling 2026-09-09).
 
 11. **Production blacklist (v1.3)** — Per-category checkboxes plus a per-item
     "buy, don't build" list; blacklisted sub-chains are pruned at expansion.
@@ -257,8 +261,9 @@ anywhere, iterates quickly, and owns its own data pipeline.
     sold for. Every "⟳ Update from ESI" runs a second, independently
     guarded step after the snapshot (and, since the same day's user
     request, the price refresh as a third — one button keeps the quotes,
-    undercut verdicts and contract splits current; ⟳ Refresh prices
-    stays for prices alone): for each character and corporation
+    undercut verdicts and contract splits current; the Planning tab's
+    profit view keeps a prices-only button, the dashboard does not —
+    user ruling 2026-09-11): for each character and corporation
     with **Count sales** on (ESI tab; default on), the owner's SELL
     market orders (open + 90-day history), wallet SALE transactions
     (corporations per wallet division) and ISSUED contracts with their
@@ -286,9 +291,18 @@ anywhere, iterates quickly, and owns its own data pipeline.
     station, the structure cache for the configured market, no verdict
     elsewhere); a contract without a location falls back to the
     Planning tab's class rule; contracts pay the same estimates as an
-    approximation. The **cost basis** is `costing.hull_cost`
-    on the latest executed run with attributable hulls (a zero-total basis
-    is no basis); estimated profit = net − units × cost, margin = profit ÷
+    approximation. The **cost basis** of a sale is `costing.hull_cost`
+    on the latest run executed on or before the sale (v1.27.1, user
+    ruling 2026-09-09 — `ledger.CostVintages`; every sale took the
+    latest executed run until then), so executing a new run never
+    re-costs an earlier sale. A run planned before any price pull totals
+    zero, sets no basis and is passed over for the priced one before it;
+    a sale made before ANY priced run had been executed takes the
+    earliest priced run (*pre-history* badge), and where the latest
+    executed run prices nothing the row badges *latest unpriced* while
+    its sales keep their own vintages (review 2026-09-09/10). The unsold
+    listings and the products table's cost-per-unit column read the
+    latest executed run; estimated profit = net − units × cost, margin = profit ÷
     cost. The page: the header strip (user ruling 2026-09-08) — **Revenue ·
     Cost of goods sold · Net income · Margin · Unrealized profit · Units
     sold · Contracts closed** plus the *N without cost basis* / *K
@@ -312,6 +326,57 @@ anywhere, iterates quickly, and owns its own data pipeline.
     have sales in the window, and the contracts ESI gave no items for. Count sales is honoured at read time too
     (rows keep accruing). Needs four new scopes on the app registration
     and a re-login per character (the ESI tab badges *re-login needed*).
+
+19. **Install check (v1.27.1, 2026-09-09)** — every planned run verifies
+    that this cycle's jobs can actually be INSTALLED from what is there:
+    each job's inputs are available at stock on hand + in-flight output +
+    this cycle's purchases (the Buy list is bought before the installs; a
+    compressed-covered raw counts its reprocessed share) — never this
+    cycle's own build output, which delivers next cycle (that one-cycle
+    lag IS the pipeline), nor the alchemy route's composite. Where an
+    input's planned draw exceeds that, the run is *short on stock* and the
+    installs are rationed: **pipeline finals first, highest return on
+    cost first** (net proceeds after sell fees − chain cost, over chain
+    cost, at plan-time prices — each final's Planning / Ledger sell
+    quote, so a capital hull is judged at the structure market; unpriced
+    last), each taking the most runs
+    its remaining inputs feed; then **intermediates in proportion** —
+    every consumer of a scarce input installs the same share of its
+    planned runs (max-min fair: a consumer bound tighter by another
+    input leaves its share to its siblings, and nothing is cut for an
+    input it never uses), floored to whole runs, re-checked at the
+    game's per-job rounding, then topped back up while runs still fit.
+    A short item installs the way Phase 7 sizes it (user ruling
+    2026-09-09): an **intermediate as uniform jobs with the per-job count
+    rounded up when the inputs allow**, else the largest uniform count
+    that fits; an **exact-quantity ship or a saturating reaction as full
+    jobs at the plan's runs per job plus one last job with the
+    remainder** (whole-copy rounding set aside) — and the draw is judged
+    at that packing. On the Plan tab the **job tables show the jobs to
+    run now** (Runs/job with "· last N" on the remainder job, Jobs, Build
+    qty; the plan's own figures in the tooltips; a `short` badge naming
+    the binding input — no separate column, user ruling), the section
+    stats and the Mfg / Reaction slots stats count those jobs ("· plan
+    N" beside them where stock feeds fewer), and a *short on stock*
+    panel lists the finals in install order with their return, and each
+    short input's planned draw, availability (on hand + in jobs + bought
+    + compressed-covered), shortfall and the cut jobs that eat it.
+    Advisory: the plan's sizing, slots and buys stand underneath — the
+    Buy list is unchanged and the Chain tab keeps the plan; the run does
+    not re-plan around the shortage (§7 Phase 7.6). One thing does feed
+    back (user ruling 2026-09-09): a slot held by a job stock cannot
+    start is a free slot, so Phase 6 hands such slots — in savings order
+    — to the contenders the pool starved whose inputs ARE there, and
+    Phase 6.5 lets alchemy run in them (ranked by savings as ever). The
+    starved jobs stay listed — they wait for stock — so a pool's planned
+    jobs may exceed it; its startable jobs never do (the slots stat shows
+    both). Once the run is
+    executed, its **Profit tab counts the hulls the cycle started** — the
+    install check's figure, this pipeline's share of it — as Units and in
+    the cycle totals (a `short` badge and the plan's count in the tooltip
+    where stock fed fewer), the per-hull cost unchanged — and that
+    per-hull cost stays the **Ledger's cost basis** whether or not the
+    cycle started a hull (user rulings 2026-09-09).
 
 ---
 
@@ -1085,6 +1150,7 @@ Structure bonuses are read from the structure type's own attributes via
 | `planned_start`, `actual_start`, `planned_end` | |
 | `compressed_saving_isk` | v1.25: landed ISK the compressed sourcing pass saved vs buying the covered raws direct at plan time (NULL when it changed nothing) |
 | `hub_price_basis` / `structure_price_basis` | v1.26: the pricing bases the run was planned under (NULL on older runs: ladder) |
+| `manufacturing_slots_available`, `reaction_slots_available` | v1.27.1 (schema 11): the slot pools the run was planned and capped against — the settings' pools less the multi-cycle jobs running past the next run (`engine.snapshot_from_state`); the run page's strip denominator. NULL on older runs (the page shows the settings' pools) |
 | `freight_in_isk_per_m3`, `structure_freight_in_isk_per_m3` | 2026-09-05 review: the plan-time freight-in rates (Jita leg, structure leg) the fill landed with — `costing.hull_cost` prices inbound freight at this vintage; NULL on pre-column runs falls back to live settings |
 | `status` | planned / active / complete |
 | `completed_at` | v1.5: stamped on "Mark executed" — lag costing walks completed runs only |
@@ -1100,8 +1166,8 @@ The core output table.
 | `type_id` | |
 | `on_hand_qty` | ESI assets in tracked systems |
 | `in_progress_qty` | Output of active jobs — counts as stock |
-| `target_stock_qty` | Merged minimum × (1 + buffer) |
-| `deficit_qty` | `max(0, target + merged_min − on_hand − in_progress)`; final products: Phase 4 seeds `= target`, and the feedback loop re-sizes a dual-role final to `requested + max(0, other pipelines' allocated draw − on_hand − in_progress)` (review 2026-09-05, A1) |
+| `target_stock_qty` | `cycle_need_qty × (1 + buffer)` since 2026-09-09 (the merged minimum × (1 + buffer) before), prorated by the feedback loop to the consumers holding jobs, plus the composite extra-runs adder |
+| `deficit_qty` | `max(0, target + cycle_need − on_hand − in_progress)` (`merged_min` in that term until 2026-09-09); final products: Phase 4 seeds `= target`, and the feedback loop re-sizes a dual-role final to `requested + max(0, other pipelines' allocated draw − on_hand − in_progress)` (review 2026-09-05, A1) |
 | `recommended_action` | buy / build / both — `both` when jobs build part and the rest is bought (a capacity loser, or since v1.26 an item the market beats on part of its quantity) |
 | `blueprint_id`, `activity_id` | Activity selects the slot pool |
 | `time_per_run` | ME/TE/facility adjusted |
@@ -1119,7 +1185,8 @@ The core output table.
 | `price_region_wide` | v1.9: price_snapshot was a region-wide fallback quote (hub-quote provenance only) |
 | `buy_venue` | v1.10: `hub` / `structure` / NULL (unpriced; NULL on pre-v1.10 rows = hub); v1.25: `split` when the fill spans both markets — plan-time venue of price_snapshot |
 | `structure_units_cheaper` | v1.10, structure buys: units of the structure's sell ladder landing at or below the hub landed price; on single-quote pages (pre-v1.25 runs, the Planning tab, the Invention tab) the venue cell reads "Jita Z · C-J6 X" and Multibuy splits the same way when `recommended_buy_qty` exceeds it (v1.26.1; a *shallow* badge before) — since v1.25 the engine NULLs it on every fill-priced row |
-| `depth`, `item_class`, `merged_min_qty` | Merged chain depth (display), class, one cycle's consumption |
+| `depth`, `item_class`, `merged_min_qty` | Merged chain depth (display), class, one cycle's consumption as the merged BOM rounds it (the pipeline-share attribution basis) |
+| `cycle_need_qty` | v1.27.1 (schema 10): one cycle's consumption at the jobs' own rounding (Phase 3.5) — the target and deficit basis; ≥ `merged_min_qty` within one pipeline, possibly below it where pipelines share a consumer (the pass merges before rounding); NULL on runs planned before it existed (the Chain tab then shows `merged_min_qty`) |
 | `unit_install_fee` | v1.5: hypothetical per-unit install fee snapshotted for every buildable |
 | `savings_unpriced_inputs` | Unpriced raw leaves in the savings chain (UI badge) |
 | `unit_chain_cost` | 2026-08-23: the vertically-integrated chain cost per unit behind `build_savings_per_unit` (savings = landed buy price − this); NULL on older rows, which the run page recovers as price − savings |
@@ -1137,6 +1204,8 @@ The core output table.
 | `hub_buy_qty`, `hub_fill_price`, `hub_fill_orders` | v1.25 fill pricing: units bought at Jita (the unfilled remainder included ONLY when Jita's stored book was truncated — ruling R5 2026-09-05), their average raw fill price and the orders walked; `hub_buy_qty` NULL = a row priced before fill pricing / with no ladder anywhere (its `buy_venue` says it all) |
 | `structure_buy_qty`, `structure_fill_price`, `structure_fill_orders` | v1.25: the structure market's share of the same buy |
 | `unfilled_qty`, `unfilled_price` | v1.25: units no stored ladder held and the last rung walked they are priced at — the *N unsourced* badge (v1.26.1 wording; *shallow* before). Since 2026-09-05 (R5) these units are UNSOURCED unless folded into `hub_buy_qty` (truncated Jita book): `hub_buy_qty + structure_buy_qty + unfilled_qty == recommended_buy_qty`, and Multibuy lists the two venue quantities only |
+| `install_runs`, `install_jobs`, `install_per_job`, `install_limited_by`, `install_priority`, `install_return` | v1.27.1 (schema 10), rows holding jobs: the runs and jobs to install now from stock on hand + in-flight output + this cycle's buys (Phase 7.6) and the runs per installed job — uniform for an intermediate (`install_per_job × install_jobs == install_runs`, the per-job count rounded up the way Phase 7 sizes it), the plan's own count for an exact-quantity ship or a saturating reaction, whose last job takes the remainder; the input that bound the figure (NULL when every planned run installs; −1 = the slot pool, `engine._LIMITED_BY_SLOTS`: the job could start but the pool has no slot for it after the Phase 6 backfill); on a pipeline final, its rank in the install order (1 = highest return on cost) and the return on cost that ranked it (`engine.final_return` on the snapshot's sell quote — `Snapshot.sell_quotes`, the run route's `ledger.final_quote` per final, so a capital hull is quoted at the structure market — against `unit_chain_cost`, which is stamped for every contender since v1.27.1 even when its own buy price is unknown; NULL = unpriced, ranked last). NULL on rows without jobs and on runs planned before the check |
+| `install_draw_qty`, `install_short_qty` | v1.27.1, consumed rows: what every planned job of the row's consumers draws this cycle (per-job rounding, `_draw_calculator` — the same walk `_planned_consumption` sums) and the units that exceeds `on_hand + in_progress + recommended_buy_qty − unfilled_qty + compressed_covered_qty` by (0 = not short; a buy's unsourced units are not there to install with). NULL when nothing planned consumes the row |
 
 **`index_run_item_pipeline`** — attributes shared demand back to pipelines.
 
@@ -1395,16 +1464,64 @@ final product. Tables: `blacklist_category`, `blacklist_item`.
 Sum each item's requirement across every pipeline that needs it. Populate
 `index_run_item_pipeline` with each pipeline's share.
 
+### Phase 3.5 — Cycle need at the jobs' own rounding (v1.27.1, user ruling 2026-09-09)
+
+`bom.expand`'s `merged_min` rounds each item's cycle as ONE merged job
+(ceil once per item). The jobs Phase 7 installs round PER JOB — six
+one-run Thanatos jobs each round their capital engines up separately, a
+saturating reaction runs a full window per job, an intermediate rounds
+its runs up to uniform jobs, a sub-capital final builds whole copies —
+so a stage stocked to the merged figure started every cycle a few
+percent short of what its consumers' jobs draw. The 11-run execution
+simulation of 2026-09-09 (a copy of the installed data, the install
+check's jobs executed each cycle) showed exactly that: nothing short
+from the fourth run, then a 1–3 % shortfall alternating every other
+cycle on the capital components, the fullerene reactions and the FTL
+interlink communicators, holding back up to 8 of 745 job rows, and a
+4 % buffer only shrank it. The user ruled to size the target at the
+jobs' rounding instead.
+
+`_cycle_need` walks the merged chain top-down in depth order (every
+consumer sits shallower than its material, so each item's cycle is
+complete before it is packed), starting from the finals' requested
+output, and propagates each item's cycle quantity through the packing
+Phases 5–7 will give it: whole runs by `_runs_for_units` (whole copies
+for a sub-capital final), jobs at its window (`_job_windower`, the
+helper `_size_jobs` now shares), then `_steady_packing` — an
+exact-quantity ship as Phase 7's divmod split, a saturating reaction as
+full windows per job, everything else as uniform jobs rounded up. The
+result is `cycle_need_qty` on every item (persisted; the Chain tab's
+*Cycle need* and the deficit dialog read it, falling back to
+`merged_min_qty` on older runs) and the per-consumer shares the feedback
+loop prorates by (`_steady_shares` is now this pass). Within one pipeline `cycle_need_qty ≥
+merged_min_qty` (a sum of per-job ceilings is never below the one
+ceiling); across pipelines that share a consumer it can be LOWER, since
+`merged_min` sums each pipeline's separately rounded runs while the
+pass merges the demand before rounding (review 2026-09-09).
+`merged_min_qty` stays the BOM figure and the pipeline-share
+attribution basis. A line stocked at these targets installs every
+planned job — what the install check verifies — given slots for every
+stage: a stage denied slots leaves its inputs' targets prorated down
+(ruling R7), so the re-plan that grants them slots finds those inputs
+short. The composite extra-runs adder still
+applies on top — with the saturation overshoot now inside the target,
+it is a pure additional buffer the user may lower.
+
 ### Phase 4 — Targets and deficits
 
 ```
-target_stock_qty = merged_min_required × (1 + stockpile_buffer)   [intermediates/raw]
+target_stock_qty = cycle_need × (1 + stockpile_buffer)             [intermediates/raw]
                  = requested output qty                            [final products]
 
 deficit_qty      = target_stock_qty                                [final products, Phase 4 seed]
                  = requested + max(0, consumers' draw − on_hand − in_progress)  [final products, feedback loop]
-                 = max(0, target + merged_min − on_hand − in_progress)  [others]
+                 = max(0, target + cycle_need − on_hand − in_progress)  [others]
 ```
+
+(`cycle_need` — Phase 3.5, one cycle's consumption at the jobs' own
+rounding — replaced `merged_min` in every target and deficit formula on
+2026-09-09; the text below predates that and reads `merged_min` for the
+one-cycle term.)
 
 > **Corrected 2026-08-16.** The original deficit (`target − stock`) drained
 > the pipeline: a fully-stocked stage planned zero jobs, this cycle's
@@ -1526,12 +1643,63 @@ Items with no snapshot price on record (no orders at the hub, or never
 fetched) are never flipped to buy — their shortfall remains an unmet deficit
 flagged `capacity_limited` rather than producing a fictional purchase order.
 
+**Stock-aware backfill (v1.27.1, user ruling 2026-09-09).** A job stock
+cannot feed this cycle holds no slot in practice. After the MILP, the
+install check's rationing core (`_ration`, §7 Phase 7.6) runs at
+ALLOCATION-time availability (`_allocation_availability`): raws and
+market-beaten intermediates unlimited (Phase 7 buys them just in time),
+every other buildable at stock on hand + in-flight output + the units
+the market already beat (`market_buy_qty`) + the fallback buy its
+uncovered need will get in Phase 7 (`_fallback_buy_of`: the need its
+allocated jobs — sized as Phase 7 will size them, `_sized_runs` — and
+its alchemy output leave, capped at the dearer rungs — a capacity
+loser's units are bought, so they ARE there for its consumers). Per pool, the slots of the allocated jobs
+that cannot start are `freed`, and go — finals first, then unpriced
+contenders, then priced ones by savings per job — to the contenders
+still short of their unconstrained need, each for as many extra jobs
+as the LEFTOVER stock feeds (`feedable`: a binary search on the extra
+jobs' draw against what the startable jobs left — the jobs sized as
+Phase 7 will size the row once it holds them, `_sized_runs`: a
+saturating reaction at full windows, a final or an exact-quantity ship
+at the runs it still needs, anything else re-split uniform and rounded
+UP across ALL its jobs, so the round-up of the existing jobs counts as
+extra draw over the allocation-time model the rationing charged —
+review 2026-09-10). One
+guard: a priced intermediate's extra jobs replace part of its own
+fallback buy with output that lands at the END of the cycle, and its
+consumers' startable jobs were counted on that buy — so the backfill
+may only convert the part of the buy no startable consumer draws (the
+exact Phase 7 sizing before and after the extra jobs, against what is
+left of the item itself); otherwise a lower-savings loser would
+un-start the higher-savings consumers that beat it. The starved jobs
+keep their allocation — they wait for stock and keep their suppliers
+sized — so a pool's PLANNED jobs may now exceed it (`backfilled_jobs`
+counts the extras per row; the slots stat shows "· plan N"); its
+STARTABLE jobs never do (Phase 7.6 caps them). The backfill runs
+inside the sizing loop, so the extra jobs' raw draw is bought like any
+other. The steady-state planner passes `backfill=False`: a what-if has
+no stock to backfill from and allocates within its pool (review
+2026-09-10).
+
 ### Phase 6.5 — Alchemy substitution (v1.4)
 
 Runs after slot allocation, only when `alchemy_enabled` and the reaction
-pool has spare slots — a contended pool disables alchemy entirely (direct
-reactions are ~10× more slot-efficient, so alchemy must never displace a
-needed direct job).
+pool has slots that no STARTABLE direct job holds (v1.27.1, user ruling
+2026-09-09: `spare = slots − startable direct jobs`, the same
+allocation-time rationing Phase 6's backfill uses). Direct reactions are
+~10× more slot-efficient, so alchemy never takes a slot a startable
+direct job holds: under a contended pool (every slot allocated on
+paper) the free slots are the unstartable direct jobs' — of any item —
+and each swap drops the composite's own unstartable direct job where it
+has one (it held no slot, so the alchemy jobs cost their full count) or
+else a startable one (its slot is reused, `jobs − 1` net, its inputs
+back in the pot); the alchemy jobs must themselves be startable — their
+fuel block is checked against the leftover stock; only inputs that are
+plan rows are tested, since goo no direct formula demands is not a plan
+row until the pass adds it and is bought just in time (review
+2026-09-10). With slots genuinely spare the v1.4 rule is
+unchanged (a swap nets `jobs − 1` slots, no startability test). Ranking
+is by savings as ever (user: alchemy "follows the original rules").
 
 Routes are derived from data, no hardcoded pairs: a reaction formula whose
 product's reprocess outputs contain another reaction formula's product is
@@ -1604,7 +1772,7 @@ lag costing), since every stage legitimately reads low while priming.
 
 ### Consumption feedback loop (2026-08-21; iterated to convergence 2026-08-28)
 
-Phase 4 estimates each stage's cycle draw as the steady-state `merged_min`,
+Phase 4 estimates each stage's cycle draw as the steady-state `cycle_need` (the merged `merged_min` until 2026-09-09),
 but the allocation's ACTUAL draw differs: catch-up consumers build more
 than one cycle's worth, saturating reactions overshoot, and the game rounds
 materials per job. After the draft Phase 7, supplier deficits are re-sized
@@ -1630,7 +1798,7 @@ target is PRORATED each pass by the share of its one-cycle steady draw
 stage whose consumers all flipped to buy (or are over-stocked with no
 jobs) has target 0 and is neither bought nor built, no floor kept (ruling
 R7); the composite extra-runs adder applies only to composites holding
-jobs, and `low_stock` judges a stage against `min(merged_min, target)` so
+jobs, and `low_stock` judges a stage against `min(cycle_need, target)` (`merged_min` until 2026-09-09) so
 an idle stage never reads as low. Note the consequence: an over-stocked
 consumer (deficit 0, no jobs) counts as inactive that cycle, so its
 suppliers are not stocked for it until it builds again.
@@ -1650,6 +1818,116 @@ type (`recommended_action = 'buy'`, the fill average as `price_snapshot`,
 its venue, the outputs tuple and ladder depth), and reports the landed
 saving on the run. The steady-state planner never runs it (like alchemy):
 the Slot Planner buys raws direct.
+
+### Phase 7.6 — Install check (v1.27.1, 2026-09-09)
+
+After the sourcing pass (every buy is final) and before the invention
+vintage, `_install_check` asks the question the earlier phases never did:
+can the jobs the plan just sized actually be installed from what is
+there? Every row holding runs is a consumer; each of its inputs is
+**available** at
+
+```
+available = on_hand + in_progress + recommended_buy_qty − unfilled_qty
+            + compressed_covered_qty
+```
+
+— the Buy list is bought before the installs, less the units no stored
+sell order held (`unfilled_qty`, the *N unsourced* badge: no market can
+supply them, so they are not there to install with — review 2026-09-09;
+a truncated Jita book folds them into the hub share and zeroes the
+figure); this cycle's own build
+output is NOT available (a stage's jobs feed NEXT cycle's consumers —
+the one-cycle lag is the pipeline) and neither is the alchemy route's
+composite (a reprocess stands between the job and the units). The
+planned draw of every consumer, at the game's per-job rounding, comes
+from `_draw_calculator` — the walk `_planned_consumption` now sums, so
+the two figures can never disagree — and an input whose total planned
+draw exceeds its availability is **short** (`install_draw_qty`,
+`install_short_qty` on its row). Then the installs are rationed:
+
+1. **Finals first, by return on cost.** `final_return` = (net proceeds
+   per unit after sell-side fees − the vertically-integrated chain cost)
+   ÷ chain cost — the Profit views' margin as a rate — from the final's
+   SELL reference (`Snapshot.sell_quotes`: the run route passes
+   `ledger.final_quote`'s price per active final — the hub quote for a
+   sub-capital, the capital structure's sell quote for a capital-class
+   hull, which Jita never quotes; a final absent there falls back to its
+   own `price_snapshot`) and `unit_chain_cost`, which
+   `_build_savings_per_unit` now stamps for every contender even when
+   the item's own buy price is unknown. Unpriced finals rank last;
+   before them, finals whose chain cost is understated by inputs priced
+   at 0 (`savings_unpriced_inputs` > 0, the row's *N unpriced* badge —
+   their return reads high; review 2026-09-09) rank after every fully
+   priced final, whatever their figure; ties
+   by depth then name. In that order each final takes the most runs its
+   REMAINING inputs feed (a binary search — a job's draw is monotonic in
+   its runs at a fixed per-job split) and subtracts its draw.
+   `install_priority` records the rank and `install_return` the figure,
+   so the page restates exactly what the order was built on.
+2. **Intermediates in proportion** (alchemy installs included).
+   Progressive filling: one fraction of planned runs rises for every
+   still-active consumer together until some input runs out
+   (`room / active draw` is smallest); that input's consumers freeze at
+   that fraction and the rest carry on — max-min fair, so the consumers
+   of a scarce input all install the same share of their plan, a
+   consumer bound tighter by another input leaves its unused share to
+   its siblings, and no consumer is cut for an input it never uses. The
+   fractions floor to whole runs, the exact per-job draw is re-summed
+   and one run trimmed from the largest drawer wherever an input still
+   overshoots, then runs are handed back (most-cut consumer first) while
+   they still fit, so the figure is maximal as well as safe.
+
+`install_runs` / `install_jobs` / `install_per_job` — packed the way
+Phase 7 sizes that item (user ruling 2026-09-09): an INTERMEDIATE
+(everything Phase 7 rounds uniform) as `_uniform_jobs` — the jobs its
+plan's runs per job (`ceil(runs_allocated / jobs_allocated)`) needs,
+every job the same length, the per-job count rounded UP, so the total
+may exceed the runs the fractions granted by up to jobs − 1; the
+feasibility tests judge THAT draw, so where the round-up does not fit
+the stock the loops settle on the largest uniform count that does
+("round up when stock allows"); an exact-quantity ship (final, capital,
+freighter, JF) or a SATURATING reaction as `_packed_draw` — full jobs
+at the plan's runs per job plus ONE last job with the remainder, the
+whole-copy rounding overruled; the full plan draws as Phase 7 split it.
+`install_draw_of` recomputes a row's draw from those three figures
+(uniform when `install_per_job × install_jobs == install_runs`) — and
+`install_limited_by` (the
+input that stops the next run — the one most over — or the one that
+froze the fraction / forced the trim; NULL when every planned run
+installs) land on each consumer. The run page's job tables, section
+stats and slot stats show THESE as the jobs to run (`web._jobs_to_run`);
+the plan's figures stay in the tooltips and on the Chain tab. The pool
+is a hard limit on what can START whatever the plan lists (v1.27.1):
+Phase 6's backfill hands the slots of unstartable jobs to others, and a
+job can become startable after the allocation (a loser's fallback buy
+sized in Phase 7 differs a little from the allocation-time estimate),
+so where a pool's startable jobs exceed it the check trims — backfilled
+jobs first, then the lowest savings per job, finals last, one job at a
+time, the item's last (shortest) job first — and stamps
+`install_limited_by = −1` (`_LIMITED_BY_SLOTS`, "the slot pool — no
+free slot this cycle"); such a row's badge reads `no slot`, its
+tooltips name the pool, and the short-on-stock panel does not list it
+as held back by an input. The pool the run was planned against — the
+settings' pools less multi-cycle overhang (`snapshot_from_state`) — is
+persisted on the run (`manufacturing_slots_available`,
+`reaction_slots_available`, schema 11) and is the strip's denominator;
+a run planned before it was recorded shows the settings' figure (review
+2026-09-10). Advisory:
+nothing decided in Phases 4–7.5 changes — the sizing, the slots and the
+buys stand, and the raw buys still cover the full planned jobs (the
+surplus nets off next cycle). Runs on the
+steady-state planner too, but the Slot Planner renders none of it — a
+what-if has no stock.
+
+Note what the check exposed on the neutral defaults BEFORE Phase 3.5:
+with intermediates stocked at the merged BOM figure while saturating
+reactions ran the full window, a reaction's inputs were short every
+cycle because its draw exceeded that target. Phase 3.5 now packs the
+full-window draw into `cycle_need_qty`, so a line stocked at target
+installs every planned job and the composite extra-runs adder (544 runs
+on the author's profile) is a pure additional buffer the user may lower
+rather than the term that made the arithmetic work.
 
 ### Invention pass (v1.22; vintage-only since v1.23)
 
@@ -1772,7 +2050,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 629 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration) |
+| Test suite | 695 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration, the install check — rationing, packing, finals by return, per-job cycle need, the stock-aware slot backfill and the startable-jobs cap, alchemy under contention, per-sale-date cost vintages, schema 10 and 11 migrations) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -3364,6 +3642,7 @@ user's Windows machine against the live database.
 | Contract attribution (v1.27.0) | A finished, priced item exchange with an external acceptor whose items are only finals credits its whole price to them pro rata by cached quote × qty (equal per unit + *estimated split* without quotes); a *mixed* (other items included) or *swap* (items asked back) contract counts its hulls as units only, never revenue; auctions never count; item-less contracts are counted in the *partial data* note, never listed | A fitted-hull bundle credited wholesale posted a 780 % margin and a hull-for-hull trade a 200 M loss in the adversarial pass — units are certain, the price split is not |
 | Sell fees estimated, by venue (v1.27.0) | `costing.net_proceeds_at_venue` at the realized unit price: the sale's ESI location picks the fee pair and the movement term — NPC station → hub broker/tax + SCC + `freight_out_isk_per_m3` × m³; structure → the null-sec market pair + SCC + `structure_freight_in_isk_per_m3` × m³ (sub-caps); capital-class hulls take `capital_movement_cost_isk` at EITHER venue (a Thanatos at Jita 4-4 charged 1.3M m³ of freight-out was the review's finding — capitals fly themselves); freight-exempt XL hulls pay no per-m³ term; no location → the class rule (`net_proceeds_per_hull`, which Planning keeps); applied to contract sales too | The user asked for "estimated profit" and then that freight follow where the hull sold (2026-09-08) — the per-leg rates already existed in Settings; any structure other than the configured market is charged its rates (the only structure rates on record); journal-based actual fees are the documented follow-up |
 | Cost basis = latest executed run (v1.27.0) | `costing.hull_cost` on the newest `complete` run where the pipeline had `qty_attributable > 0` for its final (two pipelines sharing a final: the newest run, tie → lowest pipeline id); a basis totalling 0 (every line unpriced) is no basis; per-sale-date vintages are a follow-up | The user's words; the lag walk already prices that run's inputs at their vintages |
+| Cost basis per sale date (v1.27.1, user ruling 2026-09-09) | `ledger.CostVintages`: every executed run with attributable hulls of a final, by `completed_at`; a sale is costed at the latest run executed on or before it (`at`; among several the newest run number, tie → lowest pipeline id), a sale before the first executed run at that earliest run (`pre_history`, the *pre-history* badge); `latest` (= `cost_bases`) still prices the unsold listings and the products table's cost-per-unit column; per-(run, pipeline) hull costs computed once, on demand; `Product.cogs` / `cost_units` / `runs_used` carry the window's vintages and the products table says which runs | The user: \"the ledger always uses the cost basis marked on the executed run at the time of sale — executing a new run doesn't go back and change that price\"; it did, so now it does not |
 | Store every type, sell side only (v1.27.0) | The pull persists every sell-side row it sees; the Ledger filters to finals at read time; buys are read only to drive the transactions cursor | A pipeline added later sees its past sales; buys have no consumer (cost basis is the price snapshot, decision "Cost basis") |
 | Owner normalisation, corp beats character (v1.27.0) | Character-feed rows flagged corporate are stored under the character's current corporation; the corp feed re-owns any row it can see (owner columns included); contracts are exact via `issuer_corporation_id`; `feed_overlap_suspects` is the tripwire that one sale carries one id on both feeds | A corp-wallet sale seen through the selling character's feed must not double under two owners |
 | Sales pull placement (v1.27.0) | A second, independently guarded step of `POST /esi/refresh` after `save_esi_snapshot` has committed; `refresh_state` untouched; two-phase per owner × family × division (every ESI call, then one short write); `except Exception` around the step (the `_after_sde_import` precedent) | Neither step may lose the other's data; the write lock must never span a network call (a toggle click waited on `busy_timeout` otherwise) |
@@ -3378,6 +3657,36 @@ user's Windows machine against the live database.
 | Ledger nav position (v1.27.0) | Dashboard · Pipelines · Planning · Invention · Index Runs · **Ledger** · ESI · Settings | Define → plan → run → sell, then the configuration pair |
 | Provenance in `sales_pull`, not `esi_corp` (v1.27.0) | One row per owner × family × division with status, message, via, counts and the cursor; `upsert_esi_corps` unchanged | Three families need three role sets; the corp table's `*_via` columns are one per family and pruned with the corp |
 | No station / structure name cache (v1.27.0) | The Ledger names the solar system through `location_system`; a structure the puller cannot dock at reads "—" with the id in the tooltip | Measure the unresolved volume on real data before adding a name table |
+| Install check is advisory (v1.27.1, 2026-09-09) | Phase 7.6 annotates the converged plan (what to install now, what is short) and re-plans nothing: sizing, slots and buys stand, raw buys still cover the full planned jobs | User asked to VERIFY inventory against the plan and prioritise under shortage; feeding the rationing back into the MILP / raw sizing is a separate decision (freed slots, deferred buys) — the annotated plan stays the one source of truth |
+| Availability for installs (v1.27.1) | on hand + in-flight output + this cycle's buys less their unsourced units (compressed-covered share included); never this cycle's build output or alchemy output | User wording "on hand + in production" and the codebase's stock definition; the pipeline's one-cycle lag means a stage never feeds its own cycle's consumers; an unsourced unit has no market to be bought from (review 2026-09-09) |
+| Executed-run Profit tab counts the hulls started (user request 2026-09-09) | `costing.hull_cost`: `hulls_per_cycle` = the final's `install_runs × portion_size`, this pipeline's share pro rata to the cycle need where another pipeline consumes the final (`hulls_planned` keeps the plan's count; per-hull lines still divide by it); `ledger.cost_bases` is unchanged — the latest executed run is the basis even when it started no hull (user ruling the same day) | "Mark executed" means the buys and installs the page listed are done — those installs are the install check's jobs, so the Units and cycle figures follow them; the cost basis is a per-hull figure at the latest prices the line bought at, which needs no hull started |
+| Targets sized at the jobs' own rounding (user ruling 2026-09-09) | Phase 3.5 `_cycle_need`: the finals' requested output propagated top-down through the packing Phases 5–7 will install (per-job ceilings, uniform round-up, full reaction windows, whole copies) gives `cycle_need_qty`, the target / deficit / low-stock basis and the loop's proration shares; `merged_min_qty` stays the BOM figure for attribution; the composite extra-runs adder stays on top | The execution simulation showed a stage stocked to the merged BOM figure starts every cycle 1–3 % short of what its consumers' jobs draw (six one-run capital jobs each round up; reactions run full windows), so the install check could never reach zero; unlike the rejected "target = realized draw" (2026-09-05 review — a catch-up draw compounds down the chain), this is the STEADY draw, so nothing compounds |
+| Finals with unpriced inputs rank after fully priced ones (review 2026-09-09) | The sort key: unpriced last, then `savings_unpriced_inputs > 0`, then return descending; the figure itself is kept and marked ≈ in the panel | A chain cost with a 0-priced leaf understates, so its return is inflated — ranking scarce stock on a figure the row's own badge disowns would starve a fully priced final |
+| Finals ranked by return on cost (v1.27.1) | (net proceeds after sell fees − chain cost) ÷ chain cost at plan-time prices, unpriced last; each final in turn takes the most runs its remaining inputs feed. The sell reference is `Snapshot.sell_quotes` (the run route's `ledger.final_quote` per final — the capital structure's sell quote for capital-class hulls, which the plan's `prices` never hold), and the chain cost is stamped for every contender whether or not its own buy price is known; the figure is persisted (`install_return`) and never recomputed by the page | "Highest return" read as return on the ISK tied up, the Profit views' margin as a rate; greedy in rank order is what a person would do with a scarce component. The first real-data pass ranked every capital hull LAST as "unpriced" (Jita quotes none of them) — the user's biggest products — which is why the sell reference and the chain cost are sourced independently of the buy side |
+| Intermediates rationed max-min fair (v1.27.1) | Progressive filling: consumers of a scarce input install the same share of their planned runs; a consumer bound tighter elsewhere hands its share back; whole-run floor, per-job re-check, top-up | "Keep the proper proportions" = the same fraction of the plan per sibling; strict pro-rata that ignored a sibling's other binding input would leave installable stock and slots idle for no benefit |
+| Install packing mirrors Phase 7's sizing rule (v1.27.1, user rulings 2026-09-09) | An intermediate installs uniform jobs — `jobs = ceil(runs / plan per job)`, every job `ceil(runs / jobs)` long, rounded UP when the inputs allow, else the largest uniform count that fits; an exact-quantity ship or a saturating reaction installs full jobs at the plan's runs per job plus one remainder job, whole-copy rounding set aside; the draw is judged at that packing; `install_per_job` persists the count | The user: "last job remainders are only needed on ships; intermediates are all the job count with the remainder rounded up" — the same convention the plan itself sizes them with, and "round up when stock allows" chosen over a remainder job for the case where the round-up outruns the stock (at most jobs − 1 installable runs wait a cycle) |
+| Slots of unstartable jobs are backfilled (user ruling 2026-09-09) | Phase 6: the install rationing at allocation-time availability says which allocated jobs stock cannot start; their slots go, in savings order (finals, unpriced, then savings per job), to contenders the pool starved for as many extra jobs as the leftover stock feeds; the starved jobs stay in the plan, so planned jobs may exceed the pool while startable jobs never do | The user, shown 474 startable of 540 reaction slots on run 20: "then there are free slots that can be filled" — chose backfilling over re-solving the MILP without the unstartable jobs (which would drop them from the plan and unsize their suppliers) |
+| A loser's fallback buy is available at allocation time (v1.27.1) | `_allocation_availability` adds `_fallback_buy_of` (the Phase 7 sizing: uncovered need capped at the dearer rungs) to a priced non-final buildable's availability; the backfill may only convert the part of that buy no startable consumer draws | Without it composites over bought simple reactions read unstartable at allocation time, got backfilled around, and then started at the final check on top of the backfill — startable jobs over the pool; with it, and without the guard, a lower-savings loser's extra jobs ate the buy its higher-savings consumers were counted on |
+| Alchemy in the slots of unstartable direct jobs (user ruling 2026-09-09) | Phase 6.5's spare = slots − STARTABLE direct jobs; under a contended pool a swap drops the composite's own unstartable direct job where it has one (the alchemy jobs cost their full count) else a startable one (`jobs − 1` net, its inputs returned), and the alchemy jobs' fuel block must fit the leftover stock; the uncontended v1.4 rule and the savings ranking are unchanged. A first cut allowed only composites with unstartable jobs — on the user's data the free slots were other items' and every routed composite could start, so no alchemy ran | The user asked whether the freed slots would "allow alchemy to be reactivated", and that it "follows the original rules by ranking most savings and running those first" |
+| Startable jobs capped at the pool (v1.27.1) | Phase 7.6 trims a pool's startable jobs down to it — backfilled jobs first, lowest savings next, finals last — and stamps `install_limited_by = −1` | The plan may list more jobs than the pool after the backfill, and a job can become startable only after Phase 7 sizes a buy; the run page must never tell the user to start more jobs than the pool holds |
+| Cost vintages pass over unpriced runs; COGS is all-or-nothing (review 2026-09-09) | `CostVintages.at` skips a run whose hull cost totals 0 (planned before any price pull) for the priced run before it, pre-history for the earliest priced run; `Product.cost_of_units` is the vintage COGS only when EVERY priced unit sold got one, else None; the products row badges `latest unpriced` when the current basis prices nothing but the sales are costed; `_basis_for`'s plain-map branch dropped | Opus review: a zero-total vintage silently dropped units from COGS while their net stayed in — profit overstated, header and products disagreeing with the sales rows and charts; and `cost_of_units` gated on the CURRENT basis, throwing away vintage costs when the latest run was unpriced |
+| Sale vintages by execution time (review 2026-09-09) | `at()` ranks eligible runs by `completed_at`, then run number, tie → lowest pipeline id (pre-history the same order ascending); `latest()` keeps the run-number rule for the products table and the unsold listings | "The run executed at the time of sale" is a time-ordered question; the production database holds a legacy out-of-order execution (run 37 after 38) |
+| Pro-rata hull shares round up (review 2026-09-09) | `costing.hull_cost`: a pipeline's share of the hulls started is `ceil(started × planned / whole)`, capped at the plan | `round()` turned 1 of 2 into 0 — a started hull read as none and the Profit tab badged `short` |
+| Backfill sizes its extra jobs as Phase 7 will (review 2026-09-10) | `feedable` draws the extra jobs at `_sized_runs` — Phase 7's rule: saturating reactions at full windows, finals and exact-quantity ships at the runs still needed, everything else re-split uniform and rounded up across all the row's jobs — over the allocation-time model the rationing charged; `_fallback_buy_of` covers need at the same sizing | A Capital Drone Bay at 4 jobs of 9 runs with 37 needed was backfilled a fifth job as ONE run while Phase 7 re-split it to 5 × 8 = 40: the real extra draw was 4× what the fit test and the leftover bookkeeping assumed |
+| Steady-state planner never backfills (review 2026-09-10) | `plan_steady_state` passes `backfill=False` through `plan_index_run` to `_allocate_slots` | The Slot Planner's what-if had 11 manufacturing jobs against a 10-slot pool — a what-if has no stock to backfill from and must allocate within the pool it was given |
+| Route-only goo never gates contended alchemy (review 2026-09-10) | The startability test of the alchemy jobs covers only inputs that are plan rows (the fuel block, goo the chain already buys); goo no direct formula demands is added after the swaps and bought just in time | The gate read such goo through `_allocation_availability`, which returns on-hand for a type absent from the plan — 0 — so Solerium and every other route needing Scandium or Titanium was rejected however cheap, purely by an availability-lookup artifact |
+| Runs persist the pools they were planned against (schema 11, review 2026-09-10) | `index_run.manufacturing_slots_available` / `reaction_slots_available` = `snapshot.slots_available` at plan time (settings less multi-cycle overhang); the strip measures the plan against them, older runs against the settings' pools; a slot-trimmed row badges `no slot` and the strip's panel pointer appears only when an input is short | With 480 multi-cycle jobs running past the next run the engine planned 21 jobs against a 20-slot pool while the page measured them against "/ 500" and never said the plan exceeded the pool |
+| Profit-tab hull counts measured on the BUILD (review 2026-09-10) | `costing.hull_cost`: `hulls_planned` and `hulls_per_cycle` are both this pipeline's share of what the plan BUILDS (`runs_allocated × portion`, and `install_runs × portion` for the started figure), pro rata to the cycle demand and capped at `qty_attributable`, which stays the per-hull divisor alone; `install_runs` NULL falls back to the build, so a final holding no jobs reads 0 planned and 0 started | `qty_attributable` is the DEMAND attribution, so publishing it as the plan's count badged every slot-limited run `short on stock` although the check cut nothing, and — because NULL means both "planned before the check" and "no jobs on this row" — a final the allocator could not seat reported a whole cycle started, adding its cost and profit to the cycle totals |
+| Alchemy never overwrites a demanded row (review 2026-09-10) | `_alchemy_pass` skips a route whose unrefined product is already a plan row | The pass ends by assigning `merged[unrefined_id]`, and the feedback loop then deletes that row each pass as an alchemy row: a pipeline selling one of the 17 unrefined products lost its request, cycle need and attribution silently, with no unmet flag and no cost basis |
+| The steady built-scale bump is the rounding excess (review 2026-09-10) | `_steady_output_qty` measures `built − deficit_qty`, not `built − cycle_need_qty` | The deficit is what job sizing rounded up, so the difference is batch / whole-copy rounding alone. Measured against the cycle need it also carried the consumers' one-time stockpile fill, which scales with the request: where a pipeline final feeds another pipeline's intermediate the request climbed every pass (1,000 → 1,809 → 2,609 → 3,409 → 4,209) and the loop exited on its cap, overstating the Slot Planner's cycle. Pre-existing: the `merged_min` formula it replaced diverged identically |
+| The slot-pool clause blames overhang only downward (review 2026-09-10) | The run strip explains a pool below the configured setting as multi-cycle overhang; a pool ABOVE it reads "the pool this run was planned against; Settings now reads N" | Overhang can only reduce the pool, so comparing the run's persisted pool with today's setting rendered "500 of the 20 configured slots" after any settings change |
+| The cap never overwrites a row's binding input (review 2026-09-10) | Phase 7.6 stamps `_LIMITED_BY_SLOTS` only where `install_limited_by` is still NULL; a row cut by BOTH a short input and the pool keeps the input, and the page's `short` badge keeps naming what to buy | The sentinel destroyed the one actionable fact on the row and blamed the pool for a cut stock had already made |
+| The run page states what runs, not what caused it (review 2026-09-10) | The short-on-stock headline reads "N of the M planned jobs run this cycle"; the slot stats read "N run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow"; the row tooltips say "no more can run this cycle" beside the binding input | The install check rations in two steps and only the second survives on the row, so every figure the page reads is post-cap while the prose said "stock feeds N" — on a capped run that understated what stock fed (650 against 774) and pointed at a panel that could not explain the gap. Stating the outcome needs no second persisted figure |
+| Alchemy is trimmed before direct jobs when a pool overflows (user ruling 2026-09-10) | The cap's order is backfilled jobs, then unpriced (every alchemy install), then priced by savings, finals last | Confirmed by the user when the review questioned it: alchemy is the opportunistic route, so it yields its slot first |
+| One refresh control on the dashboard (user ruling 2026-09-11) | The dashboard's ⟳ Refresh prices button is removed; ⟳ Update from ESI is the only refresh there, and it already pulls prices as its third step. `POST /prices/refresh` and the Planning profit view's button stay | Two near-identical refresh controls side by side made the user choose between them for no gain. Prices-only belongs on the screen whose numbers move with quotes. Cost: the first-run flow needs a second (slower) ESI update after adding pipelines, since the first one ran before there was anything to price — README step 5 says so |
+| Alchemy competes with the BUY price (user ruling 2026-09-11) | A routed composite the plan means to BUY is now an alchemy candidate, judged against its LANDED market price instead of a direct build it already lost; savings feed the same ranking. It frees no slot of its own, so its jobs cost their full count; its residual is the whole purchase, so it may take a partial bite where the per-type cap or the spare slots bind (a direct swap stays all-or-nothing). `alchemy_buy_qty` keeps the purchase credit apart from the build-shortfall credit so the same output is never counted twice | The 2026-09-07 audit found buy verdicts ignoring the cheaper alchemy route and no fix was made. On the author's line Ferrofluid was bought at 29,950 landed while its route costs 17,353 |
+| Alchemy ranks on the units its jobs SUPPLY (2026-09-11) | The score is `savings_per_unit × min(residual, jobs × out_per_job) ÷ net slots` | A clamped buy replacement credited its whole residual while covering part of it, so it out-ranked honest candidates: Ferrofluid seized 20 slots for a claimed 2.67B and crowded out a better route; scored honestly it takes 4 for 0.55B and a second route wins slots |
+| Job tables show the jobs to run now (user ruling 2026-09-09) | Runs/job ("· last N"), Jobs and Build qty on the Plan tab's job tables are the install figures, the plan's own in the tooltips; section stats and the Mfg / Reaction slots stats count the same jobs with "· plan N" beside them where stock feeds fewer; no separate Install now column or stat; the `short` badge and the short-on-stock panel stay | The user reads the job tables as the worksheet of what to install; a second column made them compare two numbers per row |
 
 ---
 
@@ -3428,8 +3737,9 @@ user's Windows machine against the live database.
   profit and units over 7 / 30 / 90 days / all, charted and ranked.
 - **Ledger follow-ups** (v1.27.0) — journal-based ACTUAL fees
   (`transaction_tax` links to a transaction, `brokers_fee` to nothing;
-  the journal reaches 30 days); per-sale-date cost vintages instead of
-  the latest executed run; station / structure names for the Where
+  the journal reaches 30 days); ~~per-sale-date cost vintages instead of the latest executed run~~
+  (resolved 2026-09-09, v1.27.1: `ledger.CostVintages` costs each sale at
+  the latest run executed on or before it); station / structure names for the Where
   column; the ESI facts to verify on the first live pull: filled orders
   arriving as `expired` with nothing remaining, `from_id` inclusivity and
   page size, how far back the transactions endpoint reaches, whether a

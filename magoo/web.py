@@ -203,6 +203,132 @@ def _unmet_qty(i) -> int:
     return max(0, (i["deficit_qty"] or 0) - covered)
 
 
+def _run_pool(run, column: str, fallback: int) -> int:
+    """The slot pool a persisted run was planned against (v1.27.1,
+    schema 11), or the settings' pool for a run planned before it was
+    recorded."""
+    if column in run.keys() and run[column] is not None:
+        return run[column]
+    return fallback
+
+
+def _jobs_to_run(i) -> int:
+    """Jobs a row says to RUN NOW (v1.27.1, user ruling 2026-09-09): the
+    install check's figure where the row carries one, else the plan's —
+    the job tables, their section stats and the totals strip all read
+    this, so the page adds up to what the user will actually install."""
+    if "install_jobs" in i.keys() and i["install_jobs"] is not None:
+        return int(i["install_jobs"])
+    return int(i["jobs_allocated"] or 0)
+
+
+def _build_qty_to_run(i) -> int:
+    """Units the jobs to run now will build (_jobs_to_run's twin)."""
+    if "install_runs" in i.keys() and i["install_runs"] is not None:
+        return int(i["install_runs"]) * int(i["portion_size"] or 0)
+    return int(i["recommended_build_qty"] or 0)
+
+
+def _install_context(ref, settings_, items) -> dict:
+    """run_detail's install-check derivations (v1.27.1, engine Phase 7.6)
+    over the persisted rows: the materials whose planned draw exceeds
+    what stock on hand, in-flight jobs and this cycle's buys hold (each
+    with the cut consumers that eat it), the jobs installable now against
+    the jobs planned, the finals in install-priority order with the
+    persisted return on cost that ranked them, and a type-id → name
+    lookup for the binding-material tooltips. A run planned before the
+    check existed carries NULLs throughout and renders none of it."""
+
+    def col(i, key):
+        return i[key] if key in i.keys() else None
+
+    names = {i["type_id"]: i["name"] for i in items}
+
+    def name_of(type_id) -> str:
+        if type_id in names:
+            return names[type_id]
+        if type_id is not None and type_id < 0:
+            return "the slot pool — no free slot this cycle"
+        try:
+            return ref.type_info(type_id).name
+        except KeyError:
+            return f"type {type_id}"
+
+    consumers = [i for i in items if col(i, "install_runs") is not None]
+    # Every short input a cut consumer eats holds it back — not only the
+    # tightest one its own tooltip names — so a short input lists all
+    # the cut consumers that draw on it.
+    limits: dict[int, list[str]] = {}
+    for i in consumers:
+        if (i["install_runs"] or 0) >= (i["runs_allocated"] or 0):
+            continue
+        if (i["install_limited_by"] or 0) < 0:
+            continue  # stopped by the slot pool, not by an input
+        for m, _q in ref.materials(i["blueprint_id"], i["activity_id"]):
+            limits.setdefault(m, []).append(i["name"])
+    short = []
+    for i in items:
+        units = col(i, "install_short_qty")
+        if not units:
+            continue
+        # Units no stored sell order held are not bought (the unsourced
+        # badge) — the engine leaves them out of availability.
+        unsourced = col(i, "unfilled_qty") or 0
+        bought = (i["recommended_buy_qty"] or 0) - unsourced
+        covered = col(i, "compressed_covered_qty") or 0
+        short.append(
+            {
+                "row": i,
+                "name": i["name"],
+                "draw": i["install_draw_qty"] or 0,
+                "on_hand": i["on_hand_qty"] or 0,
+                "in_jobs": i["in_progress_qty"] or 0,
+                "bought": bought,
+                "unsourced": unsourced,
+                "covered": covered,
+                "available": (i["on_hand_qty"] or 0)
+                + (i["in_progress_qty"] or 0)
+                + bought
+                + covered,
+                "short": units,
+                "limits": limits.get(i["type_id"], []),
+            }
+        )
+    finals = [
+        {
+            "row": i,
+            "name": i["name"],
+            "priority": i["install_priority"],
+            # The figure the engine ranked on, persisted with the row —
+            # never recomputed here (a capital final's sell reference is
+            # the structure quote the run route handed the snapshot).
+            "return": col(i, "install_return"),
+            # Inputs the chain cost priced at 0 (the 'N unpriced' badge):
+            # the return reads high, and the engine ranks such a final
+            # after every fully priced one.
+            "unpriced": col(i, "savings_unpriced_inputs") or 0,
+            "bound": (
+                name_of(i["install_limited_by"])
+                if i["install_limited_by"] is not None
+                else None
+            ),
+        }
+        for i in sorted(
+            (i for i in consumers if col(i, "install_priority")),
+            key=lambda i: i["install_priority"],
+        )
+    ]
+    return dict(
+        install_checked=bool(consumers),
+        install_short=short,
+        install_jobs_now=sum(i["install_jobs"] or 0 for i in consumers),
+        install_jobs_planned=sum(i["jobs_allocated"] or 0 for i in consumers),
+        install_finals=finals,
+        type_names=names,
+        name_of=name_of,
+    )
+
+
 def _chain_short(x) -> bool:
     """Unmet demand on a row that still reads build/react: capacity-limited
     and the jobs plus whatever the market could supply fall short of
@@ -271,6 +397,7 @@ def _steady_rows(ref, plan) -> list[dict]:
                 "blueprint_id": item.blueprint_id,
                 "portion_size": item.portion_size,
                 "merged_min_qty": item.merged_min_qty,
+                "cycle_need_qty": item.cycle_need_qty,
                 "target_stock_qty": item.target_stock_qty,
                 "deficit_qty": item.deficit_qty,
                 "recommended_build_qty": item.recommended_build_qty,
@@ -308,6 +435,21 @@ def _steady_rows(ref, plan) -> list[dict]:
                 "structure_fill_orders": None,
                 "unfilled_qty": 0,
                 "unfilled_price": None,
+                # v1.27.1: the install check runs on the steady plan too
+                # (its stocked draft rations the saturating reactions,
+                # whose inputs sit at one cycle's target), but the Slot
+                # Planner is a what-if with no stock of its own and shows
+                # the PLAN — so the figures are dropped here, not carried:
+                # _jobs_to_run and the section stats then read the plan's
+                # jobs. The keys exist so the rows keep one shape.
+                "install_runs": None,
+                "install_jobs": None,
+                "install_per_job": None,
+                "install_limited_by": None,
+                "install_priority": None,
+                "install_return": None,
+                "install_draw_qty": None,
+                "install_short_qty": None,
             }
         )
     return rows
@@ -443,7 +585,7 @@ def _buy_context(rows, ref=None) -> dict:
         ),
         struct_builds=struct_builds,
         struct_buys=struct_buys,
-        struct_slots=sum(i["jobs_allocated"] or 0 for i in struct_builds),
+        struct_slots=sum(_jobs_to_run(i) for i in struct_builds),
         builds_mfg_all=builds_mfg_all,
     )
 
@@ -501,19 +643,28 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
             continue
         route = routes.get(composite_id)
         composite = by_type.get(composite_id)
-        qty = i["recommended_build_qty"]
+        # v1.27.1: the section describes the jobs to RUN NOW — a row the
+        # install check cut reprocesses only what those jobs deliver, so
+        # the checklist, the expected composite and the savings follow
+        # the install quantity, not the plan's.
+        qty = _build_qty_to_run(i)
+        cut = qty < (i["recommended_build_qty"] or 0)
         yield_ = settings_.alchemy_reprocess_yield
         alchemy.append(
             {
                 "item": i,
+                "build_qty": qty,
                 "composite_name": ref.type_info(composite_id).name,
                 # Prefer the engine's persisted per-job-floored figure
                 # (what the Chain tab shows); the one-shot recomputation
-                # here floors once over the total and can disagree.
+                # here floors once over the total and can disagree. A
+                # cut row has no persisted figure for its install
+                # quantity, so it takes the recomputation.
                 "expected_qty": (
                     composite["alchemy_output_qty"]
                     if composite is not None
                     and composite["alchemy_output_qty"]
+                    and not cut
                     else (
                         int(qty * route.composite_qty * yield_)
                         if route
@@ -583,7 +734,14 @@ def _chain_context(ref, items) -> dict:
             "group": i["category"],  # EVE group, e.g. "Jump Freighter"
             "group_id": i["group_id"],
             "depth": i["depth"],
-            "cycle_need": i["merged_min_qty"],
+            # One cycle's consumption at the jobs' own rounding (the
+            # target basis since v1.27.1); the merged BOM figure on runs
+            # planned before the column existed.
+            "cycle_need": (
+                i["cycle_need_qty"]
+                if "cycle_need_qty" in i.keys() and i["cycle_need_qty"] is not None
+                else i["merged_min_qty"]
+            ),
             "target": i["target_stock_qty"],
             "on_hand": i["on_hand_qty"],
             "in_jobs": i["in_progress_qty"],
@@ -1204,17 +1362,18 @@ def create_app() -> Flask:
     # _macros job_stats / buy_stats macros; these are their reducers.
     @app.template_filter("slots")
     def slots(rows):
-        """Job slots a section's rows occupy."""
-        return sum(r["jobs_allocated"] or 0 for r in rows)
+        """Job slots a section's rows occupy — the jobs to run now
+        (v1.27.1: the install check's figure where a row carries one)."""
+        return sum(_jobs_to_run(r) for r in rows)
 
     @app.template_filter("build_value")
     def build_value(rows):
         """Σ build qty × unit price over a job-table section — the same
         price snapshot the Buy list prices from, so the figures reconcile
-        across sections. Unpriced rows contribute 0 (the macro says so)."""
+        across sections; the build qty is what the jobs to run now build
+        (v1.27.1). Unpriced rows contribute 0 (the macro says so)."""
         return sum(
-            (r["recommended_build_qty"] or 0) * (r["price_snapshot"] or 0)
-            for r in rows
+            _build_qty_to_run(r) * (r["price_snapshot"] or 0) for r in rows
         )
 
     @app.template_filter("buy_value")
@@ -2929,6 +3088,19 @@ def create_app() -> Flask:
             sell_ladders=sell_ladders,
             hub_prices=hub_prices,
             structure_prices=structure_prices,
+            # v1.27.1: each active final's SELL reference for the install
+            # check's ranking — the Planning / Ledger quote (the hub for
+            # sub-capitals, the capital structure's sell quote for
+            # capital-class hulls, which `prices` never carries).
+            sell_quotes={
+                t: price
+                for t in {
+                    p["final_product_type_id"]
+                    for p in store.active_pipelines(c)
+                }
+                for price in (ledger.final_quote(c, ref(), settings_, t)[0],)
+                if price is not None
+            },
         )
         if snapshot is None:
             flash("no ESI data yet — run an ESI update first")
@@ -3165,6 +3337,7 @@ def create_app() -> Flask:
                 else None
             ),
             **_chain_context(ref(), items),
+            **_install_context(ref(), settings_, items),
             unmet=unmet,
             low_stock=[i for i in items if i["low_stock"]],
             buy_total=bc["buy_total"],
@@ -3176,13 +3349,22 @@ def create_app() -> Flask:
             venue_qty=bc["venue_qty"],
             unsourced=bc["unsourced"],
             settings=settings_,
-            mfg_slots_used=sum(
+            # v1.27.1: the strip counts the jobs to RUN NOW, the plan's
+            # allocation beside it where stock feeds fewer — against the
+            # pool the run was planned against (schema 11; the settings'
+            # figure on runs planned before it was persisted).
+            mfg_pool=_run_pool(run, "manufacturing_slots_available", settings_.manufacturing_slots),
+            reaction_pool=_run_pool(run, "reaction_slots_available", settings_.reaction_slots),
+            mfg_slots_used=sum(_jobs_to_run(i) for i in bc["builds_mfg_all"]),
+            mfg_slots_planned=sum(
                 i["jobs_allocated"] or 0 for i in bc["builds_mfg_all"]
             ),
-            reaction_slots_used=sum(
+            reaction_slots_used=sum(_jobs_to_run(i) for i in builds_reaction),
+            reaction_slots_planned=sum(
                 i["jobs_allocated"] or 0 for i in builds_reaction
             ),
-            alchemy_slots_used=sum(
+            alchemy_slots_used=sum(_jobs_to_run(a["item"]) for a in alchemy),
+            alchemy_slots_planned=sum(
                 a["item"]["jobs_allocated"] or 0 for a in alchemy
             ),
         )
@@ -3201,8 +3383,9 @@ def create_app() -> Flask:
     @app.route("/ledger", endpoint="ledger")
     def ledger_tab():
         """Sales of pipeline finals (v1.27.0): wallet transactions, orders
-        and contracts persisted by the ESI refresh, costed against the
-        latest executed run — recomputed on every load, nothing saved.
+        and contracts persisted by the ESI refresh, each costed against
+        the latest priced run executed on or before it (v1.27.1,
+        ledger.CostVintages) — recomputed on every load, nothing saved.
         Named ledger_tab: a nested `def ledger` would make `ledger` a local
         of create_app and shadow the module for every closure here."""
         c = conn()

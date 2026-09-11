@@ -60,7 +60,7 @@
         data-kind="{{ 'final' if i.type_id in final_ids
                       else ('build' if i.blueprint_id else 'raw') }}"
         data-target="{{ i.target_stock_qty }}"
-        data-need="{{ i.merged_min_qty }}"
+        data-need="{{ i.cycle_need_qty if (i.cycle_need_qty is defined and i.cycle_need_qty is not none) else i.merged_min_qty }}"
         data-onhand="{{ i.on_hand_qty }}"
         data-injobs="{{ i.in_progress_qty }}"
         data-deficit="{{ i.deficit_qty }}"
@@ -85,6 +85,44 @@
 {{ rows|length }} item{{ 's' if rows|length != 1 }}, <span title="{{ rows|buy_value|isk }} ISK — qty × unit price{{ ' at plan time' if plan_time else ' today' }}{% if rows|unpriced %}; {{ rows|unpriced }} unpriced item{{ 's' if rows|unpriced != 1 }} count as 0{% endif %}">{{ rows|buy_value|isk_short }}</span>{% if rows|unpriced %}, {{ rows|unpriced }} unpriced{% endif %}
 {%- endmacro %}
 
+{# Install check (v1.27.1, user rulings 2026-09-09): the job tables show
+   the jobs to RUN NOW. Where stock on hand, in-flight jobs and this
+   cycle's buys feed fewer runs than planned, the row reads the installable
+   figures — an intermediate as uniform jobs (install_per_job × jobs ==
+   runs, the per-job count rounded up to what the inputs feed), a ship or
+   a saturating reaction as full jobs at the plan's count plus one short
+   last job ("· last N") — with the plan's own figures in the tooltip and
+   a `short` badge. Plan tab only (execution=true): the Slot Planner is a
+   what-if with no stock, and a run planned before the check (NULLs) reads
+   the plan. #}
+{% macro job_cells(i, execution=true) -%}
+    {% set plan_per_job = ((i.runs_allocated + i.jobs_allocated - 1) // i.jobs_allocated) if i.jobs_allocated else 0 %}
+    {% set cut = execution and i.install_runs is defined and i.install_runs is not none and i.install_runs < i.runs_allocated %}
+    {% set jobs = i.install_jobs if cut else i.jobs_allocated %}
+    {% set runs = i.install_runs if cut else i.runs_allocated %}
+    {% set per_job = i.install_per_job if (cut and i.install_per_job is defined and i.install_per_job) else plan_per_job %}
+    {% set last = (runs - (jobs - 1) * per_job) if (cut and jobs) else per_job %}
+    {% set uniform = cut and jobs and last == per_job %}
+    {# The pool, not an input, stopped the job (install_limited_by = −1,
+       engine._LIMITED_BY_SLOTS): the plan lists more jobs than the pool
+       after the Phase 6 backfill. #}
+    {% set pool_cut = cut and i.install_limited_by is defined and i.install_limited_by is not none and i.install_limited_by < 0 %}
+    <td class="num" data-sort="{{ last if (cut and jobs == 1) else (per_job if jobs else 0) }}"
+        title="{% if cut %}run {{ runs|qty }} of the {{ i.runs_allocated|qty }} planned runs{% if jobs %}{% if uniform %} as {{ jobs }} job{{ 's' if jobs != 1 }} of {{ per_job|qty }}{% if per_job < plan_per_job %} — the plan's {{ plan_per_job|qty }} per job, rounded to what the inputs feed{% endif %}{% elif jobs == 1 %} as 1 job of {{ last|qty }}{% else %}: {{ jobs - 1 }} job{{ 's' if jobs - 1 != 1 }} of {{ per_job|qty }} and a last job of {{ last|qty }}{% endif %}{% endif %}{% if pool_cut %} — the pool has no free slot for the rest this cycle (the plan lists more jobs than the pool){% else %} — no more can run this cycle (short on {{ name_of(i.install_limited_by) if i.install_limited_by is not none else 'an input' }}){% endif %}; the plan wanted {{ i.jobs_allocated }} job(s) of {{ plan_per_job|qty }}{% else %}{{ i.runs_allocated|qty }} runs across {{ i.jobs_allocated }} job(s){% endif %}; max {{ i.max_runs_per_job|qty }}/job">
+      {% if not jobs %}—{% elif cut and jobs == 1 %}{{ last|qty }}{% else %}{{ per_job|qty }}{% if cut and last != per_job %} <span class="muted">· last {{ last|qty }}</span>{% endif %}{% endif %}</td>
+    <td class="num {% if cut %}{{ 'bad' if not jobs else 'warn' }}{% endif %}" data-sort="{{ jobs }}"{% if cut %} title="{% if pool_cut %}{{ jobs }} of the {{ i.jobs_allocated }} planned jobs have a slot this cycle — the pool has no free slot for the rest{% elif jobs == i.jobs_allocated %}{% if uniform %}every planned job runs, but at {{ per_job|qty }} runs each rather than the plan's {{ plan_per_job|qty }}{% else %}every planned job runs; the last is short at {{ last|qty }} run{{ 's' if last != 1 }} rather than {{ per_job|qty }}{% endif %} — no more can run this cycle{% else %}{{ jobs }} of the {{ i.jobs_allocated }} planned jobs run this cycle{% endif %}"{% endif %}>{{ jobs }}</td>
+    {% set build_qty = (runs * i.portion_size) if cut else i.recommended_build_qty %}
+    <td class="num" data-sort="{{ build_qty }}"{% if cut %} title="the plan builds {{ i.recommended_build_qty|qty }}; {{ build_qty|qty }} can be started now"{% endif %}>{{ build_qty|qty }}</td>
+    {% set job_runs = last if (cut and jobs == 1) else per_job %}
+    <td class="num"{% if cut and jobs > 1 and last != per_job %} title="the full jobs; the last job of {{ last|qty }} run{{ 's' if last != 1 }} takes {{ (i.time_per_run * last)|hours }}"{% endif %}>{% if cut and not jobs %}—{% else %}{{ (i.time_per_run * job_runs)|hours }}{% endif %}</td>
+{%- endmacro %}
+
+{% macro install_badge(i) -%}
+    {% if i.install_runs is defined and i.install_runs is not none and i.install_runs < i.runs_allocated %}{% if i.install_limited_by is defined and i.install_limited_by is not none and i.install_limited_by < 0 %}<span class="badge {{ 'bad' if not i.install_jobs else 'warn' }}"
+      title="the pool has no free slot this cycle for {{ i.jobs_allocated - i.install_jobs }} of the {{ i.jobs_allocated }} planned job{{ 's' if i.jobs_allocated != 1 }}: slots of jobs stock cannot feed went to others, so the plan lists more jobs than the pool — this row shows the {{ i.install_jobs }} job{{ 's' if i.install_jobs != 1 }} to run now; the rest waits for a slot">no slot</span>{% else %}<span class="badge {{ 'bad' if not i.install_jobs else 'warn' }}"
+      title="short on {{ name_of(i.install_limited_by) if i.install_limited_by is not none else 'an input' }}: {{ i.install_runs|qty }} of the {{ i.runs_allocated|qty }} planned runs can run this cycle — this row shows the {{ i.install_jobs }} job{{ 's' if i.install_jobs != 1 }} to run now{% if i.install_jobs != i.jobs_allocated %} (the plan wanted {{ i.jobs_allocated }}){% endif %}; the rest waits for stock (see Short on stock above)">short</span>{% endif %}{% endif %}
+{%- endmacro %}
+
 {% macro job_table(group, execution=true) %}
 <div class="tablewrap">
 <table class="sortable aligned">
@@ -95,16 +133,10 @@
   {% for i in group %}
   <tr>
 {% if execution %}{{ item_cell(i) }}{% else %}    <td>{{ i.name }}</td>{% endif %}
-    {% set per_job = ((i.runs_allocated + i.jobs_allocated - 1) // i.jobs_allocated)
-                     if i.jobs_allocated else 0 %}
-    <td class="num" data-sort="{{ per_job }}"
-        title="{{ i.runs_allocated|qty }} runs across {{ i.jobs_allocated }} job(s); max {{ i.max_runs_per_job|qty }}/job">
-      {{ per_job|qty if i.jobs_allocated else '—' }}</td>
-    <td class="num">{{ i.jobs_allocated }}</td>
-    <td class="num">{{ i.recommended_build_qty|qty }}</td>
-    <td class="num">{{ (i.time_per_run * per_job)|hours }}</td>
+{{ job_cells(i, execution) }}
     <td class="flags">{% if i.capacity_limited %}<span class="badge warn"
         title="the slot pool can't fit this item's full demand ({{ i.jobs_needed_unconstrained }} job(s) needed)">capacity</span>{% endif %}
+        {% if execution %}{{ install_badge(i) }}{% endif %}
         {% if i.market_buy_qty is defined and i.market_buy_qty %}<span class="badge accent"
           title="{{ i.market_buy_qty|qty }} units are cheaper on the market than building them (their sell orders land at or below the build cost{{ ' at plan time' if execution }}) and are on the Buy list; the jobs here build the rest">+buy {{ i.market_buy_qty|qty }}</span>{% endif %}
         {% if execution and i.low_stock %}<span class="badge warn"

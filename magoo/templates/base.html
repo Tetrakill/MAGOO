@@ -256,6 +256,9 @@ table.aligned.dense th.flags, table.aligned.dense td.flags { width: 5.5rem; }
          padding: .9rem 1.2rem; margin: .8rem 0;
          box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
 .panel > h2:first-child, .panel > h3:first-child { margin-top: 0; }
+/* A collapsible alert panel (v1.27.1, the install check's stock panel):
+   the summary's h2 is the panel's first heading. */
+.panel > summary > h2 { margin-top: 0; }
 .row { display: flex; gap: 1rem; flex-wrap: wrap; }
 .row > .panel { flex: 1 1 300px; }
 .flash { background: color-mix(in srgb, var(--accent) 12%, transparent);
@@ -766,7 +769,7 @@ document.addEventListener("DOMContentLoaded", function () {
        title="each index run is one planned cycle: a buy list and the jobs to install"
        {% if ep.startswith('run') %}aria-current="page" class="active"{% endif %}>Index Runs</a>
     <a href="{{ url_for('ledger') }}"
-       title="what your pipeline finals actually sold for — sales, orders and contracts read from ESI; cost basis from the latest executed run"
+       title="what your pipeline finals actually sold for — sales, orders and contracts read from ESI; each sale costed at the latest priced run executed before it"
        {% if ep == 'ledger' %}aria-current="page" class="active"{% endif %}>Ledger</a>
     <a href="{{ url_for('characters') }}" {% if ep.startswith('character') or ep.startswith('corp') or ep.startswith('sso') %}aria-current="page" class="active"{% endif %}>ESI</a>
     <a href="{{ url_for('settings') }}" {% if ep.startswith('setting') or ep.startswith('blueprint') %}aria-current="page" class="active"{% endif %}>Settings</a>

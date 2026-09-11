@@ -56,13 +56,22 @@
     <span class="label">Mfg slots</span>
     {# Structure comps ride under the Mfg slots count (user request
        2026-09-01) — their slots are already inside mfg_slots_used. #}
-    <span class="value {% if mfg_slots_used > settings.manufacturing_slots %}bad{% endif %}"
-          title="jobs allocated / manufacturing pool{% if struct_builds or struct_buys %} · structure components: {{ struct_builds|length }} built in {{ struct_slots }} slot{{ 's' if struct_slots != 1 }} · {{ struct_buys|length }} bought{% endif %}">{{ mfg_slots_used }}<span class="sub">/ {{ settings.manufacturing_slots }}{% if struct_builds %} · {{ struct_slots }} in structure comps{% endif %}</span></span>
+    {# v1.27.1: the value is the jobs to RUN NOW (the job tables' figure);
+       where stock feeds fewer than the plan allocated, the sub says so.
+       The *_planned figures default to the value (render tests hand the
+       template a bare context). #}
+    {% set mfg_planned = mfg_slots_planned if mfg_slots_planned is defined else mfg_slots_used %}
+    {% set mfg_pool = mfg_pool if mfg_pool is defined else settings.manufacturing_slots %}
+    <span class="value {% if mfg_slots_used > mfg_pool %}bad{% endif %}"
+          title="manufacturing jobs to run now / manufacturing pool{% if mfg_pool < settings.manufacturing_slots %} — {{ mfg_pool }} of the {{ settings.manufacturing_slots }} configured slots: the rest are held by multi-cycle jobs running past the next run{% elif mfg_pool != settings.manufacturing_slots %} — the pool this run was planned against; Settings now reads {{ settings.manufacturing_slots }}{% endif %}{% if mfg_planned != mfg_slots_used %} — the plan allocated {{ mfg_planned }}; {{ mfg_slots_used }} run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow{% if install_short %} (see Short on stock){% endif %}{% if mfg_planned > mfg_pool %}; {{ mfg_planned - mfg_pool }} more than the pool: jobs stock cannot feed this cycle gave their slots to others and wait for stock{% endif %}{% endif %}{% if struct_builds or struct_buys %} · structure components: {{ struct_builds|length }} built in {{ struct_slots }} slot{{ 's' if struct_slots != 1 }} · {{ struct_buys|length }} bought{% endif %}">{{ mfg_slots_used }}<span class="sub">/ {{ mfg_pool }}{% if mfg_planned != mfg_slots_used %} · plan {{ mfg_planned }}{% endif %}{% if struct_builds %} · {{ struct_slots }} in structure comps{% endif %}</span></span>
   </div>
   <div class="stat">
     <span class="label">Reaction slots</span>
-    <span class="value {% if reaction_slots_used + alchemy_slots_used > settings.reaction_slots %}bad{% endif %}"
-          title="reaction jobs{% if alchemy_slots_used %} + {{ alchemy_slots_used }} alchemy{% endif %} / reaction pool">{{ reaction_slots_used + alchemy_slots_used }}<span class="sub">/ {{ settings.reaction_slots }}{% if alchemy_slots_used %} · {{ alchemy_slots_used }} alchemy{% endif %}</span></span>
+    {% set reaction_planned = (reaction_slots_planned if reaction_slots_planned is defined else reaction_slots_used)
+                              + (alchemy_slots_planned if alchemy_slots_planned is defined else alchemy_slots_used) %}
+    {% set reaction_pool = reaction_pool if reaction_pool is defined else settings.reaction_slots %}
+    <span class="value {% if reaction_slots_used + alchemy_slots_used > reaction_pool %}bad{% endif %}"
+          title="reaction jobs to run now{% if alchemy_slots_used %} + {{ alchemy_slots_used }} alchemy{% endif %} / reaction pool{% if reaction_pool < settings.reaction_slots %} — {{ reaction_pool }} of the {{ settings.reaction_slots }} configured slots: the rest are held by multi-cycle jobs running past the next run{% elif reaction_pool != settings.reaction_slots %} — the pool this run was planned against; Settings now reads {{ settings.reaction_slots }}{% endif %}{% if reaction_planned != reaction_slots_used + alchemy_slots_used %} — the plan allocated {{ reaction_planned }}; {{ reaction_slots_used + alchemy_slots_used }} run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow{% if install_short %} (see Short on stock){% endif %}{% if reaction_planned > reaction_pool %}; {{ reaction_planned - reaction_pool }} more than the pool: jobs stock cannot feed this cycle gave their slots to others and wait for stock{% endif %}{% endif %}">{{ reaction_slots_used + alchemy_slots_used }}<span class="sub">/ {{ reaction_pool }}{% if reaction_planned != reaction_slots_used + alchemy_slots_used %} · plan {{ reaction_planned }}{% endif %}{% if alchemy_slots_used %} · {{ alchemy_slots_used }} alchemy{% endif %}</span></span>
   </div>
   <div class="stat">
     <span class="label">Unmet</span>
@@ -114,6 +123,59 @@
   <h2><span class="badge fill warn">low stock</span> won't sustain the next run</h2>
   <div class="tags">{% for i in low_stock %}<span class="badge warn">{{ i.name }}</span>{% endfor %}</div>
 </div>
+{% endif %}
+
+{# Install check (v1.27.1): the inputs this cycle's planned jobs would draw
+   more of than stock on hand, in-flight jobs and this cycle's buys hold,
+   and how the installs were rationed. #}
+{% if install_short %}
+<details class="section panel alert-warn" open data-key="short-on-stock">
+<summary><h2><span class="badge fill warn">short on stock</span>
+  {{ install_jobs_now }} of the {{ install_jobs_planned }} planned jobs run
+  this cycle —
+  {{ install_short|length }} input{{ 's' if install_short|length != 1 }} short</h2></summary>
+  <p class="muted" style="margin:.3rem 0 .6rem">Every input listed here is
+    drawn on by more jobs than stock on hand, in-flight jobs and this
+    cycle's buys can feed. Finals claim a scarce input first, highest
+    return on cost first; intermediates that share one each install the
+    same share of their plan. The job tables already show the reduced
+    jobs, with the plan's own figures in their tooltips — the Buy list
+    still covers the full plan.</p>
+  {% if install_finals %}
+  <details style="margin:0 0 .6rem">
+    <summary class="muted">Finals in install order — {{ install_finals|length }}</summary>
+    <div class="tablewrap">
+    <table class="sortable aligned dense">
+      <thead><tr><th class="num">#</th><th>Final</th><th class="num" title="jobs to run now / jobs planned">Jobs</th>
+        <th class="num">Return on cost</th><th>Short on</th></tr></thead>
+      {% for f in install_finals %}
+      {% set i = f.row %}
+      <tr><td class="num">{{ f.priority }}</td><td>{{ f.name }}</td>
+        <td class="num {% if i.install_runs < i.runs_allocated %}{{ 'bad' if not i.install_jobs else 'warn' }}{% endif %}" data-sort="{{ i.install_jobs }}"
+            title="{{ i.install_runs|qty }} of {{ i.runs_allocated|qty }} runs">{{ i.install_jobs }} / {{ i.jobs_allocated }}</td>
+        <td class="num" data-sort="{{ f.return if f.return is not none else -1e9 }}"
+            title="net proceeds after sell fees minus the integrated chain cost, over the chain cost, at plan-time prices{% if f.return is none %} — unpriced, so ranked last{% elif f.unpriced %} — {{ f.unpriced }} input{{ 's' if f.unpriced != 1 }} priced at 0, so the chain cost is understated and this final ranks after every fully priced one{% endif %}">{{ "%.1f"|format(f.return * 100) ~ '%' if f.return is not none else '—' }}{% if f.return is not none and f.unpriced %} <span class="muted">≈</span>{% endif %}</td>
+        <td class="muted">{{ f.bound if f.bound else '—' }}</td></tr>
+      {% endfor %}
+    </table>
+    </div>
+  </details>
+  {% endif %}
+  <div class="tablewrap">
+  <table class="sortable aligned dense">
+    <thead><tr><th>Input</th><th class="num">Planned draw</th>
+      <th class="num">Available</th><th class="num">Short</th>
+      <th title="planned jobs cut this cycle that eat this input — each job row's own tooltip names the tightest of its inputs">Held back</th></tr></thead>
+    {% for s in install_short %}
+    <tr><td>{{ s.name }}</td>
+      <td class="num" title="what every planned job of its consumers would consume this cycle, with the game's per-job rounding">{{ s.draw|qty }}</td>
+      <td class="num" title="on hand {{ s.on_hand|qty }} + in jobs {{ s.in_jobs|qty }} + bought this cycle {{ s.bought|qty }}{% if s.unsourced is defined and s.unsourced %} (the plan's {{ (s.bought + s.unsourced)|qty }} less {{ s.unsourced|qty }} unsourced — no stored sell order held them, so they cannot be bought){% endif %}{% if s.covered %} + {{ s.covered|qty }} from reprocessing compressed purchases{% endif %}">{{ s.available|qty }}</td>
+      <td class="num bad">{{ s.short|qty }}</td>
+      <td class="muted">{% if s.limits %}{{ s.limits[:4]|join(', ') }}{% if s.limits|length > 4 %} <span title="{{ s.limits|join(', ') }}">+{{ s.limits|length - 4 }} more</span>{% endif %}{% else %}—{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  </div>
+</details>
 {% endif %}
 
 <details class="section" open data-key="buy">
@@ -224,7 +286,7 @@
 {% if alchemy %}
 <details class="section" open data-key="alchemy">
 <summary><h2>Alchemy <span class="muted">— {{ alchemy|length }} items,
-  {{ alchemy|map(attribute='item')|sum(attribute='jobs_allocated') }} slots</span></h2></summary>
+  {{ alchemy|map(attribute='item')|list|slots }} slots</span></h2></summary>
 <p class="muted">Cheaper than the direct reaction at current landed prices
   (venue price + courier); runs in
   slots that would otherwise sit idle. Install the unrefined reaction jobs
@@ -242,21 +304,14 @@
   {% set i = a.item %}
   <tr>
     <td>{{ i.name }}</td>
-    {% set per_job = ((i.runs_allocated + i.jobs_allocated - 1) // i.jobs_allocated)
-                     if i.jobs_allocated else 0 %}
-    <td class="num" data-sort="{{ per_job }}"
-        title="{{ i.runs_allocated|qty }} runs across {{ i.jobs_allocated }} job(s); max {{ i.max_runs_per_job|qty }}/job">
-      {{ per_job|qty if i.jobs_allocated else '—' }}</td>
-    <td class="num">{{ i.jobs_allocated }}</td>
-    <td class="num">{{ i.recommended_build_qty|qty }}</td>
-    <td class="num">{{ (i.time_per_run * per_job)|hours }}</td>
+{{ m.job_cells(i) }}
     {% if a.direct_unit is not none and a.alchemy_unit is not none %}
     {% set savings = (a.direct_unit - a.alchemy_unit) * a.expected_qty %}
     <td class="num good" data-sort="{{ savings }}"
         title="{{ a.direct_unit|isk }} direct vs {{ a.alchemy_unit|isk }} alchemy ISK per {{ a.composite_name }}, × {{ a.expected_qty|qty }} units = {{ savings|isk }}">
       {{ savings|isk_short }}</td>
     {% else %}<td class="num">—</td>{% endif %}
-    <td class="flags"></td>
+    <td class="flags">{{ m.install_badge(i) }}</td>
   </tr>
   {% endfor %}
 </table>
@@ -265,7 +320,7 @@
   <h3 class="subhead" style="margin-top:0">After the jobs deliver — reprocess:</h3>
   <ul style="margin:.4rem 0 0 1.2rem">
     {% for a in alchemy %}
-    <li>Reprocess <b>{{ a.item.recommended_build_qty|qty }} {{ a.item.name }}</b>
+    <li>Reprocess <b>{{ (a.build_qty if a.build_qty is defined else a.item.recommended_build_qty)|qty }} {{ a.item.name }}</b>
         → ~{{ a.expected_qty|qty }} {{ a.composite_name }}{% for name, qty in a.recovered %}
         (+{{ qty|qty }} {{ name }} back){% endfor %}</li>
     {% endfor %}
@@ -336,8 +391,8 @@ function openDeficit(btn) {
       // re-sized to what the consumers' allocated jobs actually draw, so
       // from empty stock the build can exceed the cycle quantity.
       rows = [
-        ["cycle quantity — your request", qty(target)],
-        ["+ other pipelines' jobs draw beyond stock", qty(deficit - target)],
+        ["cycle quantity (incl. other pipelines' draw)", qty(target)],
+        ["+ their catch-up beyond stock", qty(deficit - target)],
         ["= to build", qty(deficit)],
       ];
     } else {

@@ -87,6 +87,38 @@ def template_app():
     return app
 
 
+_REAL_BACKUPS = config.PROJECT_ROOT / "data" / "backups"
+
+
+@pytest.fixture(autouse=True)
+def _no_writes_into_the_real_backups_dir():
+    """Tripwire (review 2026-09-09): a test that runs ensure_schema on a
+    down-versioned database without monkeypatching config.DATA_DIR sends
+    store._backup_before_migrating's pre-upgrade backup into the user's
+    REAL data/backups — a 221 KB junk file named for the current version,
+    which then pre-empts the genuine backup (never overwritten). Any test
+    that adds a file there fails by name."""
+    def listing():
+        try:
+            return set(p.name for p in _REAL_BACKUPS.iterdir())
+        except FileNotFoundError:
+            return set()
+    before = listing()
+    yield
+    added = listing() - before
+    for name in added:
+        # Remove the junk it wrote (it would otherwise pre-empt the
+        # genuine backup, and the next run would pass in silence).
+        try:
+            (_REAL_BACKUPS / name).unlink()
+        except OSError:
+            pass
+    assert not added, (
+        f"test wrote into the real data/backups: {sorted(added)} (removed) — "
+        "monkeypatch config.DATA_DIR / DB_PATH to the temp dir"
+    )
+
+
 @pytest.fixture(scope="session")
 def ref():
     conn = sqlite3.connect(

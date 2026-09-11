@@ -12,6 +12,11 @@ leave it; there is no Magoo server.
 - **Plans an index run** end to end: expands your pipelines' bills of material
   against on-hand stock and in-progress jobs, then allocates job slots with a
   MILP solver to maximise savings.
+- **Checks the installs against stock**: every run says which of its jobs
+  can be installed right now from what is on hand, in flight and on this
+  cycle's buy list, and what is short — finals first by return on cost,
+  intermediates sharing a scarce input in proportion; the slots of jobs
+  stock cannot start go to contenders whose inputs are there.
 - **Prices two venues** — Jita and a structure market — walking both sell
   ladders and filling each buy cheapest *landed* first, freight included,
   splitting across markets when one book runs out; each market can instead
@@ -28,7 +33,7 @@ leave it; there is no Magoo server.
   structure production.
 - **Keeps a sales ledger** of what your pipeline finals actually sold for —
   wallet transactions, sell orders and contracts from ESI, netted by where
-  each hull sold and costed from the latest executed run: revenue, cost of
+  each hull sold and costed at the run executed before each sale: revenue, cost of
   goods sold, net income, unrealized profit, Top 10s and charts.
 
 The plan is advisory; ESI is the ledger.
@@ -69,7 +74,8 @@ Magoo walks you through it with an on-screen checklist. In short:
    reads your sales for the Ledger, then refreshes prices (once you have
    pipelines).
 4. **Add your pipelines** — what you build, and how many per cycle.
-5. **Refresh prices**, then **Plan index run**.
+5. **Update from ESI** once more — now that pipelines exist it has something
+   to price — then **Plan index run**.
 
 Then visit Settings and check the seeded build settings — a fresh install
 starts from the maintainer's facilities (Sotiyo/Tatara with T2 rigs,

@@ -26,7 +26,8 @@
     <td>{{ card.name }}</td>
     <td class="num" title="{{ card.cost.total|isk }}">{{ card.cost.total|isk_short }}</td>
     <td class="num" title="{{ card.price|isk }}">{{ card.price|isk_short }}</td>
-    <td class="num">{{ card.cost.hulls_per_cycle|qty }}</td>
+    {% set cut = lagged and card.cost.hulls_planned is not none and card.cost.hulls_per_cycle < card.cost.hulls_planned %}
+    <td class="num {% if cut %}{{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}{% endif %}"{% if cut %} title="the plan wanted {{ card.cost.hulls_planned|qty }} this cycle; stock on hand, in-flight jobs and the buys fed the jobs for {{ card.cost.hulls_per_cycle|qty }} — this pipeline's share of the hulls the Plan tab told you to start (rounded up where another pipeline shares the final)"{% endif %}>{{ card.cost.hulls_per_cycle|qty }}</td>
     <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}"
         title="{{ card.margin|isk }}">{{ card.margin|isk_short }}</td>
     <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}">
@@ -59,6 +60,9 @@
         <span class="badge warn" title="no sell quote cached for this product">no quote</span>
       {% elif neg %}
         <span class="badge fill bad" title="net proceeds after sell fees fall below the {{ 'lagged' if lagged else 'current' }} chain cost — see margin / unit">negative margin</span>
+      {% endif %}
+      {% if cut %}
+        <span class="badge {{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}" title="short on stock when this run was planned: {{ card.cost.hulls_per_cycle|qty }} of the {{ card.cost.hulls_planned|qty }} planned hulls could start — Units and the cycle figures count those; cost per unit is unchanged">short</span>
       {% endif %}</span></td>
     <td><button type="button" class="mini"
         onclick="openBreakdown('{{ pid }}')">breakdown</button></td>

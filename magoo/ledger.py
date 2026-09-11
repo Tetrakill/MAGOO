@@ -19,8 +19,10 @@ price — the fee pair and movement term follow the sale's ESI location
 (NPC station: hub rates + freight-out per m³; structure: the structure-
 market rates + the structure leg per m³; capital-class hulls take the
 flat movement cost at either venue; a contract without a location keeps
-the class rule of net_proceeds_per_hull); the cost basis is
-costing.hull_cost on the latest executed run with attributable hulls.
+the class rule of net_proceeds_per_hull); each sale's cost basis is
+costing.hull_cost on the latest PRICED run executed on or before it
+(v1.27.1, ledger.CostVintages), while the unsold listings and the
+products table's cost-per-unit column read the latest executed run.
 PROJECT.md §2 feature 18 and §6 "Sales ledger" carry the rules.
 
 Direct SQL on the state tables (the engine.py precedent; the DDL lives in
@@ -1244,35 +1246,131 @@ class CostBasis:
         return self.cost.total
 
 
+_DAWN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+class CostVintages:
+    """Every executed run that can cost a final's sales, per final — the
+    runs with attributable hulls of the final, across the pipelines that
+    share it — and the two lookups the Ledger makes (v1.27.1, user ruling
+    2026-09-09: "the basis marked on the executed run at the time of
+    sale"):
+
+    * ``at(type_id, when)`` — the latest run executed on or before the
+      sale (ranked by ``completed_at``, then run number, tie → lowest
+      pipeline id) that PRICES: a run planned before any price pull
+      totals zero and sets no basis, so it is passed over for the one
+      before it (review 2026-09-09). Executing a new run therefore never
+      re-costs a sale made before it. Where NO priced run had been
+      executed by the sale — none at all, or only unpriced ones — it
+      takes the earliest priced run, flagged ``pre_history`` (review
+      2026-09-10: the page words it as that, not as "before your first
+      executed run").
+    * ``latest(type_id)`` — the newest executed run, whatever the date:
+      the basis of what is still unsold (open orders, outstanding
+      contracts) and the products table's cost-per-unit column.
+
+    The basis is a run's PER-HULL cost, so a run whose install check let
+    no hull start that cycle still counts (user ruling 2026-09-09). Per
+    (run, pipeline) costs are computed once, on demand — a window's
+    sales span a few runs, not the whole history. A run executed before
+    v1.5 stamped ``completed_at`` sorts as the dawn of time."""
+
+    def __init__(self, conn, ref, settings, finals_map):
+        self._conn, self._ref, self._settings = conn, ref, settings
+        self._runs: dict[int, list] = {}
+        self._memo: dict[tuple[int, int], CostBasis] = {}
+        for type_id, pipelines in finals_map.items():
+            entries = []
+            for p in pipelines:
+                for row in conn.execute(
+                    "SELECT r.index_run_id, r.run_number, r.completed_at FROM index_run r "
+                    "JOIN index_run_item i ON i.index_run_id = r.index_run_id AND i.type_id = ? "
+                    "JOIN index_run_item_pipeline a ON a.index_run_item_id = i.index_run_item_id "
+                    "  AND a.pipeline_id = ? AND a.qty_attributable > 0 "
+                    "WHERE r.status = 'complete'",
+                    (type_id, p["pipeline_id"]),
+                ):
+                    when = _parse_ts(row["completed_at"]) if row["completed_at"] else _DAWN
+                    entries.append((when, row["run_number"], -p["pipeline_id"], row, p))
+            self._runs[type_id] = entries
+
+    def _basis(self, row, p) -> CostBasis:
+        key = (row["index_run_id"], p["pipeline_id"])
+        basis = self._memo.get(key)
+        if basis is None:
+            cost = costing.hull_cost(
+                self._conn, self._ref, self._settings, row["index_run_id"], p["pipeline_id"]
+            )
+            basis = self._memo[key] = CostBasis(
+                p["pipeline_id"], p["name"], row["index_run_id"], row["run_number"],
+                row["completed_at"], cost,
+            )
+        return basis
+
+    @staticmethod
+    def _newest(entries):
+        return max(entries, key=lambda e: (e[1], e[2]))  # run number, then lowest pipeline id
+
+    def latest(self, type_id: int) -> CostBasis | None:
+        entries = self._runs.get(type_id) or []
+        if not entries:
+            return None
+        _when, _rn, _pid, row, p = self._newest(entries)
+        return self._basis(row, p)
+
+    def at(self, type_id: int, when: str | None) -> tuple[CostBasis | None, bool]:
+        """(basis, pre_history) for a sale at ISO ``when``: the run
+        executed latest on or before the sale (by execution time, then
+        run number, tie → lowest pipeline id) that PRICES — a run planned
+        before any price pull (every line unpriced, total 0) sets no
+        basis and is passed over for the one before it (review
+        2026-09-09). Where NO priced run had been executed by the sale
+        (none at all, or only unpriced ones): the earliest priced run by
+        execution time, flagged pre_history — the page words it as that,
+        not as "before your first executed run" (review 2026-09-10)."""
+        entries = self._runs.get(type_id) or []
+        if not entries:
+            return None, False
+        sold = _parse_ts(when) if when else None
+        if sold is not None:
+            eligible = sorted(
+                (e for e in entries if e[0] <= sold),
+                key=lambda e: (e[0], e[1], e[2]),
+                reverse=True,
+            )
+            for _when, _rn, _pid, row, p in eligible:
+                basis = self._basis(row, p)
+                if basis.unit_cost is not None:
+                    return basis, False
+        for _when, _rn, _pid, row, p in sorted(
+            entries, key=lambda e: (e[0], e[1], -e[2])
+        ):
+            basis = self._basis(row, p)
+            if basis.unit_cost is not None:
+                return basis, True
+        return None, False
+
+    def latest_map(self) -> dict[int, CostBasis]:
+        out = {}
+        for type_id in self._runs:
+            basis = self.latest(type_id)
+            if basis is not None:
+                out[type_id] = basis
+        return out
+
+
 def cost_bases(conn, ref, settings, finals_map) -> dict[int, CostBasis]:
     """Latest executed run with attributable hulls per final (two pipelines
-    sharing a final: the newest run, tie → lowest pipeline id)."""
-    out: dict[int, CostBasis] = {}
-    for type_id, pipelines in finals_map.items():
-        best = None
-        for p in pipelines:
-            row = conn.execute(
-                "SELECT r.index_run_id, r.run_number, r.completed_at FROM index_run r "
-                "JOIN index_run_item i ON i.index_run_id = r.index_run_id AND i.type_id = ? "
-                "JOIN index_run_item_pipeline a ON a.index_run_item_id = i.index_run_item_id "
-                "  AND a.pipeline_id = ? AND a.qty_attributable > 0 "
-                "WHERE r.status = 'complete' ORDER BY r.run_number DESC LIMIT 1",
-                (type_id, p["pipeline_id"]),
-            ).fetchone()
-            if row is None:
-                continue
-            key = (row["run_number"], -p["pipeline_id"])
-            if best is None or key > best[0]:
-                best = (key, row, p)
-        if best is None:
-            continue
-        _key, row, p = best
-        cost = costing.hull_cost(conn, ref, settings, row["index_run_id"], p["pipeline_id"])
-        out[type_id] = CostBasis(
-            p["pipeline_id"], p["name"], row["index_run_id"], row["run_number"],
-            row["completed_at"], cost,
-        )
-    return out
+    sharing a final: the newest run, tie → lowest pipeline id) — the
+    CURRENT basis, which the unsold listings and the products table's
+    cost-per-unit column read; sales are costed at their own date through
+    CostVintages.at. The basis is the run's PER-HULL cost, so a run whose
+    install check let no hull start that cycle (hulls_per_cycle 0 — the
+    plan wanted them, the stock did not feed them) still stands as the
+    basis (user ruling 2026-09-09): its prices are the latest the line
+    bought at."""
+    return CostVintages(conn, ref, settings, finals_map).latest_map()
 
 
 def final_quote(conn, ref, settings, type_id: int):
@@ -1348,12 +1446,19 @@ class Sale:
     detail: str = ""
     venue: str | None = None        # costing.SALE_VENUE_* or None (no location)
     venue_label: str = ""
+    # v1.27.1: the run this sale was costed at — the latest executed on
+    # or before the sale (pre_history: none was, so the earliest stands
+    # in) — and its per-hull cost; None = no executed run at all.
+    basis_run: int | None = None
+    unit_cost: float | None = None
+    pre_history: bool = False
 
 
 def sales_rows(conn, ref, settings, finals_map, window: Window, internal, quotes,
-               enabled, bases, names) -> list[Sale]:
+               enabled, vintages, names) -> list[Sale]:
     """Every sale event of a final in the window, newest first: wallet
-    transactions (the units truth) and finished item-exchange contracts."""
+    transactions (the units truth) and finished item-exchange contracts,
+    each costed at its own date through ``vintages`` (CostVintages)."""
     final_ids = set(finals_map)
     if not final_ids:
         return []
@@ -1364,7 +1469,13 @@ def sales_rows(conn, ref, settings, finals_map, window: Window, internal, quotes
         ts_clause = " AND t.date >= ?"
         params.append(window.since_ts)
     sales: list[Sale] = []
-    unit_costs = {t: b.unit_cost for t, b in bases.items()}
+
+    def cost_at(type_id: int, when: str | None):
+        basis, pre = vintages.at(type_id, when)
+        if basis is None:
+            return None, None, False
+        return basis.unit_cost, basis.run_number, pre
+
     for t in conn.execute(
         f"SELECT t.*, l.solar_system_id FROM sale_transaction t "
         f"LEFT JOIN location_system l ON l.location_id = t.location_id "
@@ -1382,7 +1493,7 @@ def sales_rows(conn, ref, settings, finals_map, window: Window, internal, quotes
         net = _net_for(ref, settings, t["type_id"], t["unit_price"], t["quantity"],
                        t["location_id"])
         venue = costing.sale_venue(t["location_id"])
-        uc = unit_costs.get(t["type_id"])
+        uc, basis_run, pre = cost_at(t["type_id"], t["date"])
         profit = net - t["quantity"] * uc if uc is not None else None
         sales.append(Sale(
             when=t["date"], type_id=t["type_id"], name=_type_name(ref, t["type_id"]),
@@ -1393,6 +1504,7 @@ def sales_rows(conn, ref, settings, finals_map, window: Window, internal, quotes
             system=_system_name(ref, t["solar_system_id"]), ref_id=t["transaction_id"],
             flags=tuple(flags), counted=counted, priced=True,
             venue=venue, venue_label=venue_label(venue, settings),
+            basis_run=basis_run, unit_cost=uc, pre_history=pre,
         ))
     # Contracts: finished item exchanges whose item list names a final.
     cparams: list = list(SOLD_CONTRACT_STATUSES) + list(final_ids)
@@ -1448,7 +1560,7 @@ def sales_rows(conn, ref, settings, finals_map, window: Window, internal, quotes
                 _net_for(ref, settings, type_id, unit_price, qty, c["start_location_id"])
                 if priced else None
             )
-            uc = unit_costs.get(type_id)
+            uc, basis_run, pre = cost_at(type_id, when)
             profit = net - qty * uc if (priced and uc is not None) else None
             sales.append(Sale(
                 when=when, type_id=type_id, name=_type_name(ref, type_id), quantity=qty,
@@ -1460,6 +1572,7 @@ def sales_rows(conn, ref, settings, finals_map, window: Window, internal, quotes
                 flags=tuple(flags), counted=counted, priced=priced,
                 contract_price=c["price"], detail=detail,
                 venue=venue, venue_label=venue_label(venue, settings),
+                basis_run=basis_run, unit_cost=uc, pre_history=pre,
             ))
     sales.sort(key=lambda s: (s.when, s.ref_id), reverse=True)
     return sales
@@ -1489,6 +1602,17 @@ class Product:
     quote_sell_side: bool = True   # False under the Max Buy basis: not comparable
     quote_age: str | None = None
     badges: list = field(default_factory=list)
+    # v1.27.1: cost of goods sold at each sale's own vintage — the units
+    # it covers, the ISK, the runs it drew on and the units sold before
+    # the first executed run (costed at that run).
+    cost_units: int = 0
+    cogs: float = 0.0
+    runs_used: set = field(default_factory=set)
+    pre_history_units: int = 0
+    # The run numbers those units were costed at (the earliest priced
+    # run by execution time — not necessarily the lowest run number;
+    # review 2026-09-10).
+    pre_history_runs: set = field(default_factory=set)
 
     @property
     def unpriced_units(self) -> int:
@@ -1500,13 +1624,33 @@ class Product:
 
     @property
     def unit_cost(self):
+        """Cost per hull at the CURRENT basis (the latest executed run)."""
         return self.basis.unit_cost if self.basis else None
 
     @property
     def cost_of_units(self):
-        if self.unit_cost is None or not self.units_priced:
+        """Cost of goods sold: every priced unit at the basis of its own
+        sale date (v1.27.1). None unless EVERY priced unit got a vintage
+        (review 2026-09-09: a partly costed product would count the
+        uncosted units' whole net as profit) — or with nothing priced."""
+        if not self.units_priced or self.cost_units < self.units_priced:
             return None  # no basis, or nothing priced to cost: profit is unknown
-        return self.units_priced * self.unit_cost
+        return self.cogs
+
+    @property
+    def avg_unit_cost(self):
+        """Cost of goods sold per unit — what the window's sales were
+        costed at on average."""
+        return self.cogs / self.cost_units if self.cost_units else None
+
+    @property
+    def runs_label(self) -> str:
+        runs = sorted(self.runs_used)
+        if not runs:
+            return ""
+        if len(runs) == 1:
+            return f"run {runs[0]}"
+        return f"runs {runs[0]}–{runs[-1]}" if runs[-1] - runs[0] == len(runs) - 1 else "runs " + ", ".join(str(r) for r in runs)
 
     @property
     def profit(self):
@@ -1551,6 +1695,13 @@ def products(conn, ref, settings, finals_map, sales, bases, quotes_full, window:
             p.units_priced += s.quantity
             p.revenue += s.gross
             p.net += s.net
+            if s.unit_cost is not None:
+                p.cost_units += s.quantity
+                p.cogs += s.quantity * s.unit_cost
+                p.runs_used.add(s.basis_run)
+                if s.pre_history:
+                    p.pre_history_units += s.quantity
+                    p.pre_history_runs.add(s.basis_run)
     out = []
     for p in by_type.values():
         if p.units_sold == 0 and window.days is not None:
@@ -1570,7 +1721,10 @@ def _product_badges(p: Product) -> list:
     else:
         cost = p.basis.cost
         if cost is None or cost.total <= 0:
-            badges.append(("no executed run", "warn", f"run {p.basis.run_number} was planned before any price pull — every cost line is unpriced, so it sets no basis"))
+            if p.cost_units:
+                badges.append(("latest unpriced", "warn", f"run {p.basis.run_number}, the latest executed, was planned before any price pull — every cost line is unpriced, so it sets no cost per unit; the window's sales are costed at the priced runs executed before them"))
+            else:
+                badges.append(("no executed run", "warn", f"run {p.basis.run_number} was planned before any price pull — every cost line is unpriced, so it sets no basis"))
         else:
             if cost.missing_prices:
                 badges.append((f"{cost.missing_prices} unpriced", "warn", f"{cost.missing_prices} cost lines of run {p.basis.run_number} had no price on record and count as 0"))
@@ -1578,6 +1732,9 @@ def _product_badges(p: Product) -> list:
                 badges.append(("spin-up", "warn", "cost history is shorter than the chain depth — some inputs are priced from the first run instead of their true vintage"))
     if p.unpriced_units:
         badges.append((f"{p.unpriced_units} not priced", "warn", f"{p.unpriced_units} units sold by contracts bundled with other items or traded for items — their price cannot be attributed, so they count as units only"))
+    if p.pre_history_units and p.pre_history_runs:
+        runs = ", ".join(str(r) for r in sorted(p.pre_history_runs))
+        badges.append(("pre-history", "", f"{p.pre_history_units} units sold before any priced run had been executed are costed at the earliest priced run (run {runs}), the earliest vintage there is"))
     if p.profit is not None and p.profit < 0:
         badges.append(("negative margin", "fill bad", "net income is below zero at the realized prices"))
     return badges
@@ -1632,7 +1789,7 @@ def totals(products_list, sales, contracts_open: int) -> Totals:
         if p.cost_of_units is not None:
             t.cost += p.cost_of_units
             t.net_basis += p.net
-        elif p.units_sold and p.unit_cost is None:
+        elif p.units_sold and not p.cost_units and p.unit_cost is None:
             t.no_basis += 1
     seen_contracts = set()
     unpriced = set()
@@ -2077,8 +2234,12 @@ def build_view(conn, ref, settings, window, now: datetime | None = None,
     internal = internal_ids(conn)
     quotes_full = {t: final_quote(conn, ref, settings, t) for t in finals_map}
     quotes = {t: q[0] for t, q in quotes_full.items()}
-    bases = cost_bases(conn, ref, settings, finals_map)
-    sales = sales_rows(conn, ref, settings, finals_map, win, internal, quotes, enabled, bases, names)
+    # v1.27.1: every sale is costed at the latest run executed on or
+    # before it (CostVintages.at); the unsold listings and the products
+    # table's cost-per-unit column read the current basis.
+    vintages = CostVintages(conn, ref, settings, finals_map)
+    bases = vintages.latest_map()
+    sales = sales_rows(conn, ref, settings, finals_map, win, internal, quotes, enabled, vintages, names)
     _hub_n, hub_at = market.price_cache_state(conn, settings.price_region_id, settings.price_source)
     _s_n, structure_at = market.structure_cache_state(conn, settings.capital_structure())
     quote_age = {

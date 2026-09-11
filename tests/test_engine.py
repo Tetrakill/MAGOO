@@ -412,17 +412,24 @@ def test_milp_solver_failure_raises(conn, ref, monkeypatch):
 
 
 def test_contention_respects_slot_caps(conn, ref):
-    """Under contention no pool exceeds its slot budget, and unprofitable
-    items lose their slots to higher-savings work."""
+    """Under contention no pool's STARTABLE jobs exceed its slot budget
+    (the stock-aware backfill of 2026-09-09 may list more planned jobs
+    than the pool — jobs that cannot start hold no slot), and
+    unprofitable items lose their slots to higher-savings work."""
     add_pipeline(conn, ref, "Hulk", 8)
     plan = engine.plan_index_run(conn, ref, rich_snapshot(ref, slots=5), persist=False)
     for activity in (config.ACTIVITY_MANUFACTURING, config.ACTIVITY_REACTION):
-        used = sum(
-            i.jobs_allocated
+        startable = sum(
+            i.install_jobs or 0
             for i in plan.items.values()
             if i.activity_id == activity
         )
-        assert used <= 5
+        assert startable <= 5
+        # The MILP itself never over-allocates: only the backfill adds
+        # jobs, and only against slots whose jobs cannot start.
+        planned = sum(i.jobs_allocated for i in plan.items.values() if i.activity_id == activity)
+        backfilled = sum(i.backfilled_jobs for i in plan.items.values() if i.activity_id == activity)
+        assert planned - backfilled <= 5
 
 
 def test_negative_savings_bought_even_with_idle_slots(conn, ref):
@@ -459,7 +466,11 @@ def test_slot_contention_milp(conn, ref):
         if i.activity_id == config.ACTIVITY_MANUFACTURING
         and i.jobs_allocated > 0
     ]
-    used = sum(i.jobs_allocated for i in builders)
+    # Startable jobs fit the pool; the MILP's own allocation (planned
+    # minus the stock-aware backfill) does too.
+    startable = sum(i.install_jobs or 0 for i in builders)
+    assert startable <= 5
+    used = sum(i.jobs_allocated - i.backfilled_jobs for i in builders)
     assert 0 < used <= 5
     # The final takes its slots FIRST (2026-08-21: finals never flip to
     # buy); intermediate losers are flagged and covered by buys.
@@ -542,12 +553,13 @@ def test_composite_inputs_get_extra_buffer(conn, ref):
     add_pipeline(conn, ref, "Hulk", 8)
     plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
     # Composite reactions consume moon materials; those inputs' targets must
-    # exceed plain merged_min x (1 + buffer).
+    # exceed plain cycle need x (1 + buffer) (the cycle need at the jobs'
+    # rounding is the target basis since 2026-09-09).
     buffer_mult = 1 + store.get_settings(conn).stockpile_buffer
     boosted = [
         i
         for i in plan.items.values()
-        if i.target_stock_qty > math.ceil(i.merged_min_qty * buffer_mult)
+        if i.target_stock_qty > math.ceil(i.cycle_need_qty * buffer_mult)
     ]
     assert boosted
 
@@ -1029,6 +1041,7 @@ def test_buffered_target_guards_float_noise(conn, ref):
             item_class="other",
             depth=1,
             merged_min_qty=100,
+            cycle_need_qty=100,  # the target basis since 2026-09-09
         )
     }
     engine._apply_targets(conn, ref, merged, rich_snapshot(ref))

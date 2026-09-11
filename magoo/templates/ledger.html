@@ -85,9 +85,12 @@
   contract ESI gives no location for falls back to the Planning tab's
   class rule. Contracts pay the same estimates, as an approximation. <b>Cost per unit</b> is the lag-based
   cost of the latest executed index run that built the product (a
-  deleted pipeline loses its run history); <b>cost of goods sold</b> is
-  units sold × that cost and <b>net income</b> is net proceeds minus it, so
-  products without an executed run show revenue but no net income.
+  deleted pipeline loses its run history); <b>cost of goods sold</b> costs
+  each sale at the latest priced run executed before it (a run planned
+  before any price pull prices nothing and is passed over; a sale made
+  before any priced run had been executed takes the earliest priced one), so executing a new run never re-costs an earlier sale,
+  and <b>net income</b> is net proceeds minus it — products without an
+  executed run show revenue but no net income.
   <b>Unrealized profit</b> is what your open sell orders and outstanding
   contracts would bank at their listed prices, after the same estimated
   fees, minus their cost basis — hangar stock is not counted. Sales to your own characters or corporations and
@@ -119,7 +122,7 @@ version need a re-login for the new scopes.</p>
   </div>
   <div class="stat">
     <span class="label">Cost of goods sold</span>
-    <span class="value" title="{{ t.cost|isk }} ISK — units sold × the cost basis per unit, products with an executed run">{{ t.cost|isk_short }}</span>
+    <span class="value" title="{{ t.cost|isk }} ISK — each priced unit sold at the cost basis of the latest run executed before its sale, products with an executed run">{{ t.cost|isk_short }}</span>
   </div>
   <div class="stat">
     <span class="label">Net income</span>
@@ -216,9 +219,9 @@ version need a re-login for the new scopes.</p>
     <td class="num" title="{{ p.revenue|isk }} ISK">{{ p.revenue|isk_short }}</td>
     <td class="num" title="{{ p.net|isk }} ISK — after the estimated sell fees">{{ p.net|isk_short }}</td>
     {% set copies = p.basis.cost.subtotal('bpc') + p.basis.cost.subtotal('invention') if p.unit_cost is not none else 0 %}
-    <td class="num">{% if p.unit_cost is not none %}<span title="lag-based cost as of run {{ p.basis.run_number }}, executed {{ p.basis.completed_at }} · materials {{ p.basis.cost.subtotal('material')|isk_short }} · job fees {{ p.basis.cost.subtotal('install')|isk_short }} · freight {{ p.basis.cost.subtotal('freight_in')|isk_short }}{% if copies %} · BPC / invention {{ copies|isk_short }}{% endif %}">{{ p.unit_cost|isk_short }}</span>
+    <td class="num">{% if p.unit_cost is not none %}<span title="cost per unit now — lag-based cost as of run {{ p.basis.run_number }} (the latest executed), executed {{ p.basis.completed_at }}; each sale in the window is costed at the priced run executed before it, see Cost of goods sold · materials {{ p.basis.cost.subtotal('material')|isk_short }} · job fees {{ p.basis.cost.subtotal('install')|isk_short }} · freight {{ p.basis.cost.subtotal('freight_in')|isk_short }}{% if copies %} · BPC / invention {{ copies|isk_short }}{% endif %}">{{ p.unit_cost|isk_short }}</span>
       <a class="small" href="{{ url_for('run_detail', index_run_id=p.basis.index_run_id, view='profit') }}" title="the run this cost basis comes from">run {{ p.basis.run_number }} ↗</a>{% else %}—{% endif %}</td>
-    <td class="num" title="{% if p.cost_of_units is not none %}{{ p.cost_of_units|isk }} ISK — {{ p.units_priced|qty }} priced units × cost per unit{% else %}no cost basis{% endif %}">{{ p.cost_of_units|isk_short }}</td>
+    <td class="num" title="{% if p.cost_of_units is not none %}{{ p.cost_of_units|isk }} ISK — {{ p.cost_units|qty }} priced units, each at the cost basis of the latest run executed before its sale ({{ p.runs_label }}{% if p.pre_history_units %}; {{ p.pre_history_units|qty }} sold before any priced run had been executed, costed at the earliest priced run{% endif %}) — {{ p.avg_unit_cost|isk }} ISK per unit on average{% else %}no cost basis{% endif %}">{{ p.cost_of_units|isk_short }}</td>
     <td class="num {% if neg %}bad{% elif p.profit %}good{% endif %}" title="{% if p.profit is not none %}{{ p.profit|isk }} ISK — net {{ p.net|isk_short }} − cost of units sold {{ p.cost_of_units|isk_short }}{% else %}no cost basis{% endif %}">{{ p.profit|isk_short }}</td>
     <td class="num {% if neg %}bad{% elif p.profit %}good{% endif %}" title="{% if p.profit_per_unit is not none %}{{ p.profit_per_unit|isk }} ISK{% else %}no cost basis{% endif %}">{{ p.profit_per_unit|isk_short }}</td>
     <td class="num {% if neg %}bad{% elif p.profit %}good{% endif %}" title="profit ÷ cost of units sold">{% if p.margin_pct is not none %}{{ "%.1f"|format(p.margin_pct) }}%{% else %}—{% endif %}</td>
@@ -310,7 +313,7 @@ version need a re-login for the new scopes.</p>
     <td class="num" title="{% if s.unit_price is not none %}{{ s.unit_price|isk }} ISK{% else %}not attributable{% endif %}">{{ s.unit_price|isk_short }}</td>
     <td class="num" title="{% if s.gross is not none %}{{ s.gross|isk }} ISK{% elif s.contract_price %}the contract's whole price, {{ s.contract_price|isk }} ISK, is not attributed to the hull{% else %}—{% endif %}">{% if s.gross is not none %}{{ s.gross|isk_short }}{% elif s.contract_price %}<span class="muted">({{ s.contract_price|isk_short }})</span>{% else %}—{% endif %}</td>
     <td class="num" title="{% if s.net is not none %}{{ s.net|isk }} ISK — after the estimated sell fees at {{ s.venue_label }}{% else %}—{% endif %}">{{ s.net|isk_short }}</td>
-    <td class="num {% if s.profit is not none and s.profit < 0 %}bad{% elif s.profit %}good{% endif %}" title="{% if s.profit is not none %}{{ s.profit|isk }} ISK — net − qty × the product's current cost basis{% else %}no cost basis or no attributable price{% endif %}">{{ s.profit|isk_short }}</td>
+    <td class="num {% if s.profit is not none and s.profit < 0 %}bad{% elif s.profit %}good{% endif %}" title="{% if s.profit is not none %}{{ s.profit|isk }} ISK — net − qty × {{ s.unit_cost|isk }} ISK, the cost basis of run {{ s.basis_run }}{% if s.pre_history %}, the earliest priced run — no priced run had been executed by this sale{% else %}, the latest priced run executed before this sale{% endif %}{% else %}no cost basis or no attributable price{% endif %}">{{ s.profit|isk_short }}</td>
     <td>{% if s.system %}{{ s.system }}{% elif s.location_id %}<span class="muted" title="location {{ s.location_id }} unresolved — a structure the pulling character cannot dock at, retried daily">—</span>{% else %}<span class="muted" title="ESI reports no location for this contract">—</span>{% endif %}</td>
     <td title="{% if s.division %}corporation wallet division {{ s.division }}{% else %}{{ s.owner_kind }} {{ s.owner_id }}{% endif %}">{{ s.owner }}</td>
     <td>{% if s.source == 'contract' %}<span class="badge accent" title="item-exchange contract {{ s.ref_id }}{% if s.detail %} — {{ s.detail }}{% endif %}">contract</span>{% else %}<span class="badge" title="market transaction {{ s.ref_id }}">market</span>{% endif %}</td>

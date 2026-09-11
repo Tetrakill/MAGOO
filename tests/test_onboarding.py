@@ -81,8 +81,16 @@ def test_disabled_actions_explain_their_prerequisites(fresh_client):
     html = fresh_client.get("/").get_data(as_text=True)
     # ESI refresh gates on the game data existing first.
     assert "download the game data first" in html
-    assert "add a pipeline first" in html
     assert "needs pipelines and an ESI update first" in html
+    # The prices-only button is gone from the dashboard (user ruling
+    # 2026-09-11): the ESI update already pulls prices as its third step,
+    # and the Planning profit view keeps a button for prices alone.
+    # Whitespace-collapsed: the template wraps labels mid-phrase, so a raw
+    # substring check passed while the browser still showed the words
+    # (pre-release check 2026-09-11 — the first-run checklist was still
+    # telling the user to press the deleted button).
+    flat = " ".join(html.split())
+    assert "Refresh prices" not in flat
 
 
 @pytest.mark.parametrize(

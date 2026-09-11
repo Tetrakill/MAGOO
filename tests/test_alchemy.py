@@ -274,24 +274,313 @@ def test_reaction_pool_never_exceeded(conn, ref):
         plan = engine.plan_index_run(
             conn, ref, snapshot(ref, slots=slots, overrides=overrides), persist=False
         )
-        used = sum(
-            i.jobs_allocated
+        # The STARTABLE reaction jobs — direct and alchemy — fit the pool;
+        # since the stock-aware backfill (2026-09-09) the planned count may
+        # not, as jobs stock cannot feed hold no slot.
+        startable = sum(
+            i.install_jobs or 0
             for i in plan.items.values()
             if i.activity_id == config.ACTIVITY_REACTION
         )
-        assert used <= slots
+        assert startable <= slots
 
 
-def test_no_alchemy_under_contention(conn, ref):
-    """A contended reaction pool has no spare slots — alchemy stays out."""
+def test_contended_alchemy_needs_its_own_fuel_block(conn, ref):
+    """A contended reaction pool (2026-09-09 ruling) with NO fuel on
+    hand: no direct job can start, so every slot is free on paper — but
+    the alchemy jobs need the fuel block too, so none is planned and
+    nothing starts. The manufacturing pool keeps its 500 slots so the
+    reaction pool alone is contended (review 2026-09-10: the first
+    contention tests set BOTH pools to 3 and planned no reaction job)."""
     add_pipeline(conn, ref, "Hulk", 8)
     baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
     overrides = expensive_rare_inputs(ref, reaction_candidates(ref, baseline))
     enable_alchemy(conn)
-    plan = engine.plan_index_run(
-        conn, ref, snapshot(ref, slots=3, overrides=overrides), persist=False
+    pool = sum(
+        i.jobs_needed_unconstrained for i in baseline.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION
     )
+    snap = snapshot(ref, overrides=overrides)
+    snap.slots_available[config.ACTIVITY_REACTION] = pool
+    plan = engine.plan_index_run(conn, ref, snap, persist=False)
+    direct = [
+        i for i in plan.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION and not i.alchemy_for_type_id
+    ]
+    assert sum(i.jobs_allocated for i in direct) == pool  # contended on paper
+    assert sum(i.install_jobs or 0 for i in direct) == 0
     assert not alchemy_items(plan)
+
+
+def test_contended_alchemy_buys_route_only_goo_just_in_time(conn, ref):
+    """Review 2026-09-10: an unrefined formula's goo that no direct
+    formula demands is not a plan row when the swap is judged — it is
+    added afterwards and bought just in time — so it must not gate the
+    swap. Stocking that goo on hand therefore changes nothing: the
+    alchemy routes taken under contention are the same either way."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    overrides = expensive_rare_inputs(ref, reaction_candidates(ref, baseline))
+    enable_alchemy(conn)
+    pool = sum(
+        i.jobs_needed_unconstrained for i in baseline.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+    )
+    route_only = set()
+    for item in reaction_candidates(ref, baseline):
+        route = ref.alchemy_routes()[item.type_id]
+        for m, _q in ref.materials(route.formula.blueprint_id, route.formula.activity_id):
+            if m not in baseline.items:
+                route_only.add(m)
+    assert route_only, "some route needs goo the direct chain never buys"
+
+    def plan_with(stock_route_goo: bool):
+        snap = snapshot(ref, overrides=overrides)
+        snap.slots_available[config.ACTIVITY_REACTION] = pool
+        for item in baseline.items.values():
+            if ref.type_info(item.type_id).group_id == 1136:  # fuel blocks
+                snap.on_hand[item.type_id] = 10**9
+        if stock_route_goo:
+            for m in route_only:
+                snap.on_hand[m] = 10**9
+        return engine.plan_index_run(conn, ref, snap, persist=False)
+
+    unstocked, stocked = plan_with(False), plan_with(True)
+    taken = lambda plan: {i.type_id: i.jobs_allocated for i in alchemy_items(plan)}
+    assert taken(unstocked) and taken(unstocked) == taken(stocked)
+    # The goo the chosen routes need is a plan row now, bought just in time.
+    for alch in alchemy_items(unstocked):
+        for m, _q in ref.materials(alch.blueprint_id, alch.activity_id):
+            if m in route_only:
+                assert unstocked.items[m].recommended_buy_qty > 0, unstocked.items[m].name
+
+
+def test_contended_alchemy_runs_in_the_slots_of_other_items_unstartable_jobs(conn, ref):
+    """The free slots are ANY unstartable direct job's (user: alchemy
+    "follows the original rules"). The routed products are the simple
+    reactions (bought goo + fuel: startable with fuel on hand); the
+    composites above them are not (their simple inputs are built this
+    cycle, none on hand). With the pool sized to exactly the direct need
+    (contended), alchemy swaps a startable simple-reaction job for
+    alchemy jobs at the original `jobs − 1` net cost, in the slots the
+    composites left free; the alchemy jobs can start, and the startable
+    total still fits the pool."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    overrides = expensive_rare_inputs(ref, reaction_candidates(ref, baseline))
+    enable_alchemy(conn)
+    direct_need = [
+        i for i in baseline.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION and i.jobs_needed_unconstrained
+    ]
+    pool = sum(i.jobs_needed_unconstrained for i in direct_need)
+    snap = snapshot(ref, slots=pool, overrides=overrides)
+    for item in baseline.items.values():
+        if ref.type_info(item.type_id).group_id == 1136:  # fuel blocks
+            snap.on_hand[item.type_id] = 10**9
+    plan = engine.plan_index_run(conn, ref, snap, persist=False)
+    direct = [
+        i for i in plan.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION and not i.alchemy_for_type_id
+    ]
+    alch = alchemy_items(plan)
+    composites = [i for i in direct if ref.type_info(i.type_id).group_id == 429 and i.jobs_allocated]
+    assert composites and all((i.install_jobs or 0) == 0 for i in composites)
+    assert alch, "alchemy ran in the composites' free slots"
+    assert all((i.install_jobs or 0) == i.jobs_allocated for i in alch), "the alchemy jobs can start"
+    # A routed simple reaction gave up direct jobs for them.
+    swapped = [i for i in direct if i.alchemy_output_qty > 0]
+    assert swapped and all(i.jobs_allocated < i.jobs_needed_unconstrained for i in swapped)
+    assert sum(i.install_jobs or 0 for i in direct) + sum(i.install_jobs or 0 for i in alch) <= pool
+
+
+def test_no_alchemy_where_every_direct_job_can_start(conn, ref):
+    """Every buildable stocked at target: every direct job can start,
+    so a pool sized to exactly the direct need is contended with no
+    free slot — alchemy stays out (review 2026-09-10: the first version
+    stocked everything at 10**9 on a 3-slot pool and planned no reaction
+    job at all)."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    empty = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    overrides = expensive_rare_inputs(ref, reaction_candidates(ref, empty))
+    enable_alchemy(conn)
+    stocked = snapshot(ref, overrides=overrides)
+    for item in empty.items.values():
+        if item.buildable:
+            stocked.on_hand[item.type_id] = item.target_stock_qty
+    free = engine.plan_index_run(conn, ref, stocked, persist=False, alchemy=False)
+    pool = sum(
+        i.jobs_needed_unconstrained for i in free.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+    )
+    assert pool > 0
+    stocked.slots_available[config.ACTIVITY_REACTION] = pool
+    plan = engine.plan_index_run(conn, ref, stocked, persist=False)
+    direct = [
+        i for i in plan.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION and not i.alchemy_for_type_id
+    ]
+    assert sum(i.jobs_allocated for i in direct) == pool
+    assert all((i.install_jobs or 0) == i.jobs_allocated for i in direct)
+    assert not alchemy_items(plan)
+
+
+def test_a_pipeline_selling_an_unrefined_product_keeps_its_plan_row(conn, ref):
+    """Review 2026-09-10: the pass ends with `merged[alch.type_id] = alch`,
+    which REPLACES any existing row. A pipeline whose final product is one
+    of the 17 unrefined route outputs therefore lost its request, cycle
+    need and pipeline attribution silently — no unmet flag, and no cost
+    basis for that pipeline. Such a route is skipped instead."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    overrides = expensive_rare_inputs(ref, reaction_candidates(ref, baseline))
+    enable_alchemy(conn)
+    routed = engine.plan_index_run(
+        conn, ref, snapshot(ref, overrides=overrides), persist=False
+    )
+    taken = alchemy_items(routed)
+    assert taken, "the fixture's prices make at least one route win"
+    unrefined = taken[0].type_id
+    name = ref.type_info(unrefined).name
+
+    # Now sell that very product from a pipeline of its own.
+    add_pipeline(conn, ref, name, 500)
+    plan = engine.plan_index_run(
+        conn, ref, snapshot(ref, overrides=overrides), persist=True
+    )
+    item = plan.items[unrefined]
+    assert item.alchemy_for_type_id is None, f"{name} is still the pipeline's row"
+    assert item.requested_qty == 500 and item.cycle_need_qty >= 500
+    assert item.recommended_build_qty + item.recommended_buy_qty >= 500
+    # The route is simply not used; the others still are.
+    assert all(i.type_id != unrefined for i in alchemy_items(plan))
+    # And the pipeline is attributed, so it has a cost basis.
+    pid = conn.execute(
+        "SELECT pipeline_id FROM pipeline WHERE final_product_type_id = ?",
+        (unrefined,),
+    ).fetchone()[0]
+    row = conn.execute(
+        "SELECT a.qty_attributable FROM index_run_item i "
+        "JOIN index_run_item_pipeline a USING (index_run_item_id) "
+        "WHERE i.index_run_id = ? AND i.type_id = ? AND a.pipeline_id = ?",
+        (plan.index_run_id, unrefined, pid),
+    ).fetchone()
+    assert row is not None and row["qty_attributable"] >= 500
+
+
+def _routed_target(conn, ref, overrides):
+    """A routed composite the pass costed, whose alchemy route is cheaper
+    than building it directly."""
+    routed = engine.plan_index_run(
+        conn, ref, snapshot(ref, overrides=overrides), persist=False
+    )
+    return next(
+        i for i in routed.items.values()
+        if i.alchemy_unit_cost and i.direct_unit_cost
+        and i.alchemy_unit_cost < i.direct_unit_cost
+        and i.type_id in ref.alchemy_routes()
+    )
+
+
+def test_alchemy_beats_the_buy_price_and_shrinks_the_purchase(conn, ref):
+    """User ruling 2026-09-11. A composite the plan decided to BUY never
+    reached the pass: the candidate filter demanded direct jobs, and the
+    comparison was against the direct BUILD cost, so "would the unrefined
+    route beat what I am about to pay the market?" was never asked. Now a
+    bought composite is a candidate, judged against its LANDED price and
+    ranked by the same savings, and the plan buys less by what the route
+    supplies."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    overrides = expensive_rare_inputs(ref, reaction_candidates(ref, baseline))
+    enable_alchemy(conn)
+    target = _routed_target(conn, ref, overrides)
+    # Price it BETWEEN its alchemy cost and its direct build cost: the
+    # market beats building it (so the plan buys it) while the route
+    # still beats the market.
+    priced = dict(overrides)
+    priced[target.type_id] = (target.alchemy_unit_cost + target.direct_unit_cost) / 2
+    snap = snapshot(ref, overrides=priced)
+    with_alchemy = engine.plan_index_run(conn, ref, snap, persist=False)
+    without = engine.plan_index_run(conn, ref, snap, persist=False, alchemy=False)
+    a, b = with_alchemy.items[target.type_id], without.items[target.type_id]
+    # Without the pass the plan buys it outright: no jobs, negative build
+    # savings, a real purchase.
+    assert b.jobs_allocated == 0 and (b.build_savings_per_unit or 0) <= 0
+    assert b.recommended_buy_qty > 0
+    # With the pass the route supplies some of those units ...
+    assert [
+        i for i in with_alchemy.items.values()
+        if i.alchemy_for_type_id == target.type_id and i.jobs_allocated
+    ], f"no alchemy for the bought {b.name}"
+    assert a.alchemy_output_qty > 0
+    # ... and the purchase shrinks by them, never below zero.
+    assert 0 <= a.recommended_buy_qty < b.recommended_buy_qty
+    assert b.recommended_buy_qty - a.recommended_buy_qty <= a.alchemy_output_qty
+
+
+def test_a_bought_composite_the_route_cannot_beat_is_left_alone(conn, ref):
+    """The mirror: priced BELOW the alchemy route, the market wins and
+    the pass leaves the purchase whole."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    overrides = expensive_rare_inputs(ref, reaction_candidates(ref, baseline))
+    enable_alchemy(conn)
+    target = _routed_target(conn, ref, overrides)
+    priced = dict(overrides)
+    priced[target.type_id] = target.alchemy_unit_cost * 0.5  # cheaper than the route
+    snap = snapshot(ref, overrides=priced)
+    with_alchemy = engine.plan_index_run(conn, ref, snap, persist=False)
+    without = engine.plan_index_run(conn, ref, snap, persist=False, alchemy=False)
+    a, b = with_alchemy.items[target.type_id], without.items[target.type_id]
+    assert b.jobs_allocated == 0 and b.recommended_buy_qty > 0
+    assert not [
+        i for i in with_alchemy.items.values()
+        if i.alchemy_for_type_id == target.type_id and i.jobs_allocated
+    ]
+    assert a.alchemy_buy_qty == 0
+    assert a.recommended_buy_qty == b.recommended_buy_qty
+
+
+def test_candidates_are_ranked_by_isk_saved_per_slot(conn, ref):
+    """The v1.4 ranking is unchanged by the buy comparison (user ruling
+    2026-09-11, "rank them as we did before"): every candidate scores ISK
+    saved on the units its jobs SUPPLY, per spare slot consumed, whether
+    it is beating a direct build or a purchase. A clamped buy replacement
+    covers only part of its residual, so crediting the whole of it would
+    out-rank honest candidates."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    overrides = expensive_rare_inputs(ref, reaction_candidates(ref, baseline))
+    enable_alchemy(conn, cap=4)  # a cap tight enough to clamp a buy bite
+    target = _routed_target(conn, ref, overrides)
+    priced = dict(overrides)
+    priced[target.type_id] = (target.alchemy_unit_cost + target.direct_unit_cost) / 2
+    plan = engine.plan_index_run(
+        conn, ref, snapshot(ref, overrides=priced), persist=False
+    )
+    item = plan.items[target.type_id]
+    alch = [
+        i for i in plan.items.values()
+        if i.alchemy_for_type_id == target.type_id and i.jobs_allocated
+    ]
+    assert alch, "the route still runs under a tight cap"
+    # The cap bound the bite, and the output never exceeds what those
+    # jobs can make.
+    assert alch[0].jobs_allocated <= 4
+    assert item.alchemy_output_qty <= alch[0].jobs_allocated * (
+        alch[0].max_runs_per_job * ref.alchemy_routes()[target.type_id].composite_qty
+    )
+    # Every routed composite that won jobs saves against what the plan
+    # would otherwise have paid — the ranking's numerator is never
+    # negative.
+    for i in plan.items.values():
+        if i.alchemy_for_type_id and i.jobs_allocated:
+            composite = plan.items[i.alchemy_for_type_id]
+            assert composite.alchemy_unit_cost < max(
+                composite.direct_unit_cost or 0.0,
+                composite.price_snapshot or 0.0,
+            ), composite.name
 
 
 def test_per_type_job_cap(conn, ref):

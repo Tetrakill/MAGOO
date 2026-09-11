@@ -31,10 +31,6 @@
       <button {% if not characters or not sde_build %}disabled
         title="{% if not sde_build %}download the game data first — step 1 of setup{% else %}log in a character first — the ESI tab has the SSO button{% endif %}"{% endif %}>⟳ Update from ESI</button>
     </form>
-    <form method="post" action="{{ url_for('prices_refresh') }}">
-      <button {% if not pipelines %}disabled
-        title="add a pipeline first — prices are pulled for what your pipelines need"{% endif %}>⟳ Refresh prices</button>
-    </form>
     <form method="post" action="{{ url_for('run_plan') }}">
       <button class="primary" {% if not pipelines or not esi_state %}disabled
         title="{% if not pipelines and not esi_state %}needs pipelines and an ESI update first{% elif not pipelines %}add a pipeline first{% else %}run an ESI update first{% endif %}"{% endif %}>
@@ -98,9 +94,10 @@
       href="{{ url_for('pipelines') }}">Add your pipelines</a></b> — what
       you build and how many per cycle. Product and quantity is enough to
       start.{{ donebadge(pipelines) }}</li>
-    <li {{ stepattrs(price_state and price_state[0]) }}><b>Refresh
-      prices</b> — the ⟳ button above pulls Jita quotes for everything
-      your pipelines need.{{ donebadge(price_state and price_state[0]) }}</li>
+    <li {{ stepattrs(price_state and price_state[0]) }}><b>Update from ESI
+      once more</b> — the first update ran before you had pipelines, so it
+      had nothing to price; this one pulls quotes for everything they
+      need.{{ donebadge(price_state and price_state[0]) }}</li>
   </ol>
   <p class="muted" style="margin:.6rem 0 0">Then look over
     <a href="{{ url_for('settings') }}">Settings</a> — job slots, skills

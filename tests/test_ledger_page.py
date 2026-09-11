@@ -300,7 +300,9 @@ def test_characters_page_toggles_provenance_relogin_badge_and_delete_nulls_via(s
 
 def test_schema_9_migration_from_v8_shape(tmp_path, monkeypatch):
     """A pre-Ledger database: the toggle columns arrive with default 1 and
-    every existing row survives; the five tables appear; user_version 9.
+    every existing row survives; the five tables appear; user_version
+    moves to the current stamp (9 at the time; 11 since the install check
+    and the persisted slot pools).
     The pre-upgrade backup goes to THIS temp dir, never to data/backups."""
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "old.sqlite")
@@ -320,7 +322,7 @@ def test_schema_9_migration_from_v8_shape(tmp_path, monkeypatch):
     c.execute("INSERT INTO esi_corp (corporation_id, corporation_name, count_wallet) VALUES (9, 'Old Corp', 0)")
     c.commit()
     store.ensure_schema(c)
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     assert list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))  # the backup landed here
     row = c.execute("SELECT * FROM pool_character").fetchone()
     assert row["count_sales"] == 1 and row["include_assets"] == 1
@@ -329,7 +331,7 @@ def test_schema_9_migration_from_v8_shape(tmp_path, monkeypatch):
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"sale_transaction", "sale_order", "sale_contract", "sale_contract_item", "sales_pull"} <= tables
     store.ensure_schema(c)  # idempotent
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
 def test_prices_refresh_caches_every_final_from_the_structure_book(seeded_client, monkeypatch):

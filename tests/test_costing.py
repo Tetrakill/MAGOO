@@ -130,7 +130,10 @@ def test_hull_cost_lags_by_depth(conn, ref):
 
     cost = costing.hull_cost(conn, ref, settings, run_id, pid)
     assert cost is not None
-    assert cost.hulls_per_cycle == 8
+    # Uniform prices make every component a buy, so the install check
+    # lets all 8 hulls start (v1.27.1: Units count the hulls the cycle
+    # actually started; hulls_planned keeps the plan's count).
+    assert cost.hulls_planned == 8 and cost.hulls_per_cycle == 8
     assert cost.spin_up  # chain depth 5 > 2 runs of lag available
 
     materials = [l for l in cost.lines if l.kind == "material"]
@@ -410,7 +413,7 @@ def test_second_pipeline_does_not_change_first_pipelines_cost(conn, ref):
     ).fetchone()["pipeline_id"]
     mack = costing.hull_cost(conn, ref, settings, shared_run, mack_pid)
     assert mack is not None and mack.total > 0
-    assert mack.hulls_per_cycle == 8
+    assert mack.hulls_planned == 8 and mack.hulls_per_cycle == 8  # components bought
 
 
 def test_new_chain_items_fall_forward_to_their_first_run(conn, ref):

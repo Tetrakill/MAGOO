@@ -428,12 +428,45 @@ and hover with the teal Hover Wash.
   `market` as the source, and neutral/warn exclusions `internal`, `no
   price`, `sales off`, plus warn `mixed` / `swap` (units only)
   and neutral `estimated split`; product rows carry `capital`, `no
-  executed run`, `N unpriced`, `spin-up`, `N not priced` and the fill-bad
-  `negative margin`; the totals strip's badge slot holds `N without cost
+  executed run`, `N unpriced`, `spin-up`, `N not priced`, warn `latest
+  unpriced` (the current basis run prices nothing, while the window's
+  sales keep their own vintages), neutral `pre-history` (units sold
+  before any priced run had been executed, costed at the earliest priced
+  one — v1.27.1) and the fill-bad `negative margin`; the totals strip's badge slot holds `N without cost
   basis` and `K contracts not priced`; the ESI tab adds warn `re-login
   needed` (missing scopes) and the sales feed statuses (`no scope`, `no
   role`, `partial`, `error`, `skipped`). Every one states its rule in
   `title`.
+- **Install check (v1.27.1, user ruling 2026-09-09):** the Plan tab's job
+  tables show the jobs to RUN NOW. A row whose planned runs outrun the
+  stock there to feed them reads the installable figures — Runs/job (an
+  intermediate's uniform rounded-up count; for a ship or a saturating
+  reaction the plan's count with a muted "· last N" for the remainder
+  job), Jobs tinted warn (bad at zero), Build qty — with the plan's own
+  figures in each cell's tooltip, and
+  carries `short` (warn while some jobs still install, bad when none do)
+  naming the binding input — or `no slot` (same tints) where the pool,
+  not an input, stopped the job: the plan lists more jobs than the pool
+  after the slot backfill, and those wait for a slot. No separate column. The Mfg / Reaction slots
+  stats count the same jobs against the pool the run was planned against
+  (the settings' pools less multi-cycle overhang, persisted on the run
+  since schema 11; the tooltip says so when they differ), with a dim
+  "· plan N" sub where the plan's count differs — stock feeds fewer, or the plan lists more jobs than the
+  pool because the slots of jobs stock cannot start went to others and
+  those jobs wait (the tooltip says which); the alert-warn panel is itself a
+  collapsible section (`details.section.panel`, state persisted like the
+  data-tab sections), leads with the fill badge `short on stock` and a
+  one-line count ("N of the M planned jobs run this cycle — K inputs
+  short": what runs, never a cause the count cannot carry),
+  keeps its explanation short, holds a collapsed "Finals in
+  install order" table
+  (rank, jobs now / planned, return on cost, short on) and the short-inputs
+  table (planned draw, available with its on-hand + in-jobs + bought +
+  compressed breakdown in the tooltip, short in Loss Red, held back = the
+  cut jobs that eat it, four named and "+N more" on hover). On an executed
+  run's Profit tab the Units cell counts the hulls the cycle started
+  (tinted warn, bad at zero, the plan's count in its tooltip) and the row
+  carries `short` when that is below the plan.
 
 ### Status Pills
 - **Style:** 999px chips in 11.5px mono with a 7px status dot — Profit Green
