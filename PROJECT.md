@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.27.0 built and live (engine, MILP allocation, sizing feedback
+Status: v1.28.0 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -19,15 +19,19 @@ default settings and a one-click game-data download with live progress
 that re-imports itself after an update, full web UI restyled,
 accessibility- and audit-hardened, a Ledger tab (sales of pipeline
 finals from ESI wallet transactions, orders and contracts, netted by
-where each hull sold, cost of goods sold from the latest executed run,
+where each hull sold, cost of goods sold at each sale's own vintage,
 unrealized profit, charts, Top 10s; the ESI update pulls sales and
-refreshes prices in one go); packaged as a Windows desktop
+refreshes prices in one go), an install check that verifies every
+planned job against stock on hand, in-flight output and this cycle's
+buys and rations what is short (finals by return on cost, intermediates
+in proportion) while the freed slots go to jobs that can actually run;
+packaged as a Windows desktop
 application — portable zip (the only published artifact since v1.24;
 the installer is still buildable), native WebView2 window,
 shared-client-id PKCE login in the user's own browser, versioned schema
 with pre-migration backups, portable zip self-heals the Mark of the Web
 on first launch)
-Last updated: 2026-09-08
+Last updated: 2026-09-11
 
 ---
 
@@ -3350,6 +3354,60 @@ Tests 555 → 560 (`test_pinned_type_lets_another_ore_cover_the_rest`,
 `test_a_row_the_market_cannot_fill_is_dropped_not_under_costed`,
 `test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct`,
 `test_thin_structure_book_splits_the_multibuy_like_the_venue_cell`).
+
+### v1.28.0 (2026-09-11): the install check — verify every planned job against real stock, ration what is short, and spend the slots and ISK that frees — commit 26c7d71
+
+The user asked the question the planner had never answered: "verify
+current inventory (on hand + in production) vs what the plan needs to
+install all manufacturing jobs. If deficiencies occur, prioritize the
+highest return final products. For intermediates, prioritize keeping the
+proper proportions."
+
+**Phase 7.6, the install check.** Every row holding jobs is checked
+against what is actually there — stock on hand + in-flight output + this
+cycle's buys, less units no market could supply. Where an input is
+short, finals claim it first by return on cost (net proceeds after sell
+fees over chain cost, capital hulls quoted at the structure market) and
+intermediates that share it install the same share of their plan
+(max-min fair). The packing mirrors Phase 7 exactly, so what the page
+tells you to install is what the game will accept. The Plan tab's job
+tables now show the jobs to run NOW, with the plan's own figures in the
+tooltips, and a collapsible *short on stock* panel names each short
+input, its availability and the jobs it holds back.
+
+**Phase 3.5, cycle need at the jobs' own rounding.** Targets were the
+merged BOM figure, which a line stocked to target still fell 1-3 % short
+of, because six one-run capital jobs each round up and reactions run
+full windows. The target is now the packed draw, so a line stocked at
+target installs every planned job. The simulation reaches zero shortfall
+from the fourth cycle instead of never.
+
+**Phase 6, the stock-aware backfill.** A job stock cannot feed holds no
+slot in practice, so its slot goes — in savings order — to a contender
+whose inputs ARE there. The starved job stays in the plan and waits, so
+a pool's planned jobs may exceed it while its startable jobs never do.
+
+**Phase 6.5, alchemy earns its slots.** Alchemy now runs in the slots
+those unstartable jobs leave, and competes with the BUY price for
+composites the plan means to purchase rather than only with a build it
+already lost — the blind spot found in the 2026-09-07 audit. Candidates
+rank by ISK saved per slot consumed.
+
+**The Ledger stops re-costing history.** Each sale keeps the basis of the
+latest *priced* run executed before it, so executing a new run never
+changes what an old sale cost. A run planned before any price pull sets
+no basis and is passed over. The executed run's Profit tab counts the
+hulls the cycle actually started.
+
+Schema 10 and 11: eight `install_*` columns and `cycle_need_qty` on
+`index_run_item`; the slot pools a run was planned against on
+`index_run`. **An installed v1.27.0 or earlier will refuse the database
+once this release migrates it** — hence the minor bump.
+
+Four adversarial review workflows ran over this work (roughly 400 agents
+across install check, cost vintages, backfill and a full-tree pass),
+plus the three-lane pre-release check; every confirmed finding was fixed
+and guarded by a test proved with mutation. 695 tests.
 
 ### v1.27.0 (2026-09-08): the Ledger tab — sales of pipeline finals from ESI, net income by venue, unrealized profit, charts, Top 10s; the ESI update pulls sales and refreshes prices — commits 2ee1aa7, 04b699a
 
