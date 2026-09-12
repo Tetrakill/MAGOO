@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.28.0 built and live (engine, MILP allocation, sizing feedback
+Status: v1.28.1 built and live (engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -31,7 +31,7 @@ the installer is still buildable), native WebView2 window,
 shared-client-id PKCE login in the user's own browser, versioned schema
 with pre-migration backups, portable zip self-heals the Mark of the Web
 on first launch)
-Last updated: 2026-09-11
+Last updated: 2026-09-12
 
 ---
 
@@ -2088,7 +2088,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 695 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration, the install check — rationing, packing, finals by return, per-job cycle need, the stock-aware slot backfill and the startable-jobs cap, alchemy under contention, per-sale-date cost vintages, schema 10 and 11 migrations) |
+| Test suite | 703 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration, the install check — rationing, packing, finals by return, per-job cycle need, the stock-aware slot backfill and the startable-jobs cap, alchemy under contention, per-sale-date cost vintages, schema 10 and 11 migrations, alchemy in stuck jobs' slots, split-row buy moves and the timing guard, built fuel bought just in time, unrealized revenue) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -3442,6 +3442,60 @@ Four adversarial review workflows ran over this work (roughly 400 agents
 across install check, cost vintages, backfill and a full-tree pass),
 plus the three-lane pre-release check; every confirmed finding was fixed
 and guarded by a test proved with mutation. 695 tests.
+
+### v1.28.1 (2026-09-12): alchemy fills the slots stuck jobs leave, replaces split-row purchases without starving this cycle, built fuel is bought just in time; the Ledger shows unrealized revenue — commit fa01764
+
+The user asked why run 19 left reaction slots idle: 540 planned, 461
+able to start, 79 blocked by short intermediates while the pipeline
+fills. Replaying the plan on a backup copy of the production database
+showed the cause.
+
+**Spare slots never depend on the pool being full on paper.** Phase 6.5
+counted `slots − startable direct jobs` only when every slot was
+allocated on paper; otherwise `slots − allocated`. Run 19 planned 523 of
+540, so alchemy saw 17 spare while 96 were free. It now always counts
+the startable jobs; the fuel check and "drop the composite's own stuck
+job first" apply to every pool. Replayed: 540 of 540 reaction jobs start.
+
+**The bought share of a split row is an alchemy candidate.** A row that
+builds and buys (Ferrofluid: 4 jobs + 903,200 bought at 30.1k against a
+17.3k route) was only offered the swap. Each composite now offers a swap
+move (against the direct build) and a buy move (against the landed
+price), ranked together by ISK saved per net slot. Output aimed at the
+market-beaten share is `alchemy_buy_qty` and is credited there only —
+crediting it against the build shortfall too under-bought the shortfall.
+
+**Timing guard.** Purchases arrive now, alchemy output at the end of the
+cycle after a reprocess, and the install check counts only the purchase.
+A move may shrink a purchase only while it still covers this cycle's
+startable consumers' draw beyond stock — the slot backfill's rule. In
+steady state stock covers the draw and the guard is moot.
+
+**Built fuel blocks are bought just in time — direct reactions first.**
+The user asked for alchemy to buy fuel when stock ran low. Buying for
+alchemy alone let the install check share that fuel with fuel-starved
+direct reactions, so most alchemy jobs still could not start; the user
+chose to buy the shortfall for every reaction. A priced fuel block the
+chain builds is unlimited at allocation time and Phase 7 buys exactly
+draw − stock − in flight − its other buys. A blacklisted fuel block was
+already bought for every job.
+
+**Ledger: Unrealized revenue.** The header stat was unrealized profit
+(net of fees, minus cost basis, coloured). The user ruled it should be
+unrealized revenue: listed price × units for open sell orders and
+outstanding contracts, gross like Revenue, every product, plain.
+
+A pre-release review (an adversarial engine lane with ~1,850 guard runs
+and ~300 randomized plans; a docs/UI lane) found one engine defect — a
+swap handed back a whole job's fuel for a fuel-limited item, planning
+alchemy on fuel that was never freed — and eleven stale statements: the
+Settings alchemy help, run-page Alchemy savings measured against the
+direct cost for routes that replaced a purchase, a quantity popup that
+called alchemy-covered units unmet, Plan/Chain tooltips, PROJECT.md
+passages. All fixed; nine behaviour changes each proved by a mutation its
+test catches. Known gaps: the fuel buy ignores a thin fuel ladder (the
+sourcing pass flags it unsourced), and the Chain tab's capacity split on
+a split row does not see the replaced share (not persisted). 703 tests.
 
 ### v1.27.0 (2026-09-08): the Ledger tab — sales of pipeline finals from ESI, net income by venue, unrealized profit, charts, Top 10s; the ESI update pulls sales and refreshes prices — commits 2ee1aa7, 04b699a
 
