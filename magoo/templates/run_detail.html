@@ -287,9 +287,9 @@
 <details class="section" open data-key="alchemy">
 <summary><h2>Alchemy <span class="muted">— {{ alchemy|length }} items,
   {{ alchemy|map(attribute='item')|list|slots }} slots</span></h2></summary>
-<p class="muted">Cheaper than the direct reaction at current landed prices
-  (venue price + courier); runs in
-  slots that would otherwise sit idle. Install the unrefined reaction jobs
+<p class="muted">Cheaper than the direct reaction, or than buying the
+  composite, at landed prices (venue price + courier); runs in reaction
+  slots no startable direct job holds. Install the unrefined reaction jobs
   below, then <b>reprocess the output</b> (expected at
   {{ (alchemy_yield * 100)|round(0)|int }}% yield — scrapmetal rules, so
   reprocessing rigs don't help).</p>
@@ -305,10 +305,10 @@
   <tr>
     <td>{{ i.name }}</td>
 {{ m.job_cells(i) }}
-    {% if a.direct_unit is not none and a.alchemy_unit is not none %}
-    {% set savings = (a.direct_unit - a.alchemy_unit) * a.expected_qty %}
-    <td class="num good" data-sort="{{ savings }}"
-        title="{{ a.direct_unit|isk }} direct vs {{ a.alchemy_unit|isk }} alchemy ISK per {{ a.composite_name }}, × {{ a.expected_qty|qty }} units = {{ savings|isk }}">
+    {% if a.benchmark_unit is not none and a.alchemy_unit is not none %}
+    {% set savings = (a.benchmark_unit - a.alchemy_unit) * a.expected_qty %}
+    <td class="num{% if savings > 0 %} good{% endif %}" data-sort="{{ savings }}"
+        title="{{ a.benchmark_unit|isk }} {{ a.benchmark_label }} vs {{ a.alchemy_unit|isk }} alchemy ISK per {{ a.composite_name }}, × {{ a.expected_qty|qty }} units = {{ savings|isk }}">
       {{ savings|isk_short }}</td>
     {% else %}<td class="num">—</td>{% endif %}
     <td class="flags">{{ m.install_badge(i) }}</td>
@@ -459,9 +459,15 @@ function openDeficit(btn) {
   if (Number(d.covered)) parts.push(
     (parts.length ? "" : "buys nothing direct — ")
     + qty(d.covered) + " come from reprocessing compressed purchases");
+  // Composite output from this cycle's alchemy jobs covers part of the
+  // deficit too (a displaced direct job, or a replaced purchase — the
+  // buy is already net of it), so it is neither "unmet" nor missing.
+  if (Number(d.alchemy)) parts.push(
+    "expects " + qty(d.alchemy) + " from the alchemy route");
   // v1.26: a capacity loser buys only what the market holds; say what
   // is left unmet rather than stop at "the plan buys N".
-  const shortfall = Number(d.deficit) - Number(d.build) - Number(d.buy) - Number(d.covered);
+  const shortfall = Number(d.deficit) - Number(d.build) - Number(d.buy)
+    - Number(d.covered) - Number(d.alchemy || 0);
   const unmetNote = (d.kind !== "final" && parts.length && shortfall > 0)
     ? " " + qty(shortfall) + " unmet: out of slots, and the market holds no more."
     : "";

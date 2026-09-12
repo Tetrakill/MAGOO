@@ -20,7 +20,7 @@ that re-imports itself after an update, full web UI restyled,
 accessibility- and audit-hardened, a Ledger tab (sales of pipeline
 finals from ESI wallet transactions, orders and contracts, netted by
 where each hull sold, cost of goods sold at each sale's own vintage,
-unrealized profit, charts, Top 10s; the ESI update pulls sales and
+unrealized revenue, charts, Top 10s; the ESI update pulls sales and
 refreshes prices in one go), an install check that verifies every
 planned job against stock on hand, in-flight output and this cycle's
 buys and rations what is short (finals by return on cost, intermediates
@@ -139,10 +139,13 @@ anywhere, iterates quickly, and owns its own data pipeline.
 10. **Alchemy (v1.4)** — When reaction slots are left over, cheaper Unrefined
     reaction routes substitute for direct composite reactions: run the
     unrefined formula, manually reprocess its output into the composite plus
-    recovered inputs. Route selection is by unit-cost comparison; a per-type
-    job cap throttles it; under a contended reaction pool it runs in the
-    slots of direct jobs stock cannot start this cycle, by the original
-    savings ranking (§7 Phase 6.5; v1.27.1, user ruling 2026-09-09).
+    recovered inputs. Route selection is by unit-cost comparison — against
+    the direct build for a swap, the landed price for units the plan buys
+    (outright, or a split row's market-beaten share); a per-type job cap
+    throttles it; it runs in the slots of direct jobs stock cannot start
+    this cycle, by the original savings ranking, and never replaces bought
+    units this cycle's consumers draw (§7 Phase 6.5; v1.27.1, user rulings
+    2026-09-09, 2026-09-11, 2026-09-12).
 
 11. **Production blacklist (v1.3)** — Per-category checkboxes plus a per-item
     "buy, don't build" list; blacklisted sub-chains are pruned at expansion.
@@ -308,15 +311,17 @@ anywhere, iterates quickly, and owns its own data pipeline.
     listings and the products table's cost-per-unit column read the
     latest executed run; estimated profit = net − units × cost, margin = profit ÷
     cost. The page: the header strip (user ruling 2026-09-08) — **Revenue ·
-    Cost of goods sold · Net income · Margin · Unrealized profit · Units
+    Cost of goods sold · Net income · Margin · Unrealized revenue · Units
     sold · Contracts closed** plus the *N without cost basis* / *K
     contracts not priced* badges, where net income = net proceeds − cost
     of goods sold over the products with a basis, margin = net income ÷
-    cost of goods sold, and **unrealized profit** = what the open sell
+    cost of goods sold, and **unrealized revenue** = what the open sell
     orders (units remaining at the listed price) and outstanding
-    item-exchange contracts (at their price) would bank after the
-    estimated fees of their venue, minus their cost basis — hangar stock
-    excluded, not bound by the window (`ledger.unrealized`); three
+    item-exchange contracts (at their attributed price) are listed for —
+    gross like Revenue: no fees, no cost basis, every product; a plain
+    figure, never coloured (user ruling 2026-09-12, unrealized profit
+    before) — hangar stock excluded, not bound by the window
+    (`ledger.unrealized`); three
     server-rendered SVG charts (revenue & net income per bucket, units
     sold market-over-contract, cumulative net income), Top 10 by margin /
     quantity / net income, the
@@ -1650,13 +1655,14 @@ flagged `capacity_limited` rather than producing a fictional purchase order.
 **Stock-aware backfill (v1.27.1, user ruling 2026-09-09).** A job stock
 cannot feed this cycle holds no slot in practice. After the MILP, the
 install check's rationing core (`_ration`, §7 Phase 7.6) runs at
-ALLOCATION-time availability (`_allocation_availability`): raws and
-market-beaten intermediates unlimited (Phase 7 buys them just in time),
+ALLOCATION-time availability (`_allocation_availability`): raws,
+market-beaten intermediates and priced built fuel blocks unlimited
+(Phase 7 buys them just in time; fuel since 2026-09-12),
 every other buildable at stock on hand + in-flight output + the units
 the market already beat (`market_buy_qty`) + the fallback buy its
 uncovered need will get in Phase 7 (`_fallback_buy_of`: the need its
 allocated jobs — sized as Phase 7 will size them, `_sized_runs` — and
-its alchemy output leave, capped at the dearer rungs — a capacity
+the alchemy output not credited to its market-beaten share leave, capped at the dearer rungs — a capacity
 loser's units are bought, so they ARE there for its consumers). Per pool, the slots of the allocated jobs
 that cannot start are `freed`, and go — finals first, then unpriced
 contenders, then priced ones by savings per job — to the contenders
@@ -1692,23 +1698,48 @@ pool has slots that no STARTABLE direct job holds (v1.27.1, user ruling
 2026-09-09: `spare = slots − startable direct jobs`, the same
 allocation-time rationing Phase 6's backfill uses). Direct reactions are
 ~10× more slot-efficient, so alchemy never takes a slot a startable
-direct job holds: under a contended pool (every slot allocated on
-paper) the free slots are the unstartable direct jobs' — of any item —
-and each swap drops the composite's own unstartable direct job where it
-has one (it held no slot, so the alchemy jobs cost their full count) or
-else a startable one (its slot is reused, `jobs − 1` net, its inputs
-back in the pot); the alchemy jobs must themselves be startable — their
-fuel block is checked against the leftover stock; only inputs that are
-plan rows are tested, since goo no direct formula demands is not a plan
-row until the pass adds it and is bought just in time (review
-2026-09-10). With slots genuinely spare the v1.4 rule is
-unchanged (a swap nets `jobs − 1` slots, no startability test). Ranking
-is by savings as ever (user: alchemy "follows the original rules").
+direct job holds: the free slots are the pool less the startable direct
+jobs — the unstartable jobs' slots, of any item, included — and each
+swap drops the composite's own unstartable direct job where it has one
+(it held no slot, so the alchemy jobs cost their full count) or else a
+startable one (its slot is reused, `jobs − 1` net, its inputs back in
+the pot); the alchemy jobs must themselves be startable — their fuel
+block is checked against the leftover stock (a priced fuel block is
+never short: a built one's shortfall is bought just in time, Phase 7,
+2026-09-12, and a blacklisted one is a raw); only inputs that are plan
+rows are tested, since goo no direct formula demands is not a plan row
+until the pass adds it and is bought just in time (review 2026-09-10).
+Ranking is by savings as ever (user: alchemy "follows the original
+rules"). Until 2026-09-12 this applied only to a pool full on paper; a
+pool even a few jobs short of full counted `slots − allocated` with no
+startability test, which hid every unstartable job's slot (run 19: 523
+of 540 planned, 444 startable — the pass saw 17 spare, 96 were free,
+and 79 reaction slots stood idle while cheaper routes were turned away).
+
+**Replacing a purchase** (user rulings 2026-09-11 and 2026-09-12). Beside
+the swap, alchemy may supply units the plan BUYS, judged against the
+landed market price instead of the direct build: a composite bought
+outright (its whole uncovered need), and the market-beaten share
+(`market_buy_qty`) of a split row that also builds — Ferrofluid in run
+19 built 4 jobs and bought 903,200 at 30.1k against a 17.3k route, and
+the share never reached the pass while the row held jobs. Both moves
+compete in one ranking (ISK saved on the units supplied, per net slot);
+a buy move frees no slot, so its jobs cost their full count, and it
+takes partial bites. Output aimed at the market-beaten share is
+`alchemy_buy_qty` and is credited against that purchase only — Phase 7's
+build shortfall and `_fallback_buy_of` subtract the rest of the output,
+never both. **Timing guard:** a purchase arrives now, alchemy output at
+the end of the cycle after a reprocess, and the install check counts the
+purchase but never the output — so a move may shrink an item's purchase
+only while it still covers what this cycle's startable consumers draw
+beyond stock (on hand + in flight); the slot backfill's rule for replaced
+buys. In steady state stock covers the draw and the whole purchase is
+replaceable; the guard binds while stockpiles fill.
 
 Routes are derived from data, no hardcoded pairs: a reaction formula whose
 product's reprocess outputs contain another reaction formula's product is
 an alchemy route for that composite (17 exist). For each routed composite
-that won direct jobs:
+that holds direct jobs, buys a market-beaten share, or is bought outright:
 
 ```
 direct_unit  = (Σ inputs @ landed + install) / 200
@@ -1734,9 +1765,11 @@ many alchemy jobs cover the RESIDUAL deficit that job was covering
 last direct job of an item is mostly overshoot, so the first swap is cheap
 — often one alchemy job at zero net slot cost; wholesale replacement only
 happens when spare slots and `max_alchemy_jobs_per_type` genuinely allow
-it. Swaps are ranked by ISK saved on the needed units per spare slot
-consumed. Coverage never drops below the deficit, and displaced direct
-jobs are not a capacity shortfall (Phase 7 credits `alchemy_output_qty`).
+it. Moves are ranked by ISK saved on the units their jobs supply per net
+slot consumed. Coverage never drops below the deficit, and displaced direct
+jobs are not a capacity shortfall (Phase 7 credits `alchemy_output_qty −
+alchemy_buy_qty` against the build shortfall, `alchemy_buy_qty` against
+the market-beaten purchase).
 
 Alchemy jobs are ordinary reaction installs of the unrefined formula: they
 saturate the cycle window, occupy reaction slots, and their inputs join the
@@ -1766,6 +1799,7 @@ recommended_build_qty  = runs_allocated × portion_size
 | Capitals, Freighters, Jump Freighters | Exact quantities — never batch-rounded (`EXACT_QTY_SHIP_GROUPS`). |
 | Reactions | A slot allocated to a reaction runs `max_runs_per_job` — the full cycle window — even if that overshoots the deficit. **Exception (v1.3):** Hybrid Polymers (974) and Molecular-Forged Materials (4096) size to the deficit like manufactured items (`NON_SATURATING_REACTION_GROUPS`). |
 | Composite reaction inputs | Carry the extra runs buffer (applied in Phase 4; largely superseded for raws by just-in-time purchasing). |
+| Built fuel blocks (2026-09-12) | A fuel block the chain BUILDS (not blacklisted) and a market prices buys the shortfall of this cycle's draw just in time: `allocated jobs' draw − on hand − in flight − what the row already buys` (no purchase margin, so a stockpile at target buys nothing), on top of its build (`_fuel_block_bought`, `config.FUEL_BLOCK_GROUPS`). Its own jobs deliver next cycle, and a reaction without fuel cannot start — direct reactions and alchemy alike. At allocation time its supply is therefore unlimited, like a raw's, so fuel never idles a slot. The build still refills the stockpile, so a cycle that bought a shortfall ends that much above target and the next cycle's deficit nets it off. An unpriced fuel block stays stock-limited. |
 
 `low_stock` is set by projecting stock forward — current + allocated
 replenishment − consumption by *allocated* downstream builds — and testing
@@ -3583,7 +3617,7 @@ user's Windows machine against the live database.
 | Plan drift | ESI is the ledger, plan is advisory | Reconcile after the fact |
 | Aggregate ISK/hr reporting | Deferred | Data model supports it when wanted |
 | Rig applicability source | `industryModifierSources` + `industryTargetFilters` (2026-08-15) | canFitShipGroup lists structures a rig fits, not products it bonuses; CCP now ships applicability as data |
-| Alchemy semantics (v1.4) | Substitute, never add: spare reaction slots only, residual-coverage swaps, gate = direct build cost | Alchemy is a price play (~10× less slot-efficient); output stays sized to the deficit; buy-vs-build remains the MILP's job |
+| Alchemy semantics (v1.4) | Substitute, never add: spare reaction slots only, residual-coverage swaps, gate = direct build cost (extended 2026-09-11/12: buy moves replace purchases against the landed price; spare = slots − startable direct jobs) | Alchemy is a price play (~10× less slot-efficient); output stays sized to the deficit; buy-vs-build remains the MILP's job |
 | Alchemy scope (v1.4) | 17 composite routes, data-derived; mineral alchemy excluded | Mineral routes have randomized reprocess outputs (unplannable) and no direct reaction to compare against |
 | Alchemy yield (v1.4) | Single user-asserted fraction, default 0.55 | Scrapmetal rules: flat, capped at 55%, rigs never apply; fold reprocessing tax in |
 | Unrefined stock (v1.4) | Credits as in-progress (composite + recovered) at the yield | A manual reprocess stands between unrefined items and usable stock; ESI replaces the credit with reality |
@@ -3710,6 +3744,7 @@ user's Windows machine against the live database.
 | Windows calendar-aligned UTC (v1.27.0) | `until = today`, `since = until − (N − 1)` days, filter `date >= since 00:00:00Z`; buckets 1 / 7 / 30 days by span (≤ 31 / ≤ 182 / else — amends the brief's weekly-for-all: a 3-year `all` at weekly is 156 bars) | Filter, axis and bucket count must agree; today's sales must land on the last bar |
 | Ledger charts: server-rendered SVG (v1.27.0) | `charts.py` computes geometry, `_chart.html` draws with tone classes only (accent primary, good / bad by sign, dim secondary — never amber), viewBox 380 × 180 in an auto-fit grid, native `<title>` tooltips, no library, no JS, no motion | Offline desktop app, the Token Purity Rule, and tests that assert on the rendered HTML |
 | Ledger header vocabulary (2026-09-08) | Revenue · Cost of goods sold · Net income · Margin · Unrealized profit · Units sold · Contracts closed; "net income" is the page's word for net proceeds minus cost of goods sold (tables, charts, Top 10 alike); unrealized profit counts ONLY open sell orders and outstanding contracts at their listed prices, never hangar stock | User ruling: accounting vocabulary in the header; unrealized profit is what is on the market and not yet closed |
+| Unrealized revenue, not profit (user ruling 2026-09-12) | The header stat reads **Unrealized revenue**: open sell orders' units remaining × listed price plus outstanding item-exchange contracts at their attributed price, gross — no fees, no cost basis, every product listed — and it is never coloured good/bad. Supersedes the 2026-09-08 row's "Unrealized profit" | The user found the profit figure wrong for the header: what is listed is revenue not yet banked, and it sits beside Revenue, which is gross; a listing's cost basis and fees belong to the sale when it happens |
 | Structure book keeps every final's sell quote (2026-09-08) | `prices_refresh` adds every pipeline final (active or not, sub-caps included) to the structure pull's wanted set beside the capital finals and the inputs, whenever the book is pulled at all (structure buying on, or a capital final in an active pipeline — the gate is unchanged); Planning still quotes sub-caps from Jita | The Ledger judges an open order against the book it sits in, and most of the user's sub-capital orders sit at C-J6 — the book was already downloaded whole, only the rows were being discarded |
 | ESI update refreshes prices too (2026-09-08) | `POST /esi/refresh` = snapshot → sales pull → the price refresh (`_refresh_prices_now`, the body ⟳ Refresh prices shares), each step guarded on its own — a price failure leaves the cache unchanged and says so in the flash; ESI down skips it | User request: one button; the Ledger's undercut verdicts and contract splits read the price cache |
 | Ledger nav position (v1.27.0) | Dashboard · Pipelines · Planning · Invention · Index Runs · **Ledger** · ESI · Settings | Define → plan → run → sell, then the configuration pair |
@@ -3725,14 +3760,14 @@ user's Windows machine against the live database.
 | Install packing mirrors Phase 7's sizing rule (v1.27.1, user rulings 2026-09-09) | An intermediate installs uniform jobs — `jobs = ceil(runs / plan per job)`, every job `ceil(runs / jobs)` long, rounded UP when the inputs allow, else the largest uniform count that fits; an exact-quantity ship or a saturating reaction installs full jobs at the plan's runs per job plus one remainder job, whole-copy rounding set aside; the draw is judged at that packing; `install_per_job` persists the count | The user: "last job remainders are only needed on ships; intermediates are all the job count with the remainder rounded up" — the same convention the plan itself sizes them with, and "round up when stock allows" chosen over a remainder job for the case where the round-up outruns the stock (at most jobs − 1 installable runs wait a cycle) |
 | Slots of unstartable jobs are backfilled (user ruling 2026-09-09) | Phase 6: the install rationing at allocation-time availability says which allocated jobs stock cannot start; their slots go, in savings order (finals, unpriced, then savings per job), to contenders the pool starved for as many extra jobs as the leftover stock feeds; the starved jobs stay in the plan, so planned jobs may exceed the pool while startable jobs never do | The user, shown 474 startable of 540 reaction slots on run 20: "then there are free slots that can be filled" — chose backfilling over re-solving the MILP without the unstartable jobs (which would drop them from the plan and unsize their suppliers) |
 | A loser's fallback buy is available at allocation time (v1.27.1) | `_allocation_availability` adds `_fallback_buy_of` (the Phase 7 sizing: uncovered need capped at the dearer rungs) to a priced non-final buildable's availability; the backfill may only convert the part of that buy no startable consumer draws | Without it composites over bought simple reactions read unstartable at allocation time, got backfilled around, and then started at the final check on top of the backfill — startable jobs over the pool; with it, and without the guard, a lower-savings loser's extra jobs ate the buy its higher-savings consumers were counted on |
-| Alchemy in the slots of unstartable direct jobs (user ruling 2026-09-09) | Phase 6.5's spare = slots − STARTABLE direct jobs; under a contended pool a swap drops the composite's own unstartable direct job where it has one (the alchemy jobs cost their full count) else a startable one (`jobs − 1` net, its inputs returned), and the alchemy jobs' fuel block must fit the leftover stock; the uncontended v1.4 rule and the savings ranking are unchanged. A first cut allowed only composites with unstartable jobs — on the user's data the free slots were other items' and every routed composite could start, so no alchemy ran | The user asked whether the freed slots would "allow alchemy to be reactivated", and that it "follows the original rules by ranking most savings and running those first" |
+| Alchemy in the slots of unstartable direct jobs (user ruling 2026-09-09; the contended/uncontended split superseded 2026-09-12 — below) | Phase 6.5's spare = slots − STARTABLE direct jobs; under a contended pool a swap drops the composite's own unstartable direct job where it has one (the alchemy jobs cost their full count) else a startable one (`jobs − 1` net, its inputs returned), and the alchemy jobs' fuel block must fit the leftover stock; the uncontended v1.4 rule and the savings ranking are unchanged. A first cut allowed only composites with unstartable jobs — on the user's data the free slots were other items' and every routed composite could start, so no alchemy ran | The user asked whether the freed slots would "allow alchemy to be reactivated", and that it "follows the original rules by ranking most savings and running those first" |
 | Startable jobs capped at the pool (v1.27.1) | Phase 7.6 trims a pool's startable jobs down to it — backfilled jobs first, lowest savings next, finals last — and stamps `install_limited_by = −1` | The plan may list more jobs than the pool after the backfill, and a job can become startable only after Phase 7 sizes a buy; the run page must never tell the user to start more jobs than the pool holds |
 | Cost vintages pass over unpriced runs; COGS is all-or-nothing (review 2026-09-09) | `CostVintages.at` skips a run whose hull cost totals 0 (planned before any price pull) for the priced run before it, pre-history for the earliest priced run; `Product.cost_of_units` is the vintage COGS only when EVERY priced unit sold got one, else None; the products row badges `latest unpriced` when the current basis prices nothing but the sales are costed; `_basis_for`'s plain-map branch dropped | Opus review: a zero-total vintage silently dropped units from COGS while their net stayed in — profit overstated, header and products disagreeing with the sales rows and charts; and `cost_of_units` gated on the CURRENT basis, throwing away vintage costs when the latest run was unpriced |
 | Sale vintages by execution time (review 2026-09-09) | `at()` ranks eligible runs by `completed_at`, then run number, tie → lowest pipeline id (pre-history the same order ascending); `latest()` keeps the run-number rule for the products table and the unsold listings | "The run executed at the time of sale" is a time-ordered question; the production database holds a legacy out-of-order execution (run 37 after 38) |
 | Pro-rata hull shares round up (review 2026-09-09) | `costing.hull_cost`: a pipeline's share of the hulls started is `ceil(started × planned / whole)`, capped at the plan | `round()` turned 1 of 2 into 0 — a started hull read as none and the Profit tab badged `short` |
 | Backfill sizes its extra jobs as Phase 7 will (review 2026-09-10) | `feedable` draws the extra jobs at `_sized_runs` — Phase 7's rule: saturating reactions at full windows, finals and exact-quantity ships at the runs still needed, everything else re-split uniform and rounded up across all the row's jobs — over the allocation-time model the rationing charged; `_fallback_buy_of` covers need at the same sizing | A Capital Drone Bay at 4 jobs of 9 runs with 37 needed was backfilled a fifth job as ONE run while Phase 7 re-split it to 5 × 8 = 40: the real extra draw was 4× what the fit test and the leftover bookkeeping assumed |
 | Steady-state planner never backfills (review 2026-09-10) | `plan_steady_state` passes `backfill=False` through `plan_index_run` to `_allocate_slots` | The Slot Planner's what-if had 11 manufacturing jobs against a 10-slot pool — a what-if has no stock to backfill from and must allocate within the pool it was given |
-| Route-only goo never gates contended alchemy (review 2026-09-10) | The startability test of the alchemy jobs covers only inputs that are plan rows (the fuel block, goo the chain already buys); goo no direct formula demands is added after the swaps and bought just in time | The gate read such goo through `_allocation_availability`, which returns on-hand for a type absent from the plan — 0 — so Solerium and every other route needing Scandium or Titanium was rejected however cheap, purely by an availability-lookup artifact |
+| Route-only goo never gates alchemy (review 2026-09-10) | The startability test of the alchemy jobs covers only inputs that are plan rows (the fuel block, goo the chain already buys); goo no direct formula demands is added after the swaps and bought just in time | The gate read such goo through `_allocation_availability`, which returns on-hand for a type absent from the plan — 0 — so Solerium and every other route needing Scandium or Titanium was rejected however cheap, purely by an availability-lookup artifact |
 | Runs persist the pools they were planned against (schema 11, review 2026-09-10) | `index_run.manufacturing_slots_available` / `reaction_slots_available` = `snapshot.slots_available` at plan time (settings less multi-cycle overhang); the strip measures the plan against them, older runs against the settings' pools; a slot-trimmed row badges `no slot` and the strip's panel pointer appears only when an input is short | With 480 multi-cycle jobs running past the next run the engine planned 21 jobs against a 20-slot pool while the page measured them against "/ 500" and never said the plan exceeded the pool |
 | Profit-tab hull counts measured on the BUILD (review 2026-09-10) | `costing.hull_cost`: `hulls_planned` and `hulls_per_cycle` are both this pipeline's share of what the plan BUILDS (`runs_allocated × portion`, and `install_runs × portion` for the started figure), pro rata to the cycle demand and capped at `qty_attributable`, which stays the per-hull divisor alone; `install_runs` NULL falls back to the build, so a final holding no jobs reads 0 planned and 0 started | `qty_attributable` is the DEMAND attribution, so publishing it as the plan's count badged every slot-limited run `short on stock` although the check cut nothing, and — because NULL means both "planned before the check" and "no jobs on this row" — a final the allocator could not seat reported a whole cycle started, adding its cost and profit to the cycle totals |
 | Alchemy never overwrites a demanded row (review 2026-09-10) | `_alchemy_pass` skips a route whose unrefined product is already a plan row | The pass ends by assigning `merged[unrefined_id]`, and the feedback loop then deletes that row each pass as an alchemy row: a pipeline selling one of the 17 unrefined products lost its request, cycle need and attribution silently, with no unmet flag and no cost basis |
@@ -3743,6 +3778,9 @@ user's Windows machine against the live database.
 | Alchemy is trimmed before direct jobs when a pool overflows (user ruling 2026-09-10) | The cap's order is backfilled jobs, then unpriced (every alchemy install), then priced by savings, finals last | Confirmed by the user when the review questioned it: alchemy is the opportunistic route, so it yields its slot first |
 | One refresh control on the dashboard (user ruling 2026-09-11) | The dashboard's ⟳ Refresh prices button is removed; ⟳ Update from ESI is the only refresh there, and it already pulls prices as its third step. `POST /prices/refresh` and the Planning profit view's button stay | Two near-identical refresh controls side by side made the user choose between them for no gain. Prices-only belongs on the screen whose numbers move with quotes. Cost: the first-run flow needs a second (slower) ESI update after adding pipelines, since the first one ran before there was anything to price — README step 5 says so |
 | Alchemy competes with the BUY price (user ruling 2026-09-11) | A routed composite the plan means to BUY is now an alchemy candidate, judged against its LANDED market price instead of a direct build it already lost; savings feed the same ranking. It frees no slot of its own, so its jobs cost their full count; its residual is the whole purchase, so it may take a partial bite where the per-type cap or the spare slots bind (a direct swap stays all-or-nothing). `alchemy_buy_qty` keeps the purchase credit apart from the build-shortfall credit so the same output is never counted twice | The 2026-09-07 audit found buy verdicts ignoring the cheaper alchemy route and no fix was made. On the author's line Ferrofluid was bought at 29,950 landed while its route costs 17,353 |
+| Alchemy's free slots never depend on the pool being full on paper (user ruling 2026-09-12) | `spare = slots − startable direct jobs` always; the startability test for the alchemy jobs (fuel on hand) and "drop an unstartable direct job first" apply to every pool | The v1.27.1 rule branched on `allocated ≥ slots`: run 19 planned 523 of 540 with 79 unstartable, counted 17 spare, and left 79 reaction slots idle. Where every direct job can start the two counts agree; the one change there is that an alchemy job must be startable (fuel on hand or bought), as a direct reaction must |
+| A built fuel block's shortfall is bought just in time — direct reactions first (user ruling 2026-09-12) | A priced fuel block the chain builds buys `this cycle's draw − stock − in flight − its other buys` (no margin); at allocation time its supply is unlimited. Chosen over earmarking bought fuel for alchemy only | The user asked for alchemy to buy fuel when stock runs low. Buying for alchemy alone let the install check share that fuel with fuel-starved direct reactions (the proportional rationing), so most alchemy jobs could not start; earmarking it would buy fuel for the ~10× less slot-efficient jobs while direct ones idled. With the whole shortfall bought, direct reactions take their fuel and alchemy runs in the slots still free. A blacklisted fuel block (the user's setup) was already bought for every job |
+| Alchemy may replace the market-beaten share of a split row, never this cycle's draw (user ruling 2026-09-12) | A row that builds AND buys offers its `market_buy_qty` as a buy move beside the swap, against the landed price; any move (swap or buy) may shrink the purchase only while it covers this cycle's startable consumers' draw beyond stock; `alchemy_buy_qty` is credited against that share only | The share never reached the pass while the row held jobs (run 19: Ferrofluid 903,200 bought at 30.1k vs a 17.3k route). Output lands at cycle end and the install check never counts it, so replacing units consumers draw now would idle their slots; crediting the share's output against the build shortfall too under-bought the shortfall |
 | Alchemy ranks on the units its jobs SUPPLY (2026-09-11) | The score is `savings_per_unit × min(residual, jobs × out_per_job) ÷ net slots` | A clamped buy replacement credited its whole residual while covering part of it, so it out-ranked honest candidates: Ferrofluid seized 20 slots for a claimed 2.67B and crowded out a better route; scored honestly it takes 4 for 0.55B and a second route wins slots |
 | Job tables show the jobs to run now (user ruling 2026-09-09) | Runs/job ("· last N"), Jobs and Build qty on the Plan tab's job tables are the install figures, the plan's own in the tooltips; section stats and the Mfg / Reaction slots stats count the same jobs with "· plan N" beside them where stock feeds fewer; no separate Install now column or stat; the `short` badge and the short-on-stock panel stay | The user reads the job tables as the worksheet of what to install; a second column made them compare two numbers per row |
 

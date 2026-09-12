@@ -1306,7 +1306,10 @@ def test_totals_strip_reconciles(conn, ref, monkeypatch):
     assert t.contracts == 2 and t.unpriced_contracts == 1  # one mixed contract, two finals inside
 
 
-def test_unrealized_profit_counts_open_orders_and_outstanding_contracts_only(conn, ref, monkeypatch):
+def test_unrealized_revenue_counts_open_orders_and_outstanding_contracts_only(conn, ref, monkeypatch):
+    """User ruling 2026-09-12: unrealized REVENUE, gross like the header's
+    Revenue — listed price × units, no fees, no cost basis, every product
+    (the Mackinaw with no executed run counts too)."""
     add_owner(conn, A)
     pid = add_pipeline(conn)
     add_pipeline(conn, MACKINAW)                       # no executed run: no basis
@@ -1331,7 +1334,7 @@ def test_unrealized_profit_counts_open_orders_and_outstanding_contracts_only(con
 
     order_row(1, HULK, 320e6, 5, 3, "open", STATION)          # 3 hulls listed at Jita
     order_row(2, HULK, 305e6, 2, 0, "expired", STATION)       # closed: not unrealized
-    order_row(3, MACKINAW, 150e6, 1, 1, "open", STATION)      # no basis: left out
+    order_row(3, MACKINAW, 150e6, 1, 1, "open", STATION)      # no basis: counted all the same
     conn.commit()
     seed_contract(conn, 4, [citem(1, HULK, 2, singleton=False)], price=700e6, status="outstanding",
                   date_completed=None)
@@ -1341,18 +1344,16 @@ def test_unrealized_profit_counts_open_orders_and_outstanding_contracts_only(con
     conn.commit()
     v = view(conn, ref)
     u = v["unrealized"]
-    hub = costing.net_proceeds_at_venue(320e6, m3, settings, "hub") * 3
-    structure = costing.net_proceeds_at_venue(350e6, m3, settings, "structure") * 2
-    assert u.units == 5 and u.orders == 2 and u.contracts == 2
-    assert u.value == pytest.approx(hub + structure)
-    assert u.cost == pytest.approx(5 * 200e6)
-    assert u.profit == pytest.approx(hub + structure - 1e9)
-    assert u.units_unpriced == 2   # the Mackinaw order + the mixed contract's hull
+    # Gross: 3 Hulks at 320M + 1 Mackinaw at 150M + 2 Hulks in a 700M contract.
+    assert u.units == 6 and u.orders == 2 and u.contracts == 2
+    assert u.revenue == pytest.approx(3 * 320e6 + 150e6 + 700e6)
+    assert u.revenue > 3 * costing.net_proceeds_at_venue(320e6, m3, settings, "hub")  # before fees
+    assert u.units_unpriced == 1   # the mixed contract's hull: no attributable price
     assert v["totals"].contracts == 1 and v["totals"].contracts_open == 2
     # Nothing listed: no figure, not zero.
     conn.execute("DELETE FROM sale_order"); conn.execute("DELETE FROM sale_contract_item"); conn.execute("DELETE FROM sale_contract")
     conn.commit()
-    assert view(conn, ref)["unrealized"].profit is None
+    assert view(conn, ref)["unrealized"].revenue is None
 
 
 def test_window_calendar_aligned_and_buckets_agree(conn, ref, monkeypatch):

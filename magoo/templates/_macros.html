@@ -67,6 +67,7 @@
         data-buy="{{ i.recommended_buy_qty or 0 }}"
         data-build="{{ i.recommended_build_qty or 0 }}"
         data-covered="{{ (i.compressed_covered_qty or 0) if i.compressed_covered_qty is defined else 0 }}"
+        data-alchemy="{{ (i.alchemy_output_qty or 0) if i.alchemy_output_qty is defined else 0 }}"
         onclick="openDeficit(this)">{{ i.name }}</button></td>
 {%- endmacro %}
 
@@ -138,7 +139,7 @@
         title="the slot pool can't fit this item's full demand ({{ i.jobs_needed_unconstrained }} job(s) needed)">capacity</span>{% endif %}
         {% if execution %}{{ install_badge(i) }}{% endif %}
         {% if i.market_buy_qty is defined and i.market_buy_qty %}<span class="badge accent"
-          title="{{ i.market_buy_qty|qty }} units are cheaper on the market than building them (their sell orders land at or below the build cost{{ ' at plan time' if execution }}) and are on the Buy list; the jobs here build the rest">+buy {{ i.market_buy_qty|qty }}</span>{% endif %}
+          title="{{ i.market_buy_qty|qty }} units are cheaper on the market than building them (their sell orders land at or below the build cost{{ ' at plan time' if execution }}) and are on the Buy list, less any the alchemy route supplies instead; the jobs here build the rest">+buy {{ i.market_buy_qty|qty }}</span>{% endif %}
         {% if execution and i.low_stock %}<span class="badge warn"
           title="current stock and in-flight jobs won't sustain the next run">low stock</span>{% endif %}
         {% if execution and i.savings_unpriced_inputs %}<span class="badge warn"

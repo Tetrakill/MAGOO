@@ -265,9 +265,9 @@ class PlanItem:
     install_draw_qty: int | None = None
     install_short_qty: int | None = None
     # v1.27.1 (user ruling 2026-09-11): of `alchemy_output_qty`, the
-    # units produced to replace units the plan was going to BUY rather
-    # than to cover a build shortfall. Phase 7 credits each against its
-    # own figure, so neither is counted twice. Not persisted.
+    # units produced to replace the MARKET-BEATEN share (`market_buy_qty`)
+    # rather than to cover a build shortfall. Phase 7 credits each against
+    # its own figure, so neither is counted twice. Not persisted.
     alchemy_buy_qty: int = 0
     # v1.27.1 stock-aware backfill (Phase 6): jobs this item received
     # from slots whose allocated jobs cannot start this cycle. Not
@@ -1574,10 +1574,17 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     spare capacity and the per-type cap genuinely allow it. Total coverage
     never drops below the deficit. Direct reactions are far more
     slot-efficient, so alchemy never takes a slot a STARTABLE direct job
-    holds: under a contended pool (every slot allocated on paper) the
-    free slots are the ones direct jobs stock cannot feed this cycle, and
-    the alchemy jobs must themselves be startable (v1.27.1, user ruling
-    2026-09-09; it disabled alchemy entirely before)."""
+    holds: the free slots are the pool less the direct jobs stock can
+    feed this cycle, and the alchemy jobs must themselves be startable
+    (v1.27.1, user ruling 2026-09-09; since 2026-09-12 whether or not
+    the pool is full on paper).
+
+    Beside the swap, a composite the plan BUYS — outright, or the share
+    of a split row the market beat — may have that purchase replaced by
+    alchemy output where the route beats the landed price (user rulings
+    2026-09-11 and 2026-09-12). The output lands at the END of the
+    cycle, so only the part of the purchase no startable consumer draws
+    this cycle may be replaced."""
     settings = store.get_settings(conn)
     if (
         not settings.alchemy_enabled
@@ -1586,24 +1593,21 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     ):
         return
     slots = snapshot.slots_available.get(config.ACTIVITY_REACTION, 0)
-    allocated = sum(
-        i.jobs_allocated
-        for i in merged.values()
-        if i.activity_id == config.ACTIVITY_REACTION
-    )
-    # With spare slots on paper the pass runs as it always has (the plan
-    # is advisory; Phase 7.6 rations the alchemy jobs like any other).
-    # Under a CONTENDED pool (every slot allocated on paper) it used to
-    # stay out entirely; since v1.27.1 (user ruling 2026-09-09) the slots
-    # that count are the ones STARTABLE direct jobs hold — a direct job
-    # stock cannot feed this cycle holds no slot — so alchemy may run in
-    # the rest by the original rules, ranked by savings: a swap drops
-    # the composite's own unstartable direct job where it has one (it
-    # held no slot, so the alchemy jobs cost their full count), else a
-    # startable one (net jobs − 1, its inputs back in the pot), and the
+    finals = {p["final_product_type_id"] for p in store.active_pipelines(conn)}
+    # The slots that count are the ones STARTABLE direct jobs hold — a
+    # direct job stock cannot feed this cycle holds no slot — so alchemy
+    # runs in the rest by the original rules, ranked by savings: a swap
+    # drops the composite's own unstartable direct job where it has one
+    # (it held no slot, so the alchemy jobs cost their full count), else
+    # a startable one (net jobs − 1, its inputs back in the pot), and the
     # alchemy jobs must themselves be startable (their fuel block is in
-    # the leftover stock; the goo is bought just in time).
-    contended = allocated >= slots
+    # the leftover stock or bought just in time — _fuel_block_bought; the
+    # goo is bought just in time). v1.27.1 (user
+    # ruling 2026-09-09) applied this only to a pool full on paper and
+    # counted `slots − allocated` otherwise, so a pool a few jobs short
+    # of full hid every unstartable job's slot from the pass (run 19,
+    # 2026-09-12: 17 spare seen, 96 free, 79 reaction slots left idle).
+    # Where every direct job can start the two counts agree.
     rationing = _ration(
         conn, ref, merged, snapshot, _allocation_availability(conn, ref, merged, snapshot)
     )
@@ -1612,7 +1616,7 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         for i in merged.values()
         if i.activity_id == config.ACTIVITY_REACTION
     )
-    spare = (slots - startable_direct) if contended else (slots - allocated)
+    spare = slots - startable_direct
     if spare <= 0:
         return
     unstartable = {
@@ -1625,6 +1629,34 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
 
     def left(m: int) -> int:
         return leftover[m] if m in leftover else rationing.left(m)
+
+    # Runs of each item's startable direct jobs not yet handed back by a
+    # swap (each dropped startable job returns ITS draw, once).
+    granted_left = dict(rationing.startable_runs)
+
+    def purchase_of(item: PlanItem, jobs_delta=0, swap_out=0, buy_out=0) -> int:
+        """The units Phase 7 will buy of the item once `jobs_delta` more
+        direct jobs, `swap_out` more units of alchemy output against its
+        build shortfall and `buy_out` more against its market-beaten
+        share are in place: that share less what the route replaced, plus
+        the fallback buy for what the jobs and swap output leave."""
+        market = max(0, item.market_buy_qty - item.alchemy_buy_qty - buy_out)
+        if item.type_id in finals or snapshot.price(item.type_id) is None:
+            return market
+        return market + _fallback_buy_of(ref, finals, item, jobs_delta, swap_out)
+
+    def keeps_consumers_fed(item: PlanItem, after: int) -> bool:
+        """The purchase is there NOW; alchemy output lands at the end of
+        the cycle (and needs a reprocess). A move may shrink the purchase
+        only while it still covers what this cycle's startable consumers
+        draw beyond stock — the slot backfill's rule for replaced buys
+        (user ruling 2026-09-12). A move that does not shrink it passes."""
+        before = purchase_of(item)
+        if after >= before:
+            return True
+        t = item.type_id
+        drawn = rationing.available[t] - left(t) if t in rationing.available else 0
+        return after >= drawn - item.on_hand_qty - item.in_progress_qty
 
     yield_ = settings.alchemy_reprocess_yield
     cap = settings.max_alchemy_jobs_per_type
@@ -1725,14 +1757,28 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         )
         item.direct_unit_cost = direct_unit
         item.alchemy_unit_cost = alchemy_unit
-        # What the route has to beat: the direct build where the item
-        # holds jobs, else the LANDED market price it would otherwise be
-        # bought at (user ruling 2026-09-11 — a bought composite has no
-        # build to compare against, and comparing it to one it already
-        # lost would keep the route out for ever).
-        buys = item.jobs_allocated <= 0
-        benchmark = (landed(composite_id) or 0.0) if buys else direct_unit
-        if benchmark <= 0 or alchemy_unit >= benchmark:
+        # What the route has to beat, per way it can supply units: the
+        # direct build for a SWAP of the item's direct jobs, the LANDED
+        # market price for units the plan BUYS — a composite bought
+        # outright (user ruling 2026-09-11: it has no build to compare
+        # against) or the share of a split row the market beat (user
+        # ruling 2026-09-12: that share never reached the pass while the
+        # row held jobs).
+        outright = item.jobs_allocated <= 0
+        market = landed(composite_id) or 0.0
+        swap_saving = (
+            direct_unit - alchemy_unit
+            if not outright and direct_unit > 0 and alchemy_unit < direct_unit
+            else None
+        )
+        buy_saving = (
+            market - alchemy_unit
+            if (outright or item.market_buy_qty > 0)
+            and market > 0
+            and alchemy_unit < market
+            else None
+        )
+        if swap_saving is None and buy_saving is None:
             continue
         out_per_job = math.floor(max_runs * route.composite_qty * yield_)
         if out_per_job <= 0:
@@ -1744,10 +1790,12 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
                 "time_per_run": time_per_run,
                 "max_runs": max_runs,
                 "out_per_job": out_per_job,
-                "buys": buys,
-                "savings_per_unit": benchmark - alchemy_unit,
+                "outright": outright,
+                "swap_saving": swap_saving,
+                "buy_saving": buy_saving,
                 # A probe row for the unrefined formula's draw (its fuel
-                # block is the one input stock must hold).
+                # block is the one input stock must hold — or, where the
+                # chain builds it and a market prices it, Phase 7 buys).
                 "probe": PlanItem(
                     type_id=route.unrefined_id,
                     name=ref.type_info(route.unrefined_id).name,
@@ -1760,114 +1808,146 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
             }
         )
 
+    def fuel_need(cand, jobs: int) -> dict[int, int]:
+        # Only inputs that are plan rows gate a move (the fuel block, and
+        # goo the chain already buys); an input no direct formula demands
+        # is not in `merged` yet — the pass adds it below and Phase 7 buys
+        # it just in time (review 2026-09-10).
+        return {
+            m: q
+            for m, q in draw_of(cand["probe"], jobs * cand["max_runs"], jobs).items()
+            if m in merged
+        }
+
+    def fed(need: dict[int, int]) -> bool:
+        return all(q <= left(m) for m, q in need.items())
+
+    def swap_move(cand, jobs_so_far: int):
+        """Drop one direct job; add the alchemy jobs covering the residual
+        deficit that job was carrying. All-or-nothing: the residual is one
+        job's overshoot, and half a swap would under-cover the deficit."""
+        item = cand["item"]
+        if cand["swap_saving"] is None or item.jobs_allocated <= 0:
+            return None
+        out_d = item.max_runs_per_job * item.portion_size
+        swap_output = item.alchemy_output_qty - item.alchemy_buy_qty
+        residual = max(
+            0,
+            item.total_runs_needed * item.portion_size
+            - (item.jobs_allocated - 1) * out_d
+            - swap_output,
+        )
+        # The last direct job is mostly overshoot, so residual 0 is the
+        # CHEAP first swap and must stay (v1.4).
+        jobs = max(1, math.ceil(residual / cand["out_per_job"]))
+        # Displace the composite's direct job that cannot start where it
+        # has one (it held no slot, so the alchemy jobs cost `jobs`
+        # slots), else a startable one (its slot is reused).
+        drops_unstartable = unstartable.get(item.type_id, 0) > 0
+        net = jobs if drops_unstartable else jobs - 1
+        if jobs_so_far + jobs > cap or net > spare:
+            return None
+        produced = jobs * cand["out_per_job"]
+        if not keeps_consumers_fed(item, purchase_of(item, -1, produced)):
+            return None
+        need = fuel_need(cand, jobs)
+        if not fed(need):
+            return None
+        return {"kind": "swap", "jobs": jobs, "net": net, "residual": residual,
+                "saving": cand["swap_saving"], "need": need,
+                "drops_unstartable": drops_unstartable}
+
+    def buy_move(cand, jobs_so_far: int):
+        """Nothing to drop: the alchemy jobs supply units the plan was
+        going to buy — the market-beaten share (`market_buy_qty`), and
+        for a composite bought outright its whole uncovered need (Phase
+        7 buys that shortfall). Partial bites: the residual is a whole
+        purchase, often more than the cap, the spare slots, the fuel or
+        the part this cycle's consumers leave replaceable allow."""
+        item = cand["item"]
+        if cand["buy_saving"] is None:
+            return None
+        market_left = max(0, item.market_buy_qty - item.alchemy_buy_qty)
+        residual = market_left
+        if cand["outright"]:
+            residual += max(
+                0,
+                item.total_runs_needed * item.portion_size
+                - (item.alchemy_output_qty - item.alchemy_buy_qty),
+            )
+        if residual <= 0:
+            return None
+        out = cand["out_per_job"]
+        room = min(cap - jobs_so_far, spare, math.ceil(residual / out))
+        if room < 1:
+            return None
+
+        def ok(jobs: int) -> bool:
+            produced = jobs * out
+            to_market = min(produced, market_left)
+            after = purchase_of(item, 0, produced - to_market, to_market)
+            return keeps_consumers_fed(item, after) and fed(fuel_need(cand, jobs))
+
+        lo, hi = 0, room
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if ok(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo < 1:
+            return None
+        return {"kind": "buy", "jobs": lo, "net": lo, "residual": residual,
+                "saving": cand["buy_saving"], "need": fuel_need(cand, lo),
+                "drops_unstartable": False, "market_left": market_left}
+
     alchemy_items: dict[int, PlanItem] = {}
     while True:
         best = None
         for cand in candidates:
-            item = cand["item"]
-            buys = cand["buys"]
-            if not buys and item.jobs_allocated <= 0:
-                continue
             existing = alchemy_items.get(cand["route"].unrefined_id)
             jobs_so_far = existing.jobs_allocated if existing else 0
-            if buys:
-                # Nothing to drop: the route supplies units the plan was
-                # going to buy. A market-preferred row keeps its whole
-                # cycle need (Phase 7 buys the shortfall and already
-                # credits `alchemy_output_qty` against it); a ladder-split
-                # row carries the bought part in `market_buy_qty`.
-                needed = max(
-                    item.total_runs_needed * item.portion_size,
-                    item.market_buy_qty,
-                )
-                covered_without = item.alchemy_output_qty
-            else:
-                out_d = item.max_runs_per_job * item.portion_size
-                needed = item.total_runs_needed * item.portion_size
-                covered_without = (
-                    item.jobs_allocated - 1
-                ) * out_d + item.alchemy_output_qty
-            residual = max(0, needed - covered_without)
-            # A build candidate's last direct job is mostly overshoot, so
-            # residual 0 is the CHEAP first swap and must stay (v1.4). A
-            # buy candidate with nothing left to replace has no swap.
-            if buys and residual <= 0:
-                continue
-            jobs = max(1, math.ceil(residual / cand["out_per_job"]))
-            # Under a contended pool: displace the composite's direct job
-            # that cannot start where it has one (it held no slot, so the
-            # alchemy jobs cost `jobs` slots), else a startable one (its
-            # slot is reused), and only where the alchemy jobs can start.
-            drops_unstartable = (
-                not buys and contended and unstartable.get(item.type_id, 0) > 0
-            )
-            # A bought composite frees no slot of its own, so its alchemy
-            # jobs cost their full count whatever the pool looks like.
-            net = jobs if (buys or drops_unstartable) else jobs - 1
-            if buys:
-                # Its residual is the WHOLE purchase, so covering it often
-                # wants more than the per-type cap or the spare slots
-                # hold. Take a partial bite rather than veto the route
-                # (a direct swap stays all-or-nothing: its residual is one
-                # job's overshoot, and half a swap would under-cover the
-                # deficit the dropped job was carrying).
-                room = min(cap - jobs_so_far, spare)
-                if room < 1:
+            for move in (swap_move(cand, jobs_so_far), buy_move(cand, jobs_so_far)):
+                if move is None:
                     continue
-                jobs = min(jobs, room)
-                net = jobs
-            elif jobs_so_far + jobs > cap or net > spare:
-                continue
-            # Only inputs that are plan rows gate the swap (the fuel
-            # block, and goo the chain already buys); an input no direct
-            # formula demands is not in `merged` yet — the pass adds it
-            # below and Phase 7 buys it just in time (review 2026-09-10).
-            need = (
-                {
-                    m: q
-                    for m, q in draw_of(
-                        cand["probe"], jobs * cand["max_runs"], jobs
-                    ).items()
-                    if m in merged
-                }
-                if contended else {}
-            )
-            if any(q > left(m) for m, q in need.items()):
-                continue
-            # Rank by ISK saved on the units these jobs actually supply,
-            # per spare slot consumed. A clamped buy replacement covers
-            # only part of its residual, so crediting the whole of it
-            # would out-rank honest candidates (2026-09-11); an unclamped
-            # swap always covers its residual, so this is the old figure.
-            covered = min(residual, jobs * cand["out_per_job"])
-            score = (
-                cand["savings_per_unit"] * max(covered, 1) / max(net, 1)
-            )
-            if best is None or score > best["score"]:
-                best = {"cand": cand, "jobs": jobs, "score": score, "net": net,
-                        "buys": buys, "drops_unstartable": drops_unstartable,
-                        "need": need}
+                # Rank by ISK saved on the units these jobs actually
+                # supply, per spare slot consumed. A clamped buy
+                # replacement covers only part of its residual, so
+                # crediting the whole of it would out-rank honest
+                # candidates (2026-09-11); an unclamped swap always
+                # covers its residual, so this is the old figure.
+                covered = min(move["residual"], move["jobs"] * cand["out_per_job"])
+                score = move["saving"] * max(covered, 1) / max(move["net"], 1)
+                if best is None or score > best["score"]:
+                    best = dict(move, cand=cand, score=score)
         if best is None:
             break
         cand = best["cand"]
         item, route = cand["item"], cand["route"]
         produced = best["jobs"] * cand["out_per_job"]
-        if not best["buys"]:
+        if best["kind"] == "swap":
             item.jobs_allocated -= 1
         else:
-            # Credited against the purchase, not the build shortfall.
-            item.alchemy_buy_qty += min(produced, item.market_buy_qty)
+            # Credited against the market-beaten share first; the rest
+            # covers the build shortfall Phase 7 would buy.
+            item.alchemy_buy_qty += min(produced, best["market_left"])
         item.alchemy_output_qty += produced
         spare -= best["net"]
         if best["drops_unstartable"]:
             unstartable[item.type_id] -= 1
-        elif contended and not best["buys"]:
+        elif best["kind"] == "swap":
             # A startable direct job gave up its slot and its inputs for
-            # the cycle (a job's draw, or the shorter run count the
-            # rationing granted it).
-            granted = rationing.startable_runs.get(item.type_id, 0)
-            runs = min(item.max_runs_per_job, granted)
+            # the cycle — but only the runs its remaining jobs can no
+            # longer hold: a job the rationing cut short (a fuel-limited
+            # item granted fewer runs than its jobs carry) leaves the
+            # rest of its grant with the item's other jobs, so crediting
+            # a whole job back fed alchemy on fuel that was never freed
+            # (review 2026-09-12). Each granted run is handed back once.
+            granted = granted_left.get(item.type_id, 0)
+            keep = min(granted, item.jobs_allocated * item.max_runs_per_job)
+            runs = granted - keep
             if runs > 0:
+                granted_left[item.type_id] = keep
                 for m, q in draw_of(item, runs, 1).items():
                     leftover[m] = left(m) + q
         for m, q in best["need"].items():
@@ -2125,13 +2205,33 @@ class _Rationing:
         return self.available_of(m)
 
 
+def _fuel_block_bought(ref, item: PlanItem, snapshot: Snapshot, finals) -> bool:
+    """A BUILT fuel block with a price on record: Phase 7 buys whatever
+    this cycle's jobs draw beyond its stock (user ruling 2026-09-12 —
+    direct reactions take their fuel first, alchemy runs in the slots
+    left), so at allocation time its supply is unlimited, like a raw
+    input's. Unpriced, it stays stock-limited: nothing can be bought."""
+    if not item.buildable or item.type_id in finals:
+        return False
+    try:
+        group = ref.type_info(item.type_id).group_id
+    except KeyError:
+        return False
+    return (
+        group in config.FUEL_BLOCK_GROUPS
+        and snapshot.price(item.type_id) is not None
+    )
+
+
 def _allocation_availability(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     """available_of(type_id) at ALLOCATION time (Phases 6–6.5), before
     the buys are sized: a raw input is bought just-in-time for whatever
     is allocated (unlimited), so is an intermediate the market beats
-    outright (Phase 7 buys its whole deficit); any other buildable is
-    what is on hand and in flight plus the units the market already
-    beat (market_buy_qty). Finals are never bought."""
+    outright (Phase 7 buys its whole deficit) and a priced built fuel
+    block (Phase 7 buys its shortfall, 2026-09-12); any other buildable
+    is what is on hand and in flight plus the units the market already
+    beat (market_buy_qty) plus the fallback buy Phase 7 gives its
+    uncovered need (_fallback_buy_of). Finals are never bought."""
     finals = {p["final_product_type_id"] for p in store.active_pipelines(conn)}
 
     def available_of(m: int) -> int:
@@ -2139,6 +2239,9 @@ def _allocation_availability(conn, ref, merged: dict[int, PlanItem], snapshot: S
         if row is None:
             return snapshot.on_hand.get(m, 0) + snapshot.in_progress.get(m, 0)
         if not row.buildable:
+            return _UNLIMITED
+        if _fuel_block_bought(ref, row, snapshot, finals):
+            # Phase 7 buys a built fuel block's shortfall just in time.
             return _UNLIMITED
         if (
             m not in finals
@@ -2193,17 +2296,24 @@ def _sized_runs(ref, finals: set, item: PlanItem, jobs: int) -> int:
     return runs
 
 
-def _fallback_buy_of(ref, finals: set, row: PlanItem, extra_jobs: int = 0) -> int:
+def _fallback_buy_of(
+    ref, finals: set, row: PlanItem, extra_jobs: int = 0, extra_output: int = 0
+) -> int:
     """The units Phase 7 will buy for a priced, non-final buildable's
     uncovered need (its allocated jobs — plus `extra_jobs` more — sized
-    as Phase 7 sizes them, and its alchemy output, cover the rest),
-    capped at the rungs the market holds."""
+    as Phase 7 sizes them, and the alchemy output aimed at that need —
+    plus `extra_output` more — cover the rest), capped at the rungs the
+    market holds. Output that replaced the market-beaten share
+    (`alchemy_buy_qty`) is credited there, never here too."""
     covered = min(
         row.total_runs_needed,
         _sized_runs(ref, finals, row, row.jobs_allocated + extra_jobs),
     ) * row.portion_size
     uncovered = (
-        row.total_runs_needed * row.portion_size - covered - row.alchemy_output_qty
+        row.total_runs_needed * row.portion_size
+        - covered
+        - (row.alchemy_output_qty - row.alchemy_buy_qty)
+        - extra_output
     )
     if uncovered <= 0:
         return 0
@@ -2657,10 +2767,12 @@ def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
 
         # Composite output expected from this cycle's alchemy jobs counts
         # toward coverage — a direct job displaced by the alchemy pass is
-        # not a capacity shortfall.
+        # not a capacity shortfall. Output that replaced the market-beaten
+        # share is credited against that purchase below, not here as well
+        # (a split row can hold both, 2026-09-12).
         shortfall_qty = (
             (item.total_runs_needed - item.runs_allocated) * item.portion_size
-            - item.alchemy_output_qty
+            - (item.alchemy_output_qty - item.alchemy_buy_qty)
         )
         if shortfall_qty > 0:
             # An intermediate denied slots because the market undercuts its
@@ -2710,6 +2822,28 @@ def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     # purchase margin, net of stock. No jobs consuming it -> nothing bought.
     settings = store.get_settings(conn)
     margin_mult = 1.0 + settings.input_purchase_margin
+
+    # A BUILT fuel block short of this cycle's draw (user ruling
+    # 2026-09-12): its own jobs deliver next cycle and a reaction without
+    # fuel cannot start, so the shortfall — the allocated jobs' draw less
+    # stock, in-flight output and what the row already buys — is bought
+    # just in time, for direct reactions and alchemy alike. Exactly the
+    # shortfall, no purchase margin: a stockpile at target (steady state)
+    # buys nothing. Its jobs still refill the stockpile for next cycle.
+    for item in merged.values():
+        if not _fuel_block_bought(ref, item, snapshot, final_products):
+            continue
+        short = (
+            consumption.get(item.type_id, 0)
+            - item.on_hand_qty
+            - item.in_progress_qty
+            - item.recommended_buy_qty
+        )
+        if short > 0:
+            item.recommended_buy_qty += short
+            item.recommended_action = (
+                "both" if item.recommended_build_qty > 0 else "buy"
+            )
     for item in merged.values():
         if item.buildable:
             continue

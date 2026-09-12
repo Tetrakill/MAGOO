@@ -329,6 +329,11 @@ COMPOSITE_REACTION_GROUPS = frozenset({428, 429, 4932})
 # stockpile deficit exactly like manufactured items.
 NON_SATURATING_REACTION_GROUPS = frozenset({974, 4096})
 
+# Fuel Blocks. A BUILT fuel block short of this cycle's draw is bought just
+# in time for the shortfall (user ruling 2026-09-12): its own jobs deliver
+# next cycle, and a reaction without fuel cannot start.
+FUEL_BLOCK_GROUPS = frozenset({1136})
+
 # Production blacklist categories: (key, label, product group ids). Checked
 # categories are bought instead of built and their sub-chains disappear
 # from the plan. "t1_hulls" is special-cased: T1 ships appearing as

@@ -594,7 +594,9 @@ def test_intermediates_sharing_a_short_input_install_the_same_share(conn, ref):
     draw = engine._planned_consumption(conn, ref, empty.items)
     fuel = ref.type_id("Hydrogen Fuel Block")
     assert draw.get(fuel, 0) > 0
-    snap = rich_snapshot(ref)
+    # Unpriced, so the fuel block stays stock-limited: a PRICED built
+    # fuel block buys its shortfall just in time (2026-09-12).
+    snap = rich_snapshot(ref, overrides={fuel: None})
     snap.on_hand[fuel] = draw[fuel] // 2
     plan = engine.plan_index_run(conn, ref, snap, persist=False)
     bound = [i for i in _consumers(plan) if i.install_limited_by == fuel]
@@ -635,7 +637,9 @@ def test_short_reactions_pack_full_jobs_plus_a_remainder_job(conn, ref):
     empty = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
     draw = engine._planned_consumption(conn, ref, empty.items)
     fuel = ref.type_id("Hydrogen Fuel Block")
-    snap = rich_snapshot(ref)
+    # Unpriced, so the fuel block stays stock-limited: a PRICED built
+    # fuel block buys its shortfall just in time (2026-09-12).
+    snap = rich_snapshot(ref, overrides={fuel: None})
     snap.on_hand[fuel] = draw[fuel] // 2
     plan = engine.plan_index_run(conn, ref, snap, persist=False)
     cut = [i for i in _consumers(plan) if 0 < i.install_runs < i.runs_allocated]
@@ -745,7 +749,9 @@ def test_a_consumer_bound_elsewhere_leaves_its_share_to_its_siblings(conn, ref):
     empty = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
     draw = engine._planned_consumption(conn, ref, empty.items)
     fuel = ref.type_id("Hydrogen Fuel Block")
-    snap = rich_snapshot(ref)
+    # Unpriced, so the fuel block stays stock-limited: a PRICED built
+    # fuel block buys its shortfall just in time (2026-09-12).
+    snap = rich_snapshot(ref, overrides={fuel: None})
     # Half the fuel; every other built input stays empty, so the
     # composite reactions (fuel + simple reaction products) are bound by
     # their empty products, not the fuel.

@@ -90,10 +90,14 @@
     <summary>How alchemy is planned</summary>
     <p>Some composites can be made two ways: the direct reaction, or an
     "unrefined" reaction whose output you reprocess yourself to get the
-    composite plus some of the inputs back. When reaction slots would
-    otherwise sit idle, the plan uses the unrefined route wherever it works
-    out cheaper. When every reaction slot is needed, alchemy is switched
-    off, because a direct reaction makes far more per slot.</p>
+    composite plus some of the inputs back. A direct reaction makes far
+    more per slot, so alchemy only uses reaction slots no direct job can
+    use this cycle — free slots, and the slots of jobs your stock can't
+    start yet. In those slots the plan uses the unrefined route wherever
+    it works out cheaper than the direct reaction, or than buying a
+    composite the plan would otherwise purchase — never units your jobs
+    need this cycle, because reprocessed output arrives at the end of
+    it.</p>
   </details>
   <div class="fields">
     <label for="alchemy_enabled">Enable Alchemy <small>Use unrefined reactions when reaction slots would otherwise sit idle.</small></label>

@@ -143,9 +143,13 @@ def test_ledger_page_seeded_sales_render(seeded_client, monkeypatch):
     assert ">filled</span>" in html                   # order history outcome
     assert ">partial</span>" in html                  # the open order has sold 1 of 3
     assert ">undercut</span>" in html                 # listed far above the seeded Hulk quote
-    for label in ("Revenue", "Cost of goods sold", "Net income", "Margin", "Unrealized profit",
+    for label in ("Revenue", "Cost of goods sold", "Net income", "Margin", "Unrealized revenue",
                   "Units sold", "Contracts closed"):
         assert f'<span class="label">{label}</span>' in html, label
+    # Unrealized revenue is a plain figure: no good/bad colouring (2026-09-12).
+    stat = html.split('<span class="label">Unrealized revenue</span>', 1)[1]
+    assert stat.lstrip().startswith('<span class="value"\n') or stat.lstrip().startswith('<span class="value" ')
+    assert "Unrealized profit" not in html
     assert "Net income (est.)" in html and "Net income / unit" in html
     assert "Est. profit" not in html and "estimated profit" not in html
     assert "sales pulled" in html and "1 owner" in html

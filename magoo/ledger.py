@@ -1803,34 +1803,34 @@ def totals(products_list, sales, contracts_open: int) -> Totals:
     return t
 
 
-# -- unrealized profit ------------------------------------------------------
+# -- unrealized revenue -----------------------------------------------------
 
 
 @dataclass
 class Unrealized:
     """Hulls on the market but not yet sold: open sell orders (units
     remaining at the listed price) and outstanding item-exchange contracts
-    (at their price), after the estimated fees of that venue, minus the
-    cost basis. Hangar stock is NOT included (user ruling 2026-09-08). A
-    point-in-time figure: it ignores the window."""
-    value: float = 0.0        # net proceeds if every listing sells as listed
-    cost: float = 0.0         # units × cost basis, priced units with a basis
-    units: int = 0            # units counted in value and cost
-    units_unpriced: int = 0   # units left out: no cost basis or no attributable price
+    (at their attributed price) — gross, like the header's Revenue: no
+    fees and no cost basis taken off, every product counted (user ruling
+    2026-09-12; it was unrealized PROFIT before). Hangar stock is NOT
+    included (user ruling 2026-09-08). A point-in-time figure: it ignores
+    the window."""
+    value: float = 0.0        # listed price × units, every listing with a price
+    units: int = 0            # units counted in value
+    units_unpriced: int = 0   # contract units left out: no attributable price
     orders: int = 0
     contracts: int = 0
 
     @property
-    def profit(self):
-        return self.value - self.cost if self.units else None
+    def revenue(self):
+        return self.value if self.units else None
 
 
-def unrealized(conn, ref, settings, finals_map, bases, quotes, enabled) -> Unrealized:
+def unrealized(conn, finals_map, quotes, enabled) -> Unrealized:
     final_ids = set(finals_map)
     u = Unrealized()
     if not final_ids:
         return u
-    unit_costs = {t: b.unit_cost for t, b in bases.items()}
     ph = _placeholders(final_ids)
     for o in conn.execute(
         f"SELECT * FROM sale_order WHERE state = 'open' AND type_id IN ({ph})",
@@ -1839,13 +1839,7 @@ def unrealized(conn, ref, settings, finals_map, bases, quotes, enabled) -> Unrea
         if (o["owner_kind"], o["owner_id"]) not in enabled or o["volume_remain"] <= 0:
             continue
         u.orders += 1
-        uc = unit_costs.get(o["type_id"])
-        if uc is None:
-            u.units_unpriced += o["volume_remain"]
-            continue
-        u.value += _net_for(ref, settings, o["type_id"], o["price"], o["volume_remain"],
-                            o["location_id"])
-        u.cost += o["volume_remain"] * uc
+        u.value += o["price"] * o["volume_remain"]
         u.units += o["volume_remain"]
     for c in conn.execute(
         f"SELECT c.* FROM sale_contract c WHERE c.type = 'item_exchange' "
@@ -1864,12 +1858,10 @@ def unrealized(conn, ref, settings, finals_map, bases, quotes, enabled) -> Unrea
             continue
         u.contracts += 1
         for type_id, (qty, unit_price) in attribution.per_final.items():
-            uc = unit_costs.get(type_id)
-            if unit_price is None or uc is None:
+            if unit_price is None:
                 u.units_unpriced += qty
                 continue
-            u.value += _net_for(ref, settings, type_id, unit_price, qty, c["start_location_id"])
-            u.cost += qty * uc
+            u.value += unit_price * qty
             u.units += qty
     return u
 
@@ -2249,7 +2241,7 @@ def build_view(conn, ref, settings, window, now: datetime | None = None,
                      quote_age=quote_age)
     contracts_open_rows = open_contracts(conn, ref, finals_map, enabled, names, now)
     tot = totals(prods, sales, len(contracts_open_rows))
-    unreal = unrealized(conn, ref, settings, finals_map, bases, quotes, enabled)
+    unreal = unrealized(conn, finals_map, quotes, enabled)
     orders = open_orders(conn, ref, settings, finals_map, enabled, quotes_full,
                          {t: (f"from {a}" if a else None) for t, a in quote_age.items()}, names, now)
     history = order_history(conn, ref, finals_map, enabled, win, names)

@@ -650,6 +650,27 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
         qty = _build_qty_to_run(i)
         cut = qty < (i["recommended_build_qty"] or 0)
         yield_ = settings_.alchemy_reprocess_yield
+        # What the route's units replace (2026-09-12): a swap replaces the
+        # direct reaction, a buy move the composite's landed purchase. The
+        # plan does not persist the split, so a composite bought outright
+        # is measured against its landed price and any other against the
+        # cheaper of the two — the Savings figure never overstates.
+        direct = composite["direct_unit_cost"] if composite else None
+        bought = (
+            costing.landed_price(
+                ref, settings_, composite["price_snapshot"],
+                composite["buy_venue"], composite_id,
+            )
+            if composite is not None and composite["price_snapshot"] is not None
+            else None
+        )
+        outright = composite is not None and (composite["jobs_allocated"] or 0) <= 0
+        if outright and bought is not None:
+            benchmark, benchmark_label = bought, "landed buy"
+        elif direct is not None and bought is not None and bought < direct:
+            benchmark, benchmark_label = bought, "landed buy (cheaper than the direct reaction)"
+        else:
+            benchmark, benchmark_label = direct, "direct"
         alchemy.append(
             {
                 "item": i,
@@ -675,9 +696,8 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
                     (ref.type_info(m).name, int(qty * q * yield_))
                     for m, q in (route.recovered if route else ())
                 ],
-                "direct_unit": (
-                    composite["direct_unit_cost"] if composite else None
-                ),
+                "benchmark_unit": benchmark,
+                "benchmark_label": benchmark_label,
                 "alchemy_unit": (
                     composite["alchemy_unit_cost"] if composite else None
                 ),

@@ -34,7 +34,7 @@ leave it; there is no Magoo server.
 - **Keeps a sales ledger** of what your pipeline finals actually sold for —
   wallet transactions, sell orders and contracts from ESI, netted by where
   each hull sold and costed at the run executed before each sale: revenue, cost of
-  goods sold, net income, unrealized profit, Top 10s and charts.
+  goods sold, net income, unrealized revenue, Top 10s and charts.
 
 The plan is advisory; ESI is the ledger.
 

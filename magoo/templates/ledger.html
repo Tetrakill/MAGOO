@@ -91,9 +91,9 @@
   before any priced run had been executed takes the earliest priced one), so executing a new run never re-costs an earlier sale,
   and <b>net income</b> is net proceeds minus it — products without an
   executed run show revenue but no net income.
-  <b>Unrealized profit</b> is what your open sell orders and outstanding
-  contracts would bank at their listed prices, after the same estimated
-  fees, minus their cost basis — hangar stock is not counted. Sales to your own characters or corporations and
+  <b>Unrealized revenue</b> is what your open sell orders and outstanding
+  contracts are listed for — price × units, before fees, like Revenue —
+  hangar stock is not counted. Sales to your own characters or corporations and
   unpriced contracts are listed but never counted; auctions are not read
   at all. A
   character's corporation is read as its current corporation; a
@@ -136,9 +136,9 @@ version need a re-login for the new scopes.</p>
   </div>
   {% set u = view.unrealized %}
   <div class="stat">
-    <span class="label">Unrealized profit</span>
-    <span class="value {% if u.profit is not none and u.profit < 0 %}bad{% elif u.profit %}good{% endif %}"
-          title="{% if u.profit is not none %}{{ u.profit|isk }} ISK — {{ u.units|qty }} hulls on {{ u.orders }} open sell order{{ '' if u.orders == 1 else 's' }} at their listed price and in {{ u.contracts }} outstanding contract{{ '' if u.contracts == 1 else 's' }} at their price, after the estimated fees of each venue ({{ u.value|isk }} ISK), minus their cost basis ({{ u.cost|isk }} ISK){% if u.units_unpriced %}; {{ u.units_unpriced|qty }} listed units left out: no cost basis or no attributable price{% endif %}. Hangar stock is not included; not bound by the window{% else %}nothing of yours is listed for sale{% if u.units_unpriced %} with a cost basis and a price ({{ u.units_unpriced|qty }} listed units left out){% endif %}{% endif %}">{{ u.profit|isk_short }}</span>
+    <span class="label">Unrealized revenue</span>
+    <span class="value"
+          title="{% if u.revenue is not none %}{{ u.revenue|isk }} ISK — {{ u.units|qty }} hulls on {{ u.orders }} open sell order{{ '' if u.orders == 1 else 's' }} at their listed price and in {{ u.contracts }} outstanding contract{{ '' if u.contracts == 1 else 's' }} at their price, before fees, like Revenue{% if u.units_unpriced %}; {{ u.units_unpriced|qty }} contract units left out: no attributable price{% endif %}. Hangar stock is not included; not bound by the window{% else %}nothing of yours is listed for sale{% if u.units_unpriced %} with a price ({{ u.units_unpriced|qty }} contract units left out){% endif %}{% endif %}">{{ u.revenue|isk_short }}</span>
   </div>
   <div class="stat">
     <span class="label">Units sold</span>
@@ -146,7 +146,7 @@ version need a re-login for the new scopes.</p>
   </div>
   <div class="stat">
     <span class="label">Contracts closed</span>
-    <span class="value" title="finished item-exchange contracts counted as sales in this window; outstanding ones feed Unrealized profit">{{ t.contracts|qty }}<span class="sub">· {{ t.contracts_open }} outstanding</span></span>
+    <span class="value" title="finished item-exchange contracts counted as sales in this window; outstanding ones feed Unrealized revenue">{{ t.contracts|qty }}<span class="sub">· {{ t.contracts_open }} outstanding</span></span>
   </div>
   {% if t.no_basis or t.unpriced_contracts %}
   <div class="stat">
