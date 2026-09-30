@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.28.1 built and live (engine, MILP allocation, sizing feedback
+Status: v1.29.0 built and live (the Buy tab — purchases recorded from ESI, realized cost at what was paid, one live run per buying cycle; engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -31,7 +31,7 @@ the installer is still buildable), native WebView2 window,
 shared-client-id PKCE login in the user's own browser, versioned schema
 with pre-migration backups, portable zip self-heals the Mark of the Web
 on first launch)
-Last updated: 2026-09-12
+Last updated: 2026-09-29
 
 ---
 
@@ -3054,7 +3054,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 703 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration, the install check — rationing, packing, finals by return, per-job cycle need, the stock-aware slot backfill and the startable-jobs cap, alchemy under contention, per-sale-date cost vintages, schema 10 and 11 migrations, alchemy in stuck jobs' slots, split-row buy moves and the timing guard, built fuel bought just in time, unrealized revenue) |
+| Test suite | 1145 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration, the install check — rationing, packing, finals by return, per-job cycle need, the stock-aware slot backfill and the startable-jobs cap, alchemy under contention, per-sale-date cost vintages, schema 10 and 11 migrations, alchemy in stuck jobs' slots, split-row buy moves and the timing guard, built fuel bought just in time, unrealized revenue, the Buy tab — ESI-recorded purchases (wallet buys, accepted item exchanges, contract scaling, unplanned-ore conversion, buying-cycle windows, per-owner Count buys, the default inbound freight venue), realized cost from purchase lines (the blend, the covered-raw re-blend, freight by purchase location, the zero-purchase identity), the live run (re-plan in place, pools always the settings', hangar ore as minerals, this cycle's installed finals), schema 12 migrations and the upgrade replay, the four-column Buy tab, Multibuy All and the per-group lists, the Industry Jobs / Stockpile renames) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -4354,6 +4354,77 @@ Tests 555 → 560 (`test_pinned_type_lets_another_ore_cover_the_rest`,
 `test_a_row_the_market_cannot_fill_is_dropped_not_under_costed`,
 `test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct`,
 `test_thin_structure_book_splits_the_multibuy_like_the_venue_cell`).
+
+### v1.29.0 (2026-09-29): the Buy tab — purchases recorded from ESI, realized cost at what was paid, one live run per buying cycle — commits 7d90d52, 5ef09b8
+
+The user buys in bulk and beats the plan's prices — Jita buy orders
+delivered to C-J6, split fills, contracts of mixed compressed ore — and
+asked for realized cost to be what was paid and for the buy list to stay
+true as stock arrives from purchases, mining and refining without anyone
+re-entering it. Eight design revisions over 2026-09-23 → 29, each with a
+contract review, a multi-lens review and adversarial verification; the
+rulings are in §10.
+
+**The Buy tab.** Each run has four tabs — Industry Jobs | Buy | Stockpile
+| Profit — and buying lives only on Buy. Its strip reads Required · On
+Hand · Remaining · Purchased; below it **Multibuy All** (the plan's
+sell-ladder buy, one Jita block and one structure-market block with the
+compressed ore lines and the reprocess checklist) and **Input Materials**,
+the rows grouped Minerals, Moon Materials, Gas, Planetary Industry, Fuel
+Blocks, then EVE groups, collapsed by default with subtotals in each
+header and one plain Multibuy list per group at Remaining. A raw group
+lists the end-result raws only; an ore the plan chose is a line in
+Multibuy All, not a row. Per row: Required (the cycle's plan need), On
+Hand (hangar + in-progress output + hangar compressed ore as the raws it
+yields), Remaining (the fresh plan's buy; purchases are never subtracted
+from it — the pull and the re-plan happen in the same update), Purchased
+(this cycle's units and average landed price, sources in the tooltip),
+Ladder and Δ. A Purchases section lists what ESI delivered and why any
+record was not costed.
+
+**Purchases from ESI, never by hand.** The Ledger pull keeps wallet buys
+and the item exchanges the pool accepted (`buy_transaction`,
+`buy_contract`, `buy_contract_item`; per-owner *Count buys* on the ESI
+tab; wallet cursors reset once so the first pull recovers the buys
+earlier builds dropped). `buying.assign_purchases` files each purchase
+under its buying cycle — the previous execution to this execution, the
+open run's window open-ended — as `run_purchase` lines. A multi-item
+contract is spread over its items by scaling each Jita sell price
+(adjusted-price fallback; blueprint copies unpriced; `k` frozen). A
+compressed ore the plan did not choose is converted, in whole batches
+at the asserted yields, into mineral lines carrying the back-calculated
+landed cost (order price + freight + the refining tax on ore). Freight
+follows the purchase location: Jita 4-4 at the Jita rate, the structure
+market at its rate, anywhere else at the new *Default inbound freight*
+setting. Internal transfers, swaps and couriers are never purchases.
+
+**Realized cost is what was paid.** `costing._run_snapshot` lets a run's
+purchase lines win over its price snapshot: the units a cycle consumes
+at the quantity-weighted average of the lines (pro rata, not FIFO;
+over-bought units carry no cost), the rest at the plan's snapshot; an
+ore the plan chose re-blends into the raws it covers through persisted
+allocation shares (`compressed_alloc`, `compressed_landed_isk`,
+`compressed_tax_isk`, `direct_landed_isk`), and a covered raw bought
+direct displaces the ore's share. With no purchase lines every number is
+bit-identical to before (tested).
+
+**One live run per buying cycle.** The open run is re-planned in place
+on every successful ESI update and by ▶ Plan while it is open (same run
+number, `planned_start` from the snapshot, `opened_at` at the click); a
+new run number starts only after Mark executed. Slot pools are always
+the configured pools. Hangar compressed ore / moon ore / gas counts as
+the raws it yields (`on_hand_from_ore_qty`). Final jobs started inside
+the current buying cycle are this cycle's wave and the plan sizes the
+rest (`installed_qty`, `wave_qty`; ESI records each job's start and
+units, completed jobs included), so a re-plan after the installs never
+doubles the cycle.
+
+**Pre-release lanes** (engine refute with random books, upgrade replay of
+the real schema-11 backup against the old code, UI/docs) confirmed 13
+findings, all fixed in 5ef09b8: the covered-raw purchase delta, the new
+run's plan cut, the legacy stale-plan wording, docs. Schema 12 is one-way
+(the pre-upgrade backup is keyed on the version — stamp before the
+production database is opened). Tests 703 → 1145.
 
 ### v1.28.0 (2026-09-11): the install check — verify every planned job against real stock, ration what is short, and spend the slots and ISK that frees — commit 26c7d71
 
