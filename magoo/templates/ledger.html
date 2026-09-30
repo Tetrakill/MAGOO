@@ -98,7 +98,10 @@
   at all. A
   character's corporation is read as its current corporation; a
   character switched off on the ESI tab also stops carrying the
-  corporation-wallet sales only its own feed reports.</p>
+  corporation-wallet sales only its own feed reports. The same wallet and
+  contract feeds carry the pool's <b>purchases</b> (Count buys on the ESI
+  tab): they are matched to index runs on each run's Buy tab and never
+  counted here.</p>
 </details>
 
 {% if not view.has_pipelines %}
@@ -106,7 +109,8 @@
 <a href="{{ url_for('pipelines') }}">Pipelines</a> page.</p>
 {% elif not view.ever_pulled %}
 <p class="muted">No sales data yet — ⟳ Update from ESI reads wallet transactions, orders and
-contracts for every character and corporation with Count sales on
+contracts for every character and corporation with Count sales on (wallet and
+contracts also with Count buys on, for the Buy tab)
 (<a href="{{ url_for('characters') }}">ESI tab</a>); characters logged in before this
 version need a re-login for the new scopes.</p>
 {% else %}

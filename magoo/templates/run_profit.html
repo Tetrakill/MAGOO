@@ -16,8 +16,8 @@
 {% if run.status != 'complete' %}
 <p class="muted">This tab activates when the run is marked executed
 (<b>Mark executed…</b> on the <a
-href="{{ url_for('run_detail', index_run_id=run.index_run_id) }}">Plan</a>
-tab). Executed runs are costed from the prices of the runs their inputs
+href="{{ url_for('run_detail', index_run_id=run.index_run_id) }}">Industry
+Jobs</a> tab). Executed runs are costed from the prices of the runs their inputs
 were actually bought at; for a what-if at today's prices see
 <a href="{{ url_for('planning') }}">Planning → Profit</a>.</p>
 {% else %}

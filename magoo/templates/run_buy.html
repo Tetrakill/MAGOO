@@ -1,0 +1,340 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}Run {{ run.run_number }} Buy{% endblock %}
+
+{# The Buy tab (v1.29; revision 6, user rulings 2026-09-28): what this
+   cycle needs to buy, what ESI says you hold and what you purchased —
+   with nothing to enter. One run per buying cycle, kept live (R1): every
+   ⟳ Update from ESI re-plans the open run in place from the stock, jobs
+   and prices it just pulled, so the page subtracts nothing from the plan
+   (R4). Columns: Required (what the cycle needs in total) · On Hand (the
+   stock the plan counted) · Remaining (the plan's buy — every Multibuy
+   block lists it) · Purchased (the cycle's purchases, from ESI) · Ladder ·
+   Δ. Realized costing (the Profit tab, the Ledger's cost vintages) prices
+   the purchased units at what was paid. Every ISK figure is LANDED at
+   this run's own freight rates (R5, R6).
+   Revision 8 (user rulings 2026-09-29): the Purchased cell carries no
+   tags — its sources are in its title (R1); a group's Multibuy is one
+   plain list of its rows' Remaining, the market split and the ore lines
+   stay in Multibuy All (R2); no group renders an ore as a row, a cell
+   or a Multibuy line — "the only place that matters is the Multibuy
+   All" (R2b): a plan-chosen ore's purchase is in the Purchased totals
+   and the Purchases section. A group names an ore only in tooltips: the
+   covered raw's "N via compressed" tag and the Purchased title's via
+   clause (an ore the pool bought that the plan did not pick). The groups
+   sit collapsed under one "Input Materials" section (R3). #}
+
+{# One row's Purchased cell: units and the landed average — nothing else
+   (revision 8, user ruling R1 2026-09-29: "for the purchased column,
+   remove the tags"). Where the units came from — Jita, the structure
+   market, elsewhere, a contract with its title and k, the ores behind a
+   via-compressed share — is one clause per source in the cell's title,
+   with the units past what the cycle consumes (costing.purchase_basis —
+   realized costing leaves them unpriced: next cycle's stock, R5). #}
+{% macro purchased_cell(r) -%}
+  {%- set cell = r.cell -%}
+  <td class="num"{% if cell.bought_qty %} title="{{ cell.bought_qty|qty }} unit{{ 's' if cell.bought_qty != 1 }} purchased this cycle for {{ cell.bought_landed|isk }} ISK landed, {{ cell.bought_unit|isk_unit }} ISK per unit — the price paid plus this run's inbound freight for where it was bought{% for s in r.sources %} · {{ s.units|qty }} {{ s.label }}{% if s.title %} ({{ s.title }}){% endif %}{% endfor %}{% if r.over_bought %} · {{ r.over_bought|qty }} beyond what the cycle consumes — stock for the next cycle{% endif %}"{% endif %}>
+    {%- if cell.bought_qty %}{{ cell.bought_qty|qty }} <span class="muted">@ {{ cell.bought_unit|isk_short }}</span>
+    {%- else %}<span class="muted">—</span>{% endif -%}
+  </td>
+{%- endmacro %}
+
+{# Δ: what the purchased units cost against the plan's ladder for the same
+   units (C14.5). Per unit, not the realized change — said on hover. #}
+{% macro delta_cell(cell) -%}
+  <td class="num {% if cell.delta is not none %}{% if cell.delta < 0 %}good{% elif cell.delta > 0 %}bad{% endif %}{% endif %}"
+      title="{% if cell.delta is none %}{% if cell.bought_qty %}no plan price to compare against{% else %}nothing purchased yet{% endif %}{% else %}{{ cell.bought_landed|isk }} ISK landed for {{ cell.bought_qty|qty }} unit{{ 's' if cell.bought_qty != 1 }} against {{ (cell.ladder_unit * cell.bought_qty)|isk }} ISK at the ladder — {{ cell.delta|abs|isk }} ISK {{ 'less' if cell.delta < 0 else 'more' }} than the plan's own landed fill for those units. The Profit tab's realized cost can move differently: it prices this cycle's whole consumption, not just what was purchased{% endif %}">
+    {%- if cell.delta is not none %}{{ cell.delta|isk_short }}{% else %}—{% endif -%}
+  </td>
+{%- endmacro %}
+
+{# The reprocess checklist: the yields the plan chose these ores at.
+   Outputs beyond this cycle's need are leftover stock — they were worth
+   nothing in the decision. #}
+{% macro reprocess(ores) -%}
+  <div class="panel">
+    <h3 class="subhead" style="margin-top:0">After buying — reprocess:</h3>
+    <p class="muted" style="margin:.2rem 0 0">At your asserted yields —
+      {{ settings.compressed_ore_yield|pct }}% for ore and moon ore,
+      {{ settings.compressed_gas_yield|pct }}% for gas{% if settings.compressed_reprocess_tax %},
+      after a {{ settings.compressed_reprocess_tax|pct }}% reprocessing tax on every refined-ore output (gas decompression is untaxed){% endif %}
+      (Settings → Compressed Sourcing).</p>
+    <ul style="margin:.4rem 0 0 1.2rem">
+      {% for ore in ores %}
+      <li>Reprocess <b>{{ ore.qty|qty }} {{ ore.name }}</b>
+        → {% for o in ore.outputs if o.used %}~{{ o.used|qty }} {{ o.name }}{{ ', ' if not loop.last }}{% endfor %}{% for o in ore.outputs if o.leftover %}; leftover +{{ o.leftover|qty }} {{ o.name }}{% endfor %}
+        {{ m.compressed_badge(ore.item) }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+{%- endmacro %}
+
+{# One venue's paste block. #}
+{% macro paste(label, venue, text) -%}
+  <p class="muted">{{ venue }}</p>
+  <textarea class="multibuy" readonly onclick="this.select()"
+    aria-label="Multibuy — {{ label }} — {{ venue }}">{{ text }}</textarea>
+{%- endmacro %}
+
+{% block content %}
+{# "as of" for the On Hand titles: the ESI update the plan read. #}
+{% set stock_when %}{% if stock_exact %}the ESI update of {{ stock_at }} UTC{% else %}the ESI update this plan read (no longer kept — planned {{ stock_at }} UTC){% endif %}{% endset %}
+
+<div class="pagehead">
+  <h1>{{ m.run_title(run, superseded) }}</h1>
+  {% if live and stale_since %}
+  <span class="cap">What this cycle still needs to buy — as last planned,
+    {{ run.planned_start }} UTC. The ESI update of {{ stale_since }} UTC did
+    not re-plan it (its flash said why: nothing to plan from — no active
+    pipeline or prices — or the re-plan failed), so stock and purchases
+    since then are not netted: Remaining and the
+    Multibuy can list units you already hold. ▶ Re-plan on the dashboard
+    applies them. Purchased is this cycle's wallet buys and accepted item
+    exchanges of every character and corporation with Count buys on
+    (<a href="{{ url_for('characters') }}">ESI tab</a>); realized cost —
+    the Profit tab and the Ledger's cost vintages — prices those units at
+    what was paid.</span>
+  {% elif live %}
+  <span class="cap">What this cycle still needs to buy. Every ⟳ Update from
+    ESI re-plans this run in place from the stock, jobs and prices it
+    pulls — last planned {{ run.planned_start }} UTC — and Required, On
+    Hand, Remaining and the Multibuy follow it: what you bought that
+    reached a tracked system is on hand, so it is off Remaining already.
+    On Hand counts only stock ESI shows in your tracked systems — units
+    bought but still in transit (a courier from Jita) are not on hand yet
+    and still read as Remaining; check Purchased. Purchased is this
+    cycle's wallet buys and accepted item exchanges of every character
+    and corporation with Count buys on
+    (<a href="{{ url_for('characters') }}">ESI tab</a>); realized cost —
+    the Profit tab and the Ledger's cost vintages — prices those units at
+    what was paid.</span>
+  {% else %}
+  <span class="cap">What this run's plan needed to buy when it was last
+    planned ({{ run.planned_start }} UTC), what it counted on hand, and
+    what the cycle purchased — read from ESI, each purchase filed under
+    the buying cycle it falls in. Realized cost — the Profit tab and the
+    Ledger's cost vintages — prices those units at what was paid.</span>
+  {% endif %}
+</div>
+{% set active = 'buy' %}
+{% include "_run_subnav.html" %}
+
+{% if superseded %}
+<div class="panel alert-warn">
+  <h2><span class="badge fill warn">superseded</span> this plan collects no purchases</h2>
+  <p class="muted" style="margin:.3rem 0 0">A newer run exists, so what the
+    pool buys belongs to {% if purchases_owner %}<a href="{{ url_for('run_detail', index_run_id=purchases_owner.index_run_id, view='buy') }}">run {{ purchases_owner.run_number }}</a>, the newest plan{% else %}the next run you plan — the newest run is already executed{% endif %}.
+    Each purchase is on one run only; the figures below read the plan
+    alone.</p>
+</div>
+{% endif %}
+
+<div class="totals">
+  <div class="stat">
+    <span class="label">Required</span>
+    <span class="value" title="{{ buy_summary.required_total|isk }} ISK — every row's Required ({{ buy_summary.units_required|qty }} units: what the cycle needs of it in total) at the plan's own landed ladder price, landed at this run's freight rates ({{ buy_summary.rows }} item{{ 's' if buy_summary.rows != 1 }}); a compressed-covered raw at the plan's blended cost, the ore's share inside{% if buy_summary.units_built %}. The {{ buy_summary.units_built|qty }} unit{{ 's' if buy_summary.units_built != 1 }} the plan builds on {{ buy_summary.rows_built }} row{{ 's' if buy_summary.rows_built != 1 }} are left out — a built row counts only what it holds and buys{% endif %}">{{ buy_summary.required_total|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">On Hand</span>
+    <span class="value" title="{{ buy_summary.on_hand_total|isk }} ISK at the ladder — the stock the plan counted (hangar, hangar compressed ore at your asserted yields, jobs in progress), capped at each row's Required{% if buy_summary.on_hand_beyond %}; {{ buy_summary.on_hand_beyond|qty }} more unit{{ 's' if buy_summary.on_hand_beyond != 1 }} on hand beyond it{% endif %}">{{ buy_summary.on_hand_total|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Remaining</span>
+    <span class="value {% if buy_summary.units_remaining %}warn{% endif %}"
+          title="{{ buy_summary.remaining_total|isk }} ISK — the {{ buy_summary.units_remaining|qty }} units the plan buys, at the ladder's landed price{% if live and stale_since %}; the plan predates the ESI update of {{ stale_since }} UTC (its re-plan was skipped), so stock and purchases since are not netted — ▶ Re-plan applies them{% elif live %}; stock that reached a tracked system is already off it, units still in transit are not{% endif %}">{{ buy_summary.remaining_total|isk_short }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Purchased</span>
+    <span class="value" title="{{ buy_summary.purchased_total|isk }} ISK landed — the price paid plus this run's inbound freight, for the purchases ESI matched to this run's rows and compressed ores{% if buy_summary.outside_units %}; the {{ buy_summary.outside_units|qty }} units outside the plan are not in it{% endif %}">{{ buy_summary.purchased_total|isk_short }}<span class="sub">· {{ buy_summary.rows_purchased }} / {{ buy_summary.rows }} rows</span></span>
+  </div>
+  {% set badged = buy_summary.unpriced or buy_summary.split or buy_summary.structure_only or buy_summary.unsourced or buy_summary.compressed or buy_summary.outside_units or buy_summary.unpriced_contract_items or buy_summary.orphan_ore_isk %}
+  {% if badged %}
+  <div class="stat">
+    <span class="label">&nbsp;</span>
+    <span class="tags">
+      {% if buy_summary.unpriced %}<span class="badge warn" title="item{{ 's' if buy_summary.unpriced != 1 }} with no price on record at plan time — their units count as 0 ISK in Required, On Hand and Remaining, which understate by them">{{ buy_summary.unpriced }} unpriced</span>{% endif %}
+      {% if buy_summary.structure_only %}<span class="badge accent" title="rows the plan bought ONLY at the structure market — cheaper landed (price + freight-in) there than at Jita at plan time">{{ buy_summary.structure_only }} via {{ structure_label }}</span>{% endif %}
+      {% if buy_summary.split %}<span class="badge accent" title="rows the plan split across Jita and {{ structure_label }} — by walking both sell ladders together, cheapest landed rung first, or, on rows planned before fill pricing, by how far {{ structure_label }}'s ladder beats the Jita landed price. Multibuy All's blocks list the two markets' shares; a group's own list is the row's whole Remaining.">{{ buy_summary.split }} split</span>{% endif %}
+      {% if buy_summary.unsourced %}<span class="badge warn" title="rows whose stored sell orders (Jita's 300 cheapest, the whole {{ structure_label }} book) held fewer units than the plan buys — the remainder had no market at plan time: it is priced at the last order walked and appears in neither Multibuy All block (each group's own list carries it, as part of Remaining)">{{ buy_summary.unsourced }} unsourced</span>{% endif %}
+      {% if buy_summary.compressed %}<span class="badge accent" title="compressed ore / moon ore / gas the plan buys and reprocesses instead of {{ buy_summary.compressed_covered }} raw type{{ 's' if buy_summary.compressed_covered != 1 }}{% if compressed_saving %} — saves {{ compressed_saving|isk }} ISK landed vs buying those raws direct at plan time{% endif %} (the cheaper market's sell ladder walked to depth — Jita and {{ structure_label }} compete). The ore is not a row here: the raws it covers are, at their full demand, and the ore itself is a line in Multibuy All (a group's own list names the raws).">{{ buy_summary.compressed }} via compressed</span>{% endif %}
+      {% if buy_summary.outside_units %}<span class="badge" title="purchased this cycle but not costed into this run ({{ buy_summary.outside_names|join(', ') }}) — an item the run does not hold, or a row the plan can build (realized costing prices every buildable row from its own inputs, even one the plan buys outright). They are recorded and listed under Purchases, never costed here: they are stock the next plan counts as on hand.{% if buy_summary.outside_remainders %} Of these, {{ buy_summary.outside_remainders|join(', ') }} {{ 'is' if buy_summary.outside_remainders|length == 1 else 'are' }} compressed ore left short of a whole reprocessing batch — the rest of that ore counts as the raws it refines into.{% endif %}">{{ buy_summary.outside_units|qty }} unit{{ 's' if buy_summary.outside_units != 1 }} outside the plan</span>{% endif %}
+      {% if buy_summary.unpriced_contract_items %}<span class="badge warn" title="items received on a bought contract with neither a Jita sell price nor CCP's adjusted price on record — each is recorded at 0 ISK and the contract's price is spread over its other items; the next price refresh re-derives it">{{ buy_summary.unpriced_contract_items }} unpriced contract item{{ 's' if buy_summary.unpriced_contract_items != 1 }}</span>{% endif %}
+      {% if buy_summary.orphan_ore_isk %}<span class="badge warn" title="{{ buy_summary.orphan_ore_isk|isk }} ISK of compressed buys the plan valued its outputs at zero, so it allocated none of that cost to any raw — that ISK is in no row or total below. It is rare (it needs an unpriced covered raw) and it is the plan's own arithmetic, not a rounding loss.">{{ buy_summary.orphan_ore_isk|isk_short }} unallocated</span>{% endif %}
+    </span>
+  </div>
+  {% endif %}
+</div>
+
+{% if history_note %}
+<div class="panel alert-warn">
+  <h2><span class="badge fill warn">in cost history</span> this run is executed</h2>
+  <p class="muted" style="margin:.3rem 0 0">A later ESI update can still
+    add a purchase dated inside its buying cycle; that reprices later
+    runs' lagged inputs on the next read — the lag walk computes on read,
+    nothing is stored.</p>
+</div>
+{% endif %}
+
+{% if buy_groups %}
+<details class="section" open data-key="buy:all">
+<summary><h2>Multibuy All <span class="muted">— {{ multibuy_all['items'] }} item{{ 's' if multibuy_all['items'] != 1 }} to buy</span></h2></summary>
+{% if multibuy_all['items'] %}
+<p class="muted">The plan's buy list, at its sell-ladder split between the
+  two markets.{% if live and stale_since %} It predates the ESI update of
+  {{ stale_since }} UTC, which did not re-plan it: what you bought or
+  received since is NOT off it — check Purchased, or ▶ Re-plan to net
+  it.{% elif live %} Every ⟳ Update from ESI re-plans it from
+  current stock, so what you bought that reached a tracked system is off
+  it already — units still in transit are not (check Purchased).{% endif %}
+  Units the plan could not source are in neither block here (each
+  group's own list, below, carries them).</p>
+{% if multibuy_all.hub %}{{ paste('All', 'Jita', multibuy_all.hub) }}{% endif %}
+{% if multibuy_all.structure %}{{ paste('All', structure_label ~ ' structure market', multibuy_all.structure) }}{% endif %}
+{% else %}
+<p class="muted">Nothing to buy — stock on hand covers the plan{% if buy_summary.unsourced %}, or what is left had no market at plan time{% endif %}.</p>
+{% endif %}
+{% if multibuy_all.ores %}
+{# The only reprocess checklist on the page since revision 8 (a group's
+   Multibuy is the plain raw list, no ore lines — user ruling R2
+   2026-09-29). Collapsed: a plan with dozens of ores would push the
+   groups off the first screen. #}
+<details class="multibuy-block">
+  <summary class="muted">After buying — reprocess {{ multibuy_all.ores|length }} ore{{ 's' if multibuy_all.ores|length != 1 }}</summary>
+  {{ reprocess(multibuy_all.ores) }}
+</details>
+{% endif %}
+</details>
+{% endif %}
+
+{# Revision 8 (user ruling R3 2026-09-29: "the item group shall stay
+   collapse under a main header of Input Materials"): ONE top-level
+   section, open by default, wraps every group; each group is a nested
+   h3.subhead section that starts COLLAPSED (data-default="closed" — the
+   section-state script in base.html stores "open" or "closed" on every
+   toggle, and on load a stored "open" is the value that reopens such a
+   section). Its summary keeps the row count and the four subtotals, so
+   a collapsed group still reads. The keys sit under buy:inputs: so an
+   "open" stored under the old group keys (before revision 8) cannot
+   reopen a group that now defaults closed. #}
+{% if buy_groups %}
+<details class="section" open data-key="buy:inputs">
+<summary><h2>Input Materials <span class="muted">— {{ buy_groups|length }}
+  group{{ 's' if buy_groups|length != 1 }} ·
+  <span title="{{ buy_summary.remaining_total|isk }} ISK — what the plan buys across every group, at the ladder's landed price">remaining {{ buy_summary.remaining_total|isk_short }}</span></span></h2></summary>
+{% for group in buy_groups %}
+<details class="section" data-default="closed" data-key="buy:inputs:{{ group.label|lower|replace(' ', '-') }}">
+<summary><h3 class="subhead">{{ group.label }} <span class="muted">— {{ group.rows|length }}
+  item{{ 's' if group.rows|length != 1 }},
+  <span title="{{ group.required_total|isk }} ISK — what this group's rows need in total, at the plan's own landed fill; a row the plan builds counts only what it holds and buys">required {{ group.required_total|isk_short }}</span>,
+  <span title="{{ group.on_hand_total|isk }} ISK — the stock the plan counted, capped at each row's Required, at the ladder">on hand {{ group.on_hand_total|isk_short }}</span>,
+  <span title="{{ group.remaining_total|isk }} ISK — what the plan buys, at the ladder">remaining {{ group.remaining_total|isk_short }}</span>,
+  <span title="{{ group.purchased_total|isk }} ISK of purchases matched to this group, landed">purchased {{ group.purchased_total|isk_short }}</span></span></h3></summary>
+{% if group.rows %}
+<div class="tablewrap">
+<table class="buy">
+  <thead><tr>
+    <th class="item">Item</th>
+    <th class="num" title="what this cycle's plan needs of the item in total — target stock plus this cycle's draw; for a raw bought just in time, its planned consumption plus the purchase margin">Required</th>
+    <th class="num" title="the stock the plan counted: the hangar, what hangar compressed ore reprocesses into, and job output in progress">On Hand</th>
+    <th class="num" title="what the plan buys — the group's Multibuy lists it">Remaining</th>
+    <th class="num" title="what the pool purchased this cycle, from ESI, landed">Purchased</th>
+    <th class="num">Ladder</th>
+    <th class="num">Δ</th>
+  </tr></thead>
+  {% for r in group.rows %}
+  <tr class="item" id="t{{ r.type_id }}">
+    <td class="item">{{ m.item_button(r.item) }}
+      {#- Revision 5 (user ruling 2026-09-28: the tables were stretched):
+         the "N via compressed" badge is the row's ONE compressed tag —
+         the ores it names used to be a footnote under the name. #}
+      {%- if r.covered_qty %} <span class="badge accent" title="{{ r.covered_qty|qty }} of the {{ (r.covered_qty + r.direct_qty)|qty }} units this cycle come from reprocessing compressed purchases (plan time); the other {{ r.direct_qty|qty }} are bought direct.{% if r.ores %} From {{ r.ores|join(', ') }} — each is a line in Multibuy All above, not a row of its own; {{ r.covered_qty|qty }} units reprocessed out of them. This group's own Multibuy lists the raw itself{% endif %}">{{ r.covered_qty|qty }} via compressed</span>{% endif %}
+      {%- if r.unsourced %} <span class="badge warn" title="only {{ (r.direct_qty - r.unfilled_qty)|qty }} of the {{ r.direct_qty|qty }} units the plan buys direct were on the stored Jita / {{ structure_label }} sell orders; the remaining {{ r.unfilled_qty|qty }} had no market to buy from — priced at the last order walked{% if r.unfilled_price %}, {{ r.unfilled_price|isk }} ISK{% endif %}, and in neither Multibuy All block (this group's list carries them: they are part of Remaining)">{{ r.unfilled_qty|qty }} unsourced</span>{% endif %}
+      {%- if r.missing_price %} <span class="badge warn" title="no price on record for this item at plan time — its units count as 0 ISK in Required, On Hand and Remaining, and a purchase of it has no ladder to compare against">unpriced</span>{% endif %}
+      {%- if r.item.alchemy_for_type_id %} <span class="badge" title="an alchemy-route row — realized costing does not walk it, so what you paid for it is recorded but reprices no hull's chain, and it is not in the Purchased total">alchemy route</span>
+      {%- elif r.built %} <span class="badge" title="{% if r.item.recommended_build_qty %}the plan builds {{ r.item.recommended_build_qty|qty }} of this item and buys the rest{% else %}a row the plan can build{% endif %} — realized costing prices a built row from its own inputs, so what you paid for it is recorded but reprices no hull's chain, and it is not in the Purchased total">built</span>{% endif %}
+      {%- if not r.remaining and r.cell.bought_qty %} <span class="badge" title="the plan no longer buys this item, but this cycle's purchases of it are still this run's — realized costing prices the units the cycle consumes at what was paid">not on the buy list</span>{% endif %}
+      {%- if r.in_transit %} <span class="badge" title="{{ r.cell.bought_qty|qty }} purchased this cycle, and the plan still buys {{ r.remaining|qty }}: On Hand counts only stock ESI shows in your tracked systems, so units still on their way (a courier from Jita) are not on hand yet and still read as Remaining — the rest may simply be still to buy">in transit?</span>{% endif %}</td>
+    <td class="num" title="{% if r.built or r.draw %}target stock {{ r.target|qty }} + this cycle's draw {{ r.draw|qty }} (the Stockpile's deficit basis){% else %}this cycle's planned consumption plus the purchase margin (Settings now reads {{ purchase_margin|pct }}%{% if not live %} — the plan may have used another{% endif %}){% if r.cycle_need %} — steady cycle need {{ r.cycle_need|qty }}{% endif %}{% endif %}">{{ r.required|qty }}</td>
+    <td class="num" title="{{ r.on_hand|qty }} counted by the plan: {{ r.hangar|qty }} in the hangar{% if r.from_ore %} + {{ r.from_ore|qty }} from hangar compressed ore (what it reprocesses into at your asserted yields){% endif %}{% if r.in_jobs %} + {{ r.in_jobs|qty }} in jobs{% if r.alchemy_credit %} (incl. {{ r.alchemy_credit|qty }} expected from unrefined stock at the reprocess yield){% endif %}{% endif %} — as of {{ stock_when }}, in your tracked systems{% if r.on_hand > r.required %}; {{ (r.on_hand - r.required)|qty }} beyond Required{% endif %}">{{ r.on_hand|qty }}</td>
+    <td class="num" title="{% if r.remaining %}{{ r.remaining|qty }} to buy{% if r.covered_qty %}: {{ r.direct_qty|qty }} direct + {{ r.covered_qty|qty }} from compressed ore{% endif %}{% if r.ladder_unit is not none %} — {{ r.remaining_isk|isk }} ISK at the ladder{% endif %}{% else %}nothing to buy{% endif %}{% if r.built and r.gap != r.remaining %}. Required − On Hand is {{ r.gap|qty }}: the plan builds {{ r.build_qty|qty }}{% if r.alchemy_out %}, expects {{ r.alchemy_out|qty }} from the alchemy route{% endif %}{% if r.unmet_qty %}, and {{ r.unmet_qty|qty }} are unmet — no free slot and no market holds them{% endif %} — Remaining is only the part it buys{% elif r.gap != r.remaining %}. Required − On Hand is {{ r.gap|qty }}; the plan's own figure wins{% elif not r.remaining and r.on_hand >= r.required %} — On Hand covers Required{% endif %}{% if r.unsourced_qty %}; {{ r.unsourced_qty|qty }} of them had no market at plan time and are in neither Multibuy All block{% endif %}">{{ r.remaining|qty }}</td>
+    {{ purchased_cell(r) }}
+    <td class="num" title="{% if r.ladder_unit is none %}no price on record at plan time{% else %}{{ r.ladder_unit|isk_unit }} ISK landed per unit — {% if r.effective_unit_cost is not none %}the plan's blend of its direct buy and the compressed ore it reprocesses, freight and refining tax inside{% else %}the plan's own sell order ladder fill plus this run's inbound freight{% endif %}; {{ r.remaining_isk|isk }} ISK for the {{ r.remaining|qty }} it buys{% endif %}">
+      {%- if r.ladder_unit is none %}—{% else %}{{ r.ladder_unit|isk_short }}{% endif -%}
+    </td>
+    {{ delta_cell(r.cell) }}
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+{# The group's Multibuy (revision 8, user ruling R2 2026-09-29: "the
+   straight no compression, just the item list with no jita vs c-j6
+   differing lists"): ONE list, every row's Remaining as the raw itself —
+   a covered raw's direct + covered units, unsourced units included — in
+   the table's order. The market split, the ore lines and the reprocess
+   checklist are Multibuy All's alone. #}
+<details class="multibuy-block"{% if not group.rows %} open{% endif %}>
+  <summary class="muted">Multibuy — {{ group.multibuy_items }} item{{ 's' if group.multibuy_items != 1 }} to buy</summary>
+  {% if group.multibuy_items %}
+  <textarea class="multibuy" readonly onclick="this.select()"
+    aria-label="Multibuy — {{ group.label }}">{{ group.multibuy }}</textarea>
+  {% else %}
+  <p class="muted">Nothing to buy in this group — stock on hand covers
+    it.</p>
+  {% endif %}
+</details>
+</details>
+{% endfor %}
+</details>
+{% else %}
+<p class="muted">Nothing to buy on this run — no inputs were sourced from
+  the market.</p>
+{% endif %}
+
+<details class="section" open data-key="buy:purchases">
+<summary><h2>Purchases <span class="muted">— {{ purchase_records|length }} from ESI{% if buy_summary.not_costed %}, {{ buy_summary.not_costed }} not costed{% endif %}</span></h2></summary>
+{% if purchase_records %}
+<p class="muted">What ESI delivered for this run's buying cycle: wallet
+  buys and the item exchanges the pool accepted. A contract's price is
+  spread over the items received at their Jita reference prices — k is
+  that scale — and its venue is where it was handed over: Jita 4-4,
+  {{ structure_label }}, or elsewhere (hauled at the default inbound rate,
+  Settings). A compressed ore the plan did not pick counts as the raws its
+  whole reprocessing batches refine into, at your asserted yields. Prices
+  here are what was paid, before freight.</p>
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Date</th><th>Owner</th><th>Venue</th><th>Items</th>
+    <th class="num">Price</th><th class="num">k</th></tr></thead>
+  {% for p in purchase_records %}
+  <tr>
+    <td class="muted">{{ p.date[:16]|replace('T', ' ') }}</td>
+    <td>{{ p.owner or '—' }}{% if p.owner_kind == 'corporation' %} <span class="muted">(corp)</span>{% endif %}</td>
+    <td{% if p.location %} title="{% if p.kind == 'contract' %}handed over{% else %}bought{% endif %} in {{ p.location }}{% if p.venue == 'other' %} — neither Jita 4-4 nor the {{ structure_label }} structure market, so landed at the default inbound rate (Settings){% endif %}"{% endif %}>{{ p.venue_label or '—' }}{% if p.venue == 'other' %} <span class="muted">{{ p.location or 'unknown location' }}</span>{% endif %}{% if p.kind == 'contract' %} <span class="badge accent" title="an item exchange the pool accepted, {{ p.label }}">contract</span> <span class="muted">{{ p.label }}</span>{% elif p.kind == 'hand' %} <span class="badge" title="a line recorded by hand before purchases were read from ESI">recorded</span>{% endif %}
+      {%- if p.status_label %} <span class="badge{% if p.status_tone %} {{ p.status_tone }}{% endif %}" title="{{ p.status_note }}">{{ p.status_label }}</span>{% endif %}</td>
+    <td>{% for it in p['items'] %}{{ it.qty|qty }} {{ it.name }}{% if it.unit_price is not none %} <span class="muted" title="{{ it.unit_price|isk_unit }} ISK per unit{{ ' — k × its reference price' if p.kind == 'contract' }}">@ {{ it.unit_price|isk_short }}</span>{% endif %}
+      {%- if it.given %} <span class="badge" title="an item the pool GAVE on this exchange, not one it received">given</span>{% endif %}
+      {%- if it.bpc %} <span class="badge" title="a blueprint copy — never priced by reference: its adjusted price is the original's">copy</span>{% endif %}
+      {%- if it.via %} <span class="badge accent" title="refined out of {{ it.via }} this purchase bought — the plan did not pick that ore, so it counts as what it refines into; the unit price is landed (the ore's price, its inbound freight and the refining tax, spread by value)">refined from {{ it.via }}</span>{% endif %}
+      {%- if it.refined %} <span class="badge accent" title="a compressed ore the plan did not pick — its whole reprocessing batches count as the raws they refine into (below), at your asserted yields">refined</span>{% endif %}
+      {%- if it.outside %} <span class="badge" title="not on this run's buy list — stock for the next plan (R3), not costed here">outside the plan</span>{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}
+      {%- for o in p.refined %}<div class="muted footnote" title="the matcher's lines for this purchase: {{ o.refined|qty }} of the {{ o.received|qty }} {{ o.ore }} received, in whole reprocessing batches at your asserted yields; the landed figure is the ore's price for those units, its inbound freight and the refining tax, which is not stored apart{% if o.outside %}. {{ o.outside }} — not on this run's buy list: stock for the next plan, outside the plan and not costed here{% endif %}{% if o.remainder %}. The other {{ o.remainder|qty }} are short of a whole batch: they stay {{ o.ore }}, outside the plan{% endif %}">{{ o.refined|qty }} {{ o.ore }} → refined into {{ o.outputs }} (landed {{ o.landed_isk|isk }} ISK incl. freight and refining tax){% if o.outside %}; {{ o.outside }} outside the plan{% endif %}{% if o.remainder %}; {{ o.remainder|qty }} short of a batch stay outside the plan{% endif %}</div>{% endfor %}
+      {%- if p.unpriced_items %} <span class="badge warn" title="{{ p.unpriced_items }} item{{ 's' if p.unpriced_items != 1 }} of this contract had no reference price — recorded at 0 ISK, the contract's price spread over the rest; the next ESI update re-derives the split">{{ p.unpriced_items }} unpriced</span>{% endif %}</td>
+    <td class="num" title="{{ p.price|isk }} ISK — {% if p.landed_in_price %}the sum of this purchase's lines: the raws refined out of its ore at their LANDED price (the ore's price, inbound freight and refining tax — the ore's own order price is not stored), the rest at the order price{% else %}{{ 'what the contract cost' if p.kind == 'contract' else 'quantity × unit price' }}; order price, before freight{% endif %}">{{ p.price|isk_short }}</td>
+    <td class="num">{% if p.k is not none %}{{ '%.3f'|format(p.k) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% elif superseded %}
+<p class="muted">None — a superseded plan collects no purchases.</p>
+{% else %}
+<p class="muted">No purchases matched to this run yet. ⟳ Update from ESI
+  reads the wallet buys and accepted item exchanges of every owner with
+  Count buys on (<a href="{{ url_for('characters') }}">ESI tab</a>), dated
+  inside this run's buying cycle.</p>
+{% endif %}
+</details>
+
+{% include "_deficit_dialog.html" %}
+{% endblock %}

@@ -723,9 +723,13 @@ def test_snapshot_pruned_to_recent_five(conn):
     assert count["n"] == 5
 
 
-def test_multi_cycle_jobs_net_from_slot_pool(conn):
-    """A job still running past the next index run occupies a real line;
-    jobs ending inside the window do not reduce the pool (v1.1)."""
+def test_running_jobs_never_net_from_slot_pool(conn):
+    """v1.29 revision 6 (user ruling R2, 2026-09-28): the plan's pools are
+    the Settings' pools, whatever is running — a job still running past
+    the next index run no longer takes a line off the pool (the
+    2026-08-20 rule this test pinned as 8 of 10). The open run is
+    re-planned mid-cycle, so installed jobs drop out through stock
+    (their output is in progress) instead. ESI still stores job_ends."""
     conn.execute(
         "UPDATE settings SET manufacturing_slots = 10, reaction_slots = 4"
     )
@@ -742,9 +746,178 @@ def test_multi_cycle_jobs_net_from_slot_pool(conn):
             config.ACTIVITY_REACTION: [],
         },
     )
+    assert store.latest_esi_snapshot(conn)["job_ends"][
+        config.ACTIVITY_MANUFACTURING
+    ][:2] == ["2099-01-01T00:00:00Z", "2099-01-02T00:00:00Z"]
     snap = engine.snapshot_from_state(conn)
-    assert snap.slots_available[config.ACTIVITY_MANUFACTURING] == 8
+    assert snap.slots_available[config.ACTIVITY_MANUFACTURING] == 10
     assert snap.slots_available[config.ACTIVITY_REACTION] == 4
+
+
+def test_the_snapshot_records_one_start_per_job_with_its_units(
+    conn, ref, monkeypatch,
+):
+    """v1.29 revision 7 (user ruling 2026-09-29): job_starts is {product
+    type_id: [[start_date, units], ...]} — one entry per manufacturing /
+    reaction job, units = runs x portion exactly as the in_progress credit
+    (the engine sums the units of jobs started after the buying cycle's
+    cut as this cycle's wave already installed). start_date is ESI's text,
+    verbatim. A job with no start_date records nothing; a job whose output
+    delivers outside the tracked systems is not credited, so it records
+    no start either; a job seen through the corp AND the character feed
+    is recorded once. The map round-trips through the snapshot; one saved
+    without it reads back as None (unknown), never as {} (no jobs)."""
+    add_character(conn, 2001)
+    hulk = ref.type_id("Hulk")
+    ammo = ref.type_id("Antimatter Charge S")
+    ammo_portion = ref.blueprint_for_product(ammo).portion_size
+    assert ammo_portion > 1  # the units must carry the portion
+    early = job(1, 2001, hulk, runs=1)
+    early["start_date"] = "2026-09-20T08:00:00Z"
+    late = job(2, 2001, hulk, runs=2)
+    late["start_date"] = "2026-09-25T09:30:00Z"
+    charges = job(3, 2001, ammo, runs=4)
+    charges["start_date"] = "2026-09-25T10:00:00Z"
+    undated = job(4, 2001, 34, runs=2)
+    elsewhere = job(5, 2001, hulk, runs=3, location=70000001)
+    elsewhere["start_date"] = "2026-09-26T00:00:00Z"
+    conn.execute(
+        "INSERT INTO location_system (location_id, solar_system_id) "
+        "VALUES (?, ?)",
+        (70000001, UNTRACKED),
+    )
+    conn.commit()
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: [early, late, charges, undated, elsewhere]},
+        corp_assets={2001: []},
+        corp_jobs={2001: [dict(late)]},  # the same job via the corp feed
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert state["in_progress"][hulk] == 3
+    assert state["in_progress"][ammo] == 4 * ammo_portion
+    expected = {
+        hulk: [["2026-09-25T09:30:00Z", 2], ["2026-09-20T08:00:00Z", 1]],
+        ammo: [["2026-09-25T10:00:00Z", 4 * ammo_portion]],
+    }
+    assert state["job_starts"] == expected
+    # The units recorded per product sum to its in_progress credit.
+    for type_id, starts in expected.items():
+        assert sum(u for _, u in starts) == state["in_progress"][type_id]
+    assert store.latest_esi_snapshot(conn)["job_starts"] == expected
+    store.save_esi_snapshot(conn, {}, {}, {}, 0.0, 0.0)
+    assert store.latest_esi_snapshot(conn)["job_starts"] is None
+
+
+def test_the_old_scalar_job_starts_format_reads_as_not_recorded(conn):
+    """Revision 6 stored {type_id: latest start text}. That format exists
+    only in dev/test databases (production never had the column); a
+    reader must take it as "not recorded" (None — the plan sizes the full
+    wave), never as a start with no units."""
+    store.save_esi_snapshot(
+        conn, {}, {}, {}, 0.0, 0.0,
+        job_starts={587: "2026-09-25T09:30:00Z"},
+    )
+    assert store.latest_esi_snapshot(conn)["job_starts"] is None
+
+
+def test_a_delivered_job_records_its_start_but_credits_nothing(
+    conn, ref, monkeypatch,
+):
+    """Contract amendment 4 (revision 7): a final job of this cycle that
+    finished and was delivered before Mark executed still belongs to the
+    wave — dropping it would let the next re-plan plan the whole wave
+    again. So the feeds include completed jobs and a delivered job
+    records [start, runs x portion] in job_starts ONLY: its output is on
+    hand, so no in_progress, no active-job count, no job_ends. It still
+    passes the tracked-system filter and the job_id dedup; a delivered
+    LAB job records nothing."""
+    add_character(conn, 2001)
+    hulk = ref.type_id("Hulk")
+    done = job(1, 2001, hulk, runs=2)
+    done["status"] = "delivered"
+    done["start_date"] = "2026-09-25T09:30:00Z"
+    done_far = job(2, 2001, hulk, runs=5, location=70000001)
+    done_far["status"] = "delivered"
+    done_far["start_date"] = "2026-09-25T09:40:00Z"
+    conn.execute(
+        "INSERT INTO location_system (location_id, solar_system_id) "
+        "VALUES (?, ?)",
+        (70000001, UNTRACKED),
+    )
+    conn.commit()
+    copy_done = job(3, 2001, 999, activity=config.ACTIVITY_COPYING,
+                    blueprint_type=999)
+    copy_done["status"] = "delivered"
+    copy_done["start_date"] = "2026-09-25T09:50:00Z"
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: [dict(done), done_far, copy_done]},
+        corp_assets={2001: []},
+        corp_jobs={2001: [done]},  # the corp feed claims it first
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert state["job_starts"] == {hulk: [["2026-09-25T09:30:00Z", 2]]}
+    assert state["in_progress"] == {}
+    assert state["active_jobs"] == {
+        config.ACTIVITY_MANUFACTURING: 0, config.ACTIVITY_REACTION: 0,
+    }
+    assert state["job_ends"][config.ACTIVITY_MANUFACTURING] == []
+    row = conn.execute("SELECT job_rows FROM esi_corp").fetchone()
+    assert row["job_rows"] == 0  # "N jobs" counts live jobs only
+
+
+def test_cancelled_and_reverted_jobs_record_nothing(conn, ref, monkeypatch):
+    """Only active / paused / ready (credited) and delivered (start only)
+    jobs are recorded; a cancelled or reverted job leaves no trace in any
+    of the job maps."""
+    add_character(conn, 2001)
+    hulk = ref.type_id("Hulk")
+    records = []
+    for job_id, status in ((1, "cancelled"), (2, "reverted")):
+        record = job(job_id, 2001, hulk, runs=3)
+        record["status"] = status
+        record["start_date"] = "2026-09-25T09:30:00Z"
+        records.append(record)
+    patch_pull(
+        monkeypatch,
+        personal_jobs={2001: records},
+        corp_assets={2001: []},
+        corp_jobs={2001: []},
+        corp_wallets={2001: 0.0},
+    )
+    state = esi.refresh_state(conn, ref)
+    assert state["job_starts"] == {}
+    assert state["in_progress"] == {}
+    assert state["active_jobs"][config.ACTIVITY_MANUFACTURING] == 0
+    assert state["job_ends"][config.ACTIVITY_MANUFACTURING] == []
+
+
+def test_the_job_feeds_ask_for_completed_jobs(conn, monkeypatch):
+    """Both job fetchers request include_completed (revision 7) — on every
+    page of the paginated corp feed — while the other paginated endpoints
+    stay unchanged."""
+    calls = []
+
+    def fake_get(conn_, cid, path, params=None):
+        calls.append((path, dict(params or {})))
+        return [{"job_id": len(calls)}], {"X-Pages": "2"}
+
+    monkeypatch.setattr(esi, "_get", fake_get)
+    esi.fetch_corp_industry_jobs(conn, 2001, PLAYER_CORP)
+    esi.fetch_industry_jobs(conn, 2001)
+    esi.fetch_assets(conn, 2001)
+    corp_path = f"/corporations/{PLAYER_CORP}/industry/jobs/"
+    assert calls[:2] == [
+        (corp_path, {"include_completed": "true", "page": 1}),
+        (corp_path, {"include_completed": "true", "page": 2}),
+    ]
+    assert calls[2] == (
+        "/characters/2001/industry/jobs/", {"include_completed": "true"}
+    )
+    assert calls[3] == ("/characters/2001/assets/", {"page": 1})
 
 
 # --- Lab job crediting (v1.23) ----------------------------------------------

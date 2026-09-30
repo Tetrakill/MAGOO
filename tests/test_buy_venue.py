@@ -597,7 +597,11 @@ def _buy_row(name, type_id, qty, price=1000.0, venue=HUB, units_cheaper=None):
     }
 
 
-def test_run_detail_renders_venue_column_shallow_flag_and_two_multibuys(ref):
+def test_the_jobs_page_no_longer_renders_the_venue_column_or_multibuy(ref):
+    """v1.29 (ruling R2, 2026-09-24): purchasing left the Industry Jobs
+    page. The venue cell, the fill tooltips and both Multibuy blocks live
+    on the Buy tab now — tests/test_buy_tab.py covers them there — and the
+    _buy_context derivations they are built from are unchanged."""
     from flask import render_template
 
     trit = _buy_row("Tritanium", ref.type_id("Tritanium"), 5000,
@@ -624,20 +628,16 @@ def test_run_detail_renders_venue_column_shallow_flag_and_two_multibuys(ref):
     app = _app()
     with app.test_request_context("/runs/1"):
         html = render_template("run_detail.html", **ctx)
-    assert "<th class=\"cat\">Venue</th>" in html
-    # v1.26.1: a single-quote structure row whose ladder covers only part
-    # of the buy reads as a split in the venue cell — no 'thin book' badge.
-    assert ">Jita 3,500 · C-J6 1,500</span>" in html and ">Jita</span>" in html
-    assert "1 split" in html and "thin book" not in html
-    assert "holds only 1,500 of 5,000 units below the Jita landed price" in html
-    assert "one block per market" in html
-    assert "<p class=\"muted\">Jita</p>" in html
-    assert "<p class=\"muted\">C-J6 structure market</p>" in html
-    assert ">Tritanium 1500</textarea>" in html
-    assert ">Pyerite 12\nTritanium 3500</textarea>" in html
+    assert "<th class=\"cat\">Venue</th>" not in html
+    assert ">Jita 3,500 · C-J6 1,500</span>" not in html
+    assert "1 split" not in html
+    assert "holds only 1,500 of 5,000 units below the Jita landed price" not in html
+    assert "one block per market" not in html and "<textarea" not in html
+    # what this page keeps: the wallet stat over the plan's buy list
+    assert "Buy total" in html and "2 items" in html
 
 
-def test_run_detail_without_structure_buys_keeps_single_multibuy(ref):
+def test_the_jobs_page_shows_no_buy_badges_without_structure_buys(ref):
     from flask import render_template
 
     pyer = _buy_row("Pyerite", ref.type_id("Pyerite"), 12)
@@ -663,7 +663,7 @@ def test_run_detail_without_structure_buys_keeps_single_multibuy(ref):
         html = render_template("run_detail.html", **ctx)
     assert "via C-J6" not in html and "unsourced" not in html
     assert "one block per market" not in html
-    assert html.count("<textarea") == 1
+    assert html.count("<textarea") == 0   # R2: no Multibuy on this page
     assert "C-J6 structure market" not in html
 
 

@@ -1,0 +1,189 @@
+{# "Why this quantity" — the shared deficit breakdown dialog, opened by
+   m.item_cell / m.item_button from any run page that lists plan rows.
+   v1.29 (ruling 2026-09-24) moved the bought rows to the Buy tab, so the
+   dialog has to live on both pages rather than under the buy table it
+   used to sit beside; including it twice on one page would duplicate the
+   ids, so each template includes it exactly once, at the end. #}
+<dialog id="deficit" class="breakdown" aria-labelledby="deficit-name">
+  <div class="dialog-head">
+    <h2 id="deficit-name"></h2>
+    <form method="dialog"><button class="mini">close</button></form>
+  </div>
+  <table id="deficit-math" style="max-width:24rem"></table>
+  <p class="muted" id="deficit-answer" style="margin:.6rem 0 0"></p>
+  <p style="margin:.4rem 0 0"><a id="deficit-chain">view in stockpile →</a></p>
+</dialog>
+<script>
+// The "why" sentence under a final's rows (fix pass 2026-09-29): named by
+// cause — the installed wave, the whole-copy remainder, other pipelines'
+// draw — so a single-role whole-copy final is never told other pipelines
+// are involved.
+function finalAnswer(d, target, deficit) {
+  const installed = Number(d.installed || 0);
+  const known = d.wave !== "" && d.wave !== undefined;
+  const requested = known ? Number(d.requested || 0) : target;
+  const wave = known ? Number(d.wave) : target;
+  const left = wave - Math.min(installed, wave);
+  // A run planned before the wave columns has only the target (the cycle
+  // need, other pipelines' draw included) to compare against.
+  const drawn = known ? deficit > left : deficit !== left;
+  if (installed > 0) {
+    return "Final jobs started since this buying cycle opened are this cycle's wave; the plan builds the rest."
+      + (wave > requested
+          ? " The wave counts the whole blueprint copies it was planned at: the copy in use keeps its unused runs, so the rest is built in exact runs."
+          : "")
+      + (installed > wave
+          ? " Units installed beyond the wave count as stock."
+          : "")
+      + (drawn
+          ? " Other pipelines' draw on this final is netted against the stock and in-flight jobs beyond the wave."
+          : "");
+  }
+  return drawn
+    ? "Finals build their requested quantity every cycle; the share other pipelines' jobs draw is netted against stock and in-flight jobs."
+    : "Finals build the full cycle quantity every cycle, less what this cycle's own jobs already installed — stock on hand is not netted.";
+}
+// One shared dialog, filled from the clicked row's data attributes — the
+// chain has 300+ items, so per-item dialogs would bloat the DOM. The
+// equation matches the engine's three deficit rules: intermediates end
+// the cycle back at target, raws buy just-in-time, finals build the cycle
+// quantity less what is already installed this cycle.
+function openDeficit(btn) {
+  const d = btn.dataset;
+  const qty = n => Number(n).toLocaleString("en-US");
+  const target = Number(d.target), onhand = Number(d.onhand),
+        injobs = Number(d.injobs), deficit = Number(d.deficit);
+  let rows;
+  if (d.kind === "final" && d.wave !== "" && d.wave !== undefined) {
+    // v1.29 revision 7 (user ruling 2026-09-29): final jobs started inside
+    // the current buying cycle are this cycle's wave — the plan builds the
+    // rest. The rows read the engine's own figures (fix pass 2026-09-29:
+    // index_run_item.requested_qty / wave_qty) rather than inferring them
+    // from the target, which for a final is the cycle need — the request
+    // plus any other pipeline's draw — and never the whole-copy wave:
+    //   wave     = the request, or once installs exist the whole copies
+    //              it was planned at (contract amendment 8)
+    //   deficit  = wave − installed (capped at the wave)
+    //              + other pipelines' draw beyond the free stock
+    const requested = Number(d.requested || 0), wave = Number(d.wave);
+    const credit = Math.min(Number(d.installed || 0), wave);
+    const left = wave - credit;
+    rows = [["requested this cycle", qty(requested)]];
+    if (wave > requested) rows.push(["+ rest of the whole copies it was planned at", qty(wave - requested)]);
+    if (credit > 0) rows.push(["− already installed this cycle", qty(credit)]);
+    if (deficit > left) {
+      // A dual-role final: another pipeline consumes it, and the engine
+      // nets that draw against the free stock (stock and jobs beyond this
+      // cycle's installed wave); from empty stock it builds on top.
+      rows.push(["+ other pipelines' draw beyond free stock", qty(deficit - left)]);
+    } else if (deficit < left) {
+      rows.push(["− covered by stock / in-flight jobs", qty(left - deficit)]);
+    }
+    if (rows.length > 1) {
+      rows.push(["= to build", qty(deficit)]);
+    } else {
+      rows = [["cycle quantity — finals always build", qty(deficit)]];
+    }
+  } else if (d.kind === "final") {
+    // A run planned before the wave columns (NULL wave_qty): the target is
+    // the only cycle figure on record, so the rows infer from it.
+    const installed = Math.min(Number(d.installed || 0), target);
+    const rest = target - installed;
+    rows = [["cycle quantity"
+             + (deficit !== rest ? " (incl. other pipelines' draw)" : ""), qty(target)]];
+    if (installed > 0) rows.push(["− already installed this cycle", qty(installed)]);
+    if (deficit < rest) {
+      rows.push(["− covered by stock / in-flight jobs", qty(rest - deficit)]);
+    } else if (deficit > rest) {
+      rows.push(["+ their catch-up beyond stock", qty(deficit - rest)]);
+    }
+    if (rows.length > 1) {
+      rows.push(["= to build", qty(deficit)]);
+    } else {
+      rows = [["cycle quantity — finals always build", qty(deficit)]];
+    }
+  } else if (deficit > 0 && d.kind === "raw") {
+    rows = [
+      ["target — planned consumption + margin", qty(target)],
+      ["− on hand", qty(onhand)],
+      ["− in jobs", qty(injobs)],
+      ["= deficit", qty(deficit)],
+    ];
+    // Runs planned before the just-in-time raw rule persisted an extra
+    // cycle's draw in the deficit; recover it so the rows still sum.
+    const legacyDraw = deficit - target + onhand + injobs;
+    if (legacyDraw !== 0) rows.splice(1, 0, ["+ planned draw this cycle", qty(legacyDraw)]);
+  } else if (deficit > 0) {
+    // Buildable intermediate: the engine sizes the deficit against the
+    // allocation's actual draw (not the steady-state need), so recover
+    // that term from the identity deficit = target + draw − stock − jobs.
+    rows = [
+      ["target stock", qty(target)],
+      ["+ planned draw this cycle", qty(deficit - target + onhand + injobs)],
+      ["− on hand", qty(onhand)],
+      ["− in jobs", qty(injobs)],
+      ["= deficit", qty(deficit)],
+    ];
+  } else {
+    // Clamped to zero — stock and jobs exceed the requirement, so an
+    // operator equation would not sum. Plain facts instead.
+    rows = [
+      ["target stock", qty(target)],
+      ["steady cycle need", qty(d.need)],
+      ["on hand", qty(onhand)],
+      ["in jobs", qty(injobs)],
+      ["= deficit", "0"],
+    ];
+  }
+  const table = document.getElementById("deficit-math");
+  table.textContent = "";
+  rows.forEach(([label, value], i) => {
+    const tr = document.createElement("tr");
+    const td1 = document.createElement("td");
+    if (i === rows.length - 1 && rows.length > 1) {
+      const b = document.createElement("b");
+      b.textContent = label;
+      td1.appendChild(b);
+    } else {
+      td1.textContent = label;
+    }
+    const td2 = document.createElement("td");
+    td2.className = "num";
+    td2.textContent = value;
+    tr.append(td1, td2);
+    table.appendChild(tr);
+  });
+  document.getElementById("deficit-name").textContent = d.name;
+  const parts = [];
+  if (Number(d.buy)) parts.push("buys " + qty(d.buy));
+  if (Number(d.build)) parts.push("builds " + qty(d.build));
+  // Review 2026-09-05: a raw part-covered by compressed purchases used to
+  // read "buys N" for the direct remainder only — the covered leg was
+  // missing, so the answer never summed to the deficit.
+  if (Number(d.covered)) parts.push(
+    (parts.length ? "" : "buys nothing direct — ")
+    + qty(d.covered) + " come from reprocessing compressed purchases");
+  // Composite output from this cycle's alchemy jobs covers part of the
+  // deficit too (a displaced direct job, or a replaced purchase — the
+  // buy is already net of it), so it is neither "unmet" nor missing.
+  if (Number(d.alchemy)) parts.push(
+    "expects " + qty(d.alchemy) + " from the alchemy route");
+  // v1.26: a capacity loser buys only what the market holds; say what
+  // is left unmet rather than stop at "the plan buys N".
+  const shortfall = Number(d.deficit) - Number(d.build) - Number(d.buy)
+    - Number(d.covered) - Number(d.alchemy || 0);
+  const unmetNote = (d.kind !== "final" && parts.length && shortfall > 0)
+    ? " " + qty(shortfall) + " unmet: out of slots, and the market holds no more."
+    : "";
+  document.getElementById("deficit-answer").textContent =
+    d.kind === "final"
+      ? finalAnswer(d, target, deficit)
+      : Number(d.deficit) > 0
+        ? (parts.length ? "The plan " + parts.join(" and ") + "." + unmetNote
+                        : "Unmet — no market to buy from and no slots to build in.")
+        : "No deficit — covered by stock and jobs.";
+  document.getElementById("deficit-chain").href =
+    "{{ url_for('run_detail', index_run_id=run.index_run_id, view='chain') }}#item-" + d.type;
+  document.getElementById("deficit").showModal();
+}
+</script>

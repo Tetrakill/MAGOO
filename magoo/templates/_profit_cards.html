@@ -27,7 +27,7 @@
     <td class="num" title="{{ card.cost.total|isk }}">{{ card.cost.total|isk_short }}</td>
     <td class="num" title="{{ card.price|isk }}">{{ card.price|isk_short }}</td>
     {% set cut = lagged and card.cost.hulls_planned is not none and card.cost.hulls_per_cycle < card.cost.hulls_planned %}
-    <td class="num {% if cut %}{{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}{% endif %}"{% if cut %} title="the plan wanted {{ card.cost.hulls_planned|qty }} this cycle; stock on hand, in-flight jobs and the buys fed the jobs for {{ card.cost.hulls_per_cycle|qty }} — this pipeline's share of the hulls the Plan tab told you to start (rounded up where another pipeline shares the final)"{% endif %}>{{ card.cost.hulls_per_cycle|qty }}</td>
+    <td class="num {% if cut %}{{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}{% endif %}"{% if cut %} title="the plan wanted {{ card.cost.hulls_planned|qty }} this cycle; stock on hand, in-flight jobs and the buys fed the jobs for {{ card.cost.hulls_per_cycle|qty }} — this pipeline's share of the hulls the Industry Jobs tab told you to start (rounded up where another pipeline shares the final)"{% endif %}>{{ card.cost.hulls_per_cycle|qty }}</td>
     <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}"
         title="{{ card.margin|isk }}">{{ card.margin|isk_short }}</td>
     <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}">
@@ -100,9 +100,37 @@
       <td>{{ line.name }}
         {% if line.missing_price %}<span class="badge warn" title="no price on record for this input — it counts as 0 in the total">no price</span>{% endif %}
         {% if not lagged and line.region_price %}<span class="badge" title="no hub-station order; region-wide best order from the NPC-goods region">region price</span>{% endif %}
-        {% if line.kind == 'material' and line.venue == 'structure' %}<span class="badge accent" title="{% if lagged %}bought at the structure market (cheaper landed than Jita at that run's plan time){% else %}cheaper landed at the structure market than at Jita{% endif %}">{{ settings.structure_market_label() }}</span>{% endif %}
-        {% if line.kind == 'material' and line.venue == 'split' %}<span class="badge accent" title="bought at both markets at that run's plan time — {{ "%.0f"|format(line.hub_fraction * 100) }}% of the units from Jita, the rest from {{ settings.structure_market_label() }}; freight splits the same way">Jita + {{ settings.structure_market_label() }}</span>{% endif %}
-        {% if line.landed %}<span class="badge accent" title="part-sourced from compressed ore / gas at that run's plan time — the unit cost is the blended landed figure, inbound freight included (so no share of the freight lines below)">compressed</span>{% endif %}</td>
+        {# v1.29: on a BOUGHT line (CostLine.locked — the field keeps its
+           first name) the venue is where the ESI purchases say the units
+           came from, not the plan's landed comparison — which the override
+           has just replaced, and which the user may well have bought
+           against (review 2026-09-23; revision 3 wording 2026-09-28). #}
+        {% if line.kind == 'material' and line.venue == 'structure' %}<span class="badge accent" title="{% if line.locked %}every unit bought at the structure market, from the ESI purchases matched to that run on its Buy tab{% elif lagged %}bought at the structure market (cheaper landed than Jita at that run's plan time){% else %}cheaper landed at the structure market than at Jita{% endif %}">{{ settings.structure_market_label() }}</span>{% endif %}
+        {# v1.29: a split may now carry a DELIVERED share (a purchase line
+           whose price is already landed) or, since revision 4 (user ruling
+           2026-09-28), an ELSEWHERE share (bought at neither market, landed
+           at the default inbound rate). A purchase-priced line is 'split'
+           whenever ANY two of the four buckets hold units (PurchaseBlend.
+           venue), so Jita + delivered or delivered + elsewhere are splits
+           too: the label and the title name only the venues that supplied
+           units (review 2026-09-28 — "Jita + C-J6" with 0% from C-J6 was
+           false), and "both markets" is said only when Jita and the
+           structure market are the whole of it. #}
+        {% if line.kind == 'material' and line.venue == 'split' -%}
+          {%- set sm = settings.structure_market_label() -%}
+          {%- set sp = namespace(names=[], shares=[]) -%}
+          {%- if line.hub_fraction -%}{%- set sp.names = sp.names + ['Jita'] -%}{%- set sp.shares = sp.shares + [(line.hub_fraction, 'from Jita')] -%}{%- endif -%}
+          {%- if line.structure_fraction -%}{%- set sp.names = sp.names + [sm] -%}{%- set sp.shares = sp.shares + [(line.structure_fraction, 'from ' ~ sm)] -%}{%- endif -%}
+          {%- if line.delivered_fraction -%}{%- set sp.names = sp.names + ['delivered'] -%}{%- set sp.shares = sp.shares + [(line.delivered_fraction, 'delivered (already landed — it hauls nothing)')] -%}{%- endif -%}
+          {%- if line.other_fraction -%}{%- set sp.names = sp.names + ['elsewhere'] -%}{%- set sp.shares = sp.shares + [(line.other_fraction, 'elsewhere (at neither market — landed at the default inbound rate)')] -%}{%- endif -%}
+          {%- set two_markets = line.hub_fraction and line.structure_fraction and not line.delivered_fraction and not line.other_fraction -%}
+          <span class="badge accent" title="bought at {{ 'both markets' if two_markets else 'several venues' }}{% if line.locked %} — from the ESI purchases matched to that run on its Buy tab{% else %} at that run's plan time{% endif %}: {% if two_markets %}{{ "%.0f"|format(line.hub_fraction * 100) }}% of the units from Jita, the rest from {{ sm }}{% else %}{% for frac, where in sp.shares %}{{ "%.0f"|format(frac * 100) }}%{% if loop.first %} of the units{% endif %} {{ where }}{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}; freight splits the same way">{{ sp.names|join(' + ') }}</span>
+        {%- endif %}
+        {% if line.kind == 'material' and line.venue == 'delivered' %}<span class="badge accent" title="every unit bought delivered — the price recorded is already landed, so this line carries no inbound freight">delivered</span>{% endif %}
+        {% if line.kind == 'material' and line.venue == 'other' %}<span class="badge" title="every unit bought at neither Jita 4-4 nor the structure market, from the ESI purchases matched to that run on its Buy tab — landed at that run's default inbound rate (Settings)">elsewhere</span>{% endif %}
+        {% if line.landed %}<span class="badge accent" title="part-sourced from compressed ore / gas{% if line.locked %} — re-blended from what those ores actually cost (the refining tax stays the plan's){% else %} at that run's plan time{% endif %}: the unit cost is the blended landed figure, inbound freight included (so no share of the freight lines below)">compressed</span>{% endif %}
+        {% if line.locked %}<span class="badge good" title="priced from the ESI purchases matched to the run it lags to (its Buy tab) — what you actually paid for the units that cycle consumed, not the plan's estimate">bought</span>{% endif %}
+        {% if line.approximate %}<span class="badge warn" title="this run was planned before v1.29, so the compressed re-blend had to infer the ore's share of each raw and knows no refining tax — approx. shares and no refining tax">approx.</span>{% endif %}</td>
       <td class="muted">{{ line.kind }}</td>
       <td class="num">{{ line.depth }}</td>
       <td class="num">{{ "%.2f"|format(line.qty_per_hull) }}</td>

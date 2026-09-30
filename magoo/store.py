@@ -7,8 +7,11 @@ class_setting row per item class.
 """
 
 import logging
+import math
 import sqlite3
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields
+from typing import Any
 
 from magoo import __version__
 
@@ -21,7 +24,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -417,6 +420,160 @@ CREATE TABLE IF NOT EXISTS sales_pull (
     pulled_at        TEXT NOT NULL,
     PRIMARY KEY (owner_kind, owner_id, family, division)
 );
+
+-- Buy tab (v1.29, schema 12): what the pool ACTUALLY paid for an input
+-- of a run. Several lines per item — that is how a purchase split across
+-- venues, owners or orders is recorded. These are run purchase LINES,
+-- not the dormant FIFO lots engine.record_purchase writes; the two
+-- vocabularies stay apart (contract review A4). Realized costing lets
+-- these override the plan's price snapshot; a run with no rows here
+-- costs exactly as it did before v1.29. 'delivered' is a purchase venue
+-- only (never a plan venue): its unit_price is already landed, so no
+-- freight is added to it.
+--
+-- Revision 3 (user rulings 2026-09-28): the lines are DERIVED from ESI
+-- (buy_transaction / buy_contract below) by buying.assign_purchases —
+-- esi_kind, esi_id, contract_k, date and owner_* arrive via _MIGRATIONS
+-- so a database already stamped 12 gains them; a row with esi_kind NULL
+-- is not derived and replace_derived_purchases never touches it.
+--
+-- Revision 4 (user ruling 2026-09-28): 'other' is a purchase venue — a
+-- buy anywhere but the Jita hub station and the configured structure
+-- market, hauled at settings.freight_in_default_isk_per_m3. A database
+-- already at 12 carries the three-venue CHECK, which SQLite cannot
+-- alter: _rebuild_run_purchase_for_other_venue rebuilds it (contract
+-- review A2). Keep this CHECK and that rebuild's in step.
+CREATE TABLE IF NOT EXISTS run_purchase (
+    purchase_id   INTEGER PRIMARY KEY,
+    index_run_id  INTEGER NOT NULL REFERENCES index_run,
+    type_id       INTEGER NOT NULL,
+    venue         TEXT NOT NULL CHECK (venue IN ('hub','structure','delivered','other')),
+    source        TEXT CHECK (source IN ('sell','split','buy') OR source IS NULL),
+    quantity      INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price    REAL NOT NULL CHECK (unit_price >= 0),
+    note          TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS run_purchase_run ON run_purchase (index_run_id, type_id);
+
+-- Buy-side history (v1.29 revision 3, user ruling R1 2026-09-28). The
+-- Ledger pull already reads every enabled owner's wallet transactions and
+-- contracts; these tables keep the side of them it used to drop, so the
+-- Buy tab's purchases come from ESI and nothing is hand-entered. They
+-- mirror the sale_* tables above and share their conventions: ESI
+-- timestamps verbatim (...Z), no CHECK on ESI enums (contract type /
+-- status), rows are history and never deleted. Every owner's buys are
+-- STORED; the per-owner Count buys toggle is honoured at READ time only
+-- (buys_enabled_owners, the schema-9 precedent — contract review C7), so
+-- switching it back on loses nothing. Schema 12 had not shipped when
+-- these arrived, so they are plain CREATE IF NOT EXISTS and the stamp
+-- does not move.
+--
+-- Wallet buys (is_buy = true), upserted with the Ledger's owner re-own
+-- rule (ledger._OWNER_REOWN): a corp-wallet buy seen through the buying
+-- character's feed is stored under the corporation.
+CREATE TABLE IF NOT EXISTS buy_transaction (
+    transaction_id  INTEGER PRIMARY KEY,   -- ESI market transaction id (global)
+    owner_kind      TEXT NOT NULL CHECK (owner_kind IN ('character','corporation')),
+    owner_id        INTEGER NOT NULL,
+    division        INTEGER,               -- corp wallet 1..7; NULL = character wallet / not yet known
+    source_feed     TEXT NOT NULL CHECK (source_feed IN ('character','corporation')),
+    type_id         INTEGER NOT NULL,
+    quantity        INTEGER NOT NULL,
+    unit_price      REAL NOT NULL,
+    date            TEXT NOT NULL,
+    location_id     INTEGER NOT NULL,
+    client_id       INTEGER,               -- the seller (internal-transfer rule, review C9)
+    journal_ref_id  INTEGER,
+    fetched_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS buy_transaction_date ON buy_transaction (date);
+CREATE INDEX IF NOT EXISTS buy_transaction_owner
+    ON buy_transaction (owner_kind, owner_id, transaction_id);
+
+-- Item exchanges the pool ACCEPTED (owner_* is the buyer; the issuer is
+-- the seller). Never mixed into sale_contract: the Ledger's tables and
+-- queries stay byte-identical (§3). The acceptor pays price and receives
+-- reward (review C9). The R7 allocation is frozen per CONTRACT, not per
+-- run (review C10): once every received item has a reference price, k,
+-- priced_at and buy_contract_item.unit_price are written and never
+-- recomputed, so a reopen that moves the contract to another run keeps
+-- its prices. excluded names why a contract is listed but not costed:
+-- 'internal' (issued by the pool itself, or on behalf of one of its
+-- corporations — an alt's 0-ISK hand-over is not a purchase; a corpmate
+-- outside the pool selling personally is), 'swap' (the acceptor also gives items, or price - reward
+-- <= 0) or 'no_price' (no received item has a reference price, so k is
+-- NULL); NULL = costed. That one is Magoo's own vocabulary, so it carries
+-- a CHECK.
+CREATE TABLE IF NOT EXISTS buy_contract (
+    contract_id           INTEGER PRIMARY KEY,
+    owner_kind            TEXT NOT NULL CHECK (owner_kind IN ('character','corporation')),
+    owner_id              INTEGER NOT NULL,
+    issuer_id             INTEGER NOT NULL,
+    issuer_corporation_id INTEGER,
+    acceptor_id           INTEGER,
+    type                  TEXT NOT NULL,
+    status                TEXT NOT NULL,
+    price                 REAL,            -- ESI omits it on some contracts (NULL counts as 0)
+    reward                REAL,
+    title                 TEXT,
+    date_issued           TEXT NOT NULL,
+    date_accepted         TEXT,
+    date_completed        TEXT,
+    start_location_id     INTEGER,
+    via_character_id      INTEGER,         -- provenance only (NULLed on character delete)
+    first_seen_at         TEXT NOT NULL,
+    last_seen_at          TEXT NOT NULL,
+    items_fetched_at      TEXT,            -- NULL = items still to fetch
+    items_status          TEXT CHECK (items_status IN ('ok','missing','unavailable')),
+    items_attempts        INTEGER NOT NULL DEFAULT 0,
+    k                     REAL,            -- R7 scale: P / sum(p_i * q_i); NULL until priced
+    unpriced_items        INTEGER NOT NULL DEFAULT 0,
+    priced_at             TEXT,            -- set once every received item was priced (frozen)
+    excluded              TEXT CHECK (excluded IN ('internal','swap','no_price')
+                                      OR excluded IS NULL)
+);
+CREATE INDEX IF NOT EXISTS buy_contract_status
+    ON buy_contract (type, status, date_completed);
+
+CREATE TABLE IF NOT EXISTS buy_contract_item (
+    contract_id  INTEGER NOT NULL REFERENCES buy_contract,
+    record_id    INTEGER NOT NULL,
+    type_id      INTEGER NOT NULL,
+    quantity     INTEGER NOT NULL,
+    raw_quantity INTEGER,                  -- -1 singleton, -2 blueprint copy (never priced, C10)
+    is_included  INTEGER NOT NULL,         -- 1 = the issuer gives (we received it), 0 = we gave it
+    is_singleton INTEGER,
+    unit_price   REAL,                     -- frozen R7 price k * p_i (0 for an unpriced item)
+    PRIMARY KEY (contract_id, record_id)
+);
+CREATE INDEX IF NOT EXISTS buy_contract_item_type ON buy_contract_item (type_id);
+
+-- An EXECUTED run's unplanned-ore conversions, kept apart from its
+-- run_purchase lines (v1.29 revision 4, review 2026-09-28). The freeze
+-- (buying._RunOres) re-emits a record's refined mineral lines verbatim on
+-- an executed run; reading them only from run_purchase lost them the
+-- moment a pass stopped costing the record (Count buys off, a character
+-- removed) — replace_derived_purchases drops its lines — so switching it
+-- back on re-converted at the CURRENT yield, tax and prices and moved the
+-- run's realized cost. One row per refined line: (run, ESI record, ore,
+-- raw) → units and landed unit price, plus the contract_k the lines were
+-- written under (a contract still re-deriving recomputes). Rows exist
+-- only for executed runs: the pass clears every other run's, so a
+-- reopen re-derives as before. delete_run_purchases clears a run's.
+-- Schema 12 had not shipped when this arrived: plain CREATE IF NOT
+-- EXISTS, the stamp does not move.
+CREATE TABLE IF NOT EXISTS run_purchase_refine (
+    index_run_id INTEGER NOT NULL REFERENCES index_run,
+    esi_kind     TEXT NOT NULL CHECK (esi_kind IN ('transaction','contract')),
+    esi_id       INTEGER NOT NULL,
+    via_type_id  INTEGER NOT NULL,
+    type_id      INTEGER NOT NULL,
+    quantity     INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price   REAL NOT NULL CHECK (unit_price >= 0),
+    contract_k   REAL,
+    PRIMARY KEY (index_run_id, esi_kind, esi_id, via_type_id, type_id)
+);
 """
 
 # Columns added after the original schema; applied idempotently.
@@ -527,8 +684,9 @@ _MIGRATIONS = (
     # cost). NULL on pre-fix rows -> costing falls back to the merged depth.
     "ALTER TABLE index_run_item_pipeline ADD COLUMN depth INTEGER",
     # 2026-08-20: end dates of active jobs occupying pool slots (json
-    # {activity_id: [iso timestamps]}), so planning can net multi-cycle
-    # jobs — still running past the next index run — from the slot pool.
+    # {activity_id: [iso timestamps]}). Planning netted multi-cycle jobs
+    # from the slot pool with them until v1.29 revision 6 (user ruling R2
+    # 2026-09-28); they are still stored, but no planning step reads them.
     "ALTER TABLE esi_snapshot ADD COLUMN job_ends TEXT",
     # 2026-08-20: two overlapping /run requests both computed MAX+1 and
     # inserted duplicate run numbers, which would corrupt the lag-costing
@@ -571,6 +729,13 @@ _MIGRATIONS = (
     # and, for structure buys, how many units of the structure's sell
     # ladder still beat the Jita landed price (the depth flag's numerator).
     "ALTER TABLE settings ADD COLUMN structure_freight_in_isk_per_m3 REAL "
+    "NOT NULL DEFAULT 0.0",
+    # v1.29 revision 4 (user ruling 2026-09-28, schema 12 unshipped): the
+    # inbound rate for a purchase anywhere but Jita 4-4 and the structure
+    # market (another station, another structure, a contract elsewhere,
+    # no location). DEFAULT 0 — the user named no figure (contract review
+    # A16), so while it is 0 such a purchase carries no freight.
+    "ALTER TABLE settings ADD COLUMN freight_in_default_isk_per_m3 REAL "
     "NOT NULL DEFAULT 0.0",
     "ALTER TABLE settings ADD COLUMN structure_buy_enabled INTEGER "
     "NOT NULL DEFAULT 1",
@@ -722,6 +887,18 @@ _MIGRATIONS = (
     "ALTER TABLE index_run_item ADD COLUMN compressed_wanted_qty INTEGER",
     "ALTER TABLE index_run ADD COLUMN freight_in_isk_per_m3 REAL",
     "ALTER TABLE index_run ADD COLUMN structure_freight_in_isk_per_m3 REAL",
+    # v1.29 revision 4 (2026-09-28): the default ('other' venue) rate the
+    # run was planned at, same vintage rule as the two above; NULL on runs
+    # planned before it, which fall back to the live setting (contract
+    # review A1).
+    "ALTER TABLE index_run ADD COLUMN freight_in_default_isk_per_m3 REAL",
+    # ... and the structure market it was planned against (review
+    # 2026-09-28): an EXECUTED run's purchases are classed hub / structure
+    # / other against it (buying.purchase_venue), so pointing Settings at
+    # another structure later does not reclass that run's history onto
+    # another freight leg. NULL on runs planned before it: the live
+    # setting, as for the rates.
+    "ALTER TABLE index_run ADD COLUMN structure_market_id INTEGER",
     "ALTER TABLE hub_sell_order ADD COLUMN min_volume "
     "INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE structure_sell_order ADD COLUMN min_volume "
@@ -780,14 +957,143 @@ _MIGRATIONS = (
     # on rows planned before it existed (the Chain tab then shows the
     # merged BOM figure).
     "ALTER TABLE index_run_item ADD COLUMN cycle_need_qty INTEGER",
-    # v1.27.1 (schema 11): the slot pools the run was planned against —
-    # the settings' pools less the multi-cycle jobs running past the
-    # next index run (engine.snapshot_from_state) — so the run page
-    # measures the plan against the pool it really had; NULL on older
-    # runs (the page falls back to the settings' pools). Review
-    # 2026-09-10.
+    # v1.27.1 (schema 11): the slot pools the run was planned against,
+    # so the run page measures the plan against the pool it really had;
+    # NULL on older runs (the page falls back to the settings' pools).
+    # Review 2026-09-10. Until v1.29 they held the settings' pools less
+    # the multi-cycle jobs running past the next index run (the
+    # 2026-08-20 rule); since v1.29 revision 6 (user ruling R2,
+    # 2026-09-28) they hold the SETTINGS' pools unchanged — the plan
+    # never subtracts running jobs (their output nets through in-progress
+    # stock). Rows written before keep the netted figure they were
+    # planned against.
     "ALTER TABLE index_run ADD COLUMN manufacturing_slots_available INTEGER",
     "ALTER TABLE index_run ADD COLUMN reaction_slots_available INTEGER",
+    # v1.29 (schema 12): what the compressed pass did, persisted so the
+    # Buy tab's purchase lines can RE-BLEND a covered raw instead of
+    # re-deriving plan-time arithmetic. On a compressed ore row:
+    # compressed_alloc is json {raw_type_id: share} — the share of this
+    # pick's landed cost the engine allocated to each covered raw
+    # (per_m[m] / total_value; the shares sum to 1.0 whenever
+    # total_value > 0, and are all 0.0 in the degenerate case the engine
+    # allocates nothing — persisted as used, never normalised, contract
+    # review A5) — compressed_landed_isk is the pick's landed cost
+    # (order ISK + freight + reprocess tax) and compressed_tax_isk the
+    # tax term of it (0.0 for gas, which is untaxed), which stays the
+    # plan's even when the ore is re-priced: it is a function of the
+    # outputs, not of the ore price. On a covered RAW row:
+    # direct_landed_isk is the landed ISK of the direct remainder at
+    # plan time. All four are NULL on runs planned before v1.29.
+    "ALTER TABLE index_run_item ADD COLUMN compressed_alloc TEXT",
+    "ALTER TABLE index_run_item ADD COLUMN compressed_landed_isk REAL",
+    "ALTER TABLE index_run_item ADD COLUMN compressed_tax_isk REAL",
+    "ALTER TABLE index_run_item ADD COLUMN direct_landed_isk REAL",
+    # v1.29 revision 3 (user rulings 2026-09-28, schema 12 still
+    # unshipped, so the stamp does not move): run_purchase lines are
+    # derived from ESI. esi_kind / esi_id name the buy_transaction or
+    # buy_contract a line came from (NULL = not derived: the helpers that
+    # rewrite derived lines never touch it); contract_k copies the
+    # contract's frozen R7 scale onto each of its lines; date and owner_*
+    # are the purchase's own, for the Buy tab's Purchases section. ALTERs,
+    # not STATE_SCHEMA columns, so a database already at 12 gains them.
+    "ALTER TABLE run_purchase ADD COLUMN esi_kind TEXT "
+    "CHECK (esi_kind IN ('transaction','contract') OR esi_kind IS NULL)",
+    "ALTER TABLE run_purchase ADD COLUMN esi_id INTEGER",
+    "ALTER TABLE run_purchase ADD COLUMN contract_k REAL",
+    "ALTER TABLE run_purchase ADD COLUMN date TEXT",
+    "ALTER TABLE run_purchase ADD COLUMN owner_kind TEXT "
+    "CHECK (owner_kind IN ('character','corporation') OR owner_kind IS NULL)",
+    "ALTER TABLE run_purchase ADD COLUMN owner_id INTEGER",
+    # v1.29 revision 4 (user ruling 2026-09-28): an unplanned compressed
+    # ore purchase is written as the minerals it yields; via_type_id names
+    # the ore such a derived mineral line came from (NULL = a direct
+    # purchase line). Only ever set on a 'delivered' line — the landed
+    # price already carries the ore's freight and refining tax.
+    "ALTER TABLE run_purchase ADD COLUMN via_type_id INTEGER",
+    # The index MUST follow the ALTERs and must not live in STATE_SCHEMA:
+    # executescript(STATE_SCHEMA) runs first, when run_purchase has no
+    # esi_kind yet (fresh or at 12), and a CREATE INDEX there would raise
+    # 'no such column' inside executescript, which nothing swallows
+    # (contract review C6.1).
+    "CREATE INDEX IF NOT EXISTS run_purchase_esi "
+    "ON run_purchase (index_run_id, esi_kind, esi_id)",
+    # Per-owner Count buys (R4), the sibling of count_sales, default on.
+    # Honoured at READ time only (buys_enabled_owners): the pull stores
+    # every owner's buys, so switching it back on recovers them (C7).
+    "ALTER TABLE pool_character ADD COLUMN count_buys INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE esi_corp ADD COLUMN count_buys INTEGER NOT NULL DEFAULT 1",
+    # ESI's for_corporation flag on a bought contract (review 2026-09-28):
+    # issuer_corporation_id is the issuer's corporation on EVERY contract,
+    # so only a contract issued on the corporation's behalf may be called
+    # internal by its corporation — a corpmate outside the pool selling
+    # personally is a real purchase. The ledger upsert overwrites it on
+    # every pull, so a dev row stored before the column heals on the next
+    # refresh.
+    "ALTER TABLE buy_contract ADD COLUMN for_corporation INTEGER NOT NULL DEFAULT 0",
+    # Revisions 1-2's click-to-lock choice table never shipped and
+    # revision 3 retired it. A dev database at 12 may still hold it, and
+    # its rows reference index_run, so an orphan row would block
+    # web.run_delete (foreign_keys = ON) now that delete_run_purchases no
+    # longer clears it. IF EXISTS makes this a no-op everywhere else.
+    "DROP TABLE IF EXISTS run_buy_choice",
+    # v1.29 revision 6 (user rulings 2026-09-28, schema 12 still
+    # unshipped, so no version bump; ALTERs, not STATE_SCHEMA columns, so
+    # a dev database already stamped 12 gains them — contract review A9).
+    # R3: at plan time a raw in config.COMPRESSED_SOURCE_GROUPS is
+    # credited with what the hangar's compressed ore / moon ore / gas
+    # reprocesses into at the asserted yields (never ice).
+    # index_run_item.on_hand_qty holds the stock the plan NETTED (ESI
+    # hangar + that credit); on_hand_from_ore_qty is the "incl. N from
+    # hangar compressed ore" part of it (A12), so hangar-only stock is
+    # on_hand_qty − on_hand_from_ore_qty. NULL = planned before the
+    # credit existed; every reader treats NULL as 0.
+    "ALTER TABLE index_run_item ADD COLUMN on_hand_from_ore_qty INTEGER",
+    # R1 + A3: the open run is re-planned IN PLACE on every ESI update, so
+    # planned_start ("when the plan was last computed") moves forward
+    # each time. opened_at is when the run was FIRST planned — the
+    # engine's INSERT writes datetime('now') and the in-place replace
+    # sets COALESCE(opened_at, planned_start) in the same UPDATE that
+    # moves planned_start, never touching it otherwise — and it is what
+    # buying.buying_windows opens a cycle's first window at, so a
+    # re-plan never strands the cycle's earlier purchases. NULL on runs
+    # planned before it: readers fall back to planned_start.
+    "ALTER TABLE index_run ADD COLUMN opened_at TEXT",
+    # Review 2026-09-28, reshaped by the 2026-09-29 ruling (revision 7:
+    # final jobs started inside the current buying cycle are this
+    # cycle's wave; the plan sizes the rest; every ESI update re-plans
+    # the open run — the B1 stop rule is gone): per product, one
+    # [start_date, units] pair per manufacturing/reaction job ESI
+    # reports (active, paused, ready AND delivered — a delivered job must
+    # keep counting or the next re-plan doubles the wave), json
+    # {type_id: [[ESI ISO text, runs x portion], ...]}. The engine sums
+    # the units of starts after the cycle cut. NULL = not recorded; a
+    # value in the pre-2026-09-29 scalar format ({type_id: latest start})
+    # exists only in dev/test databases and latest_esi_snapshot reads it
+    # as NULL too, so the plan sizes the full wave.
+    "ALTER TABLE esi_snapshot ADD COLUMN job_starts TEXT",
+    # Revision 7 (2026-09-29; schema 12 is unreleased, so no bump —
+    # contract amendment 10): the units of this type whose jobs started
+    # inside the current buying cycle (esi_snapshot.job_starts after the
+    # cycle cut). On a final it is the part of the wave already
+    # installed — the plan sizes only the rest, and costing counts it as
+    # built/started so an executed run re-planned after its installs
+    # keeps its hull count; on any row it keeps the R7 "holds jobs this
+    # cycle" predicate true for a consumer with 0 runs left. 0 = none
+    # this cycle; NULL only on rows planned before the column.
+    "ALTER TABLE index_run_item ADD COLUMN installed_qty INTEGER",
+    # Revision 7 fix pass (2026-09-29, same unreleased schema 12): what a
+    # pipeline final's wave was sized against, so the Industry Jobs badge
+    # and the "why this quantity" dialog read the engine's figures rather
+    # than re-deriving them. requested_qty is the pipelines' direct
+    # request (0 on every non-final row); wave_qty is engine._final_wave's
+    # wave — the request, or once part of it is installed this cycle the
+    # whole blueprint copies it was planned at (contract amendment 8), so
+    # "installed 10/10" on 8 requested with 10-run copies rather than
+    # "installed 10/8". wave_qty is NULL on non-finals; both are NULL on
+    # rows planned before the columns (readers fall back to
+    # target_stock_qty).
+    "ALTER TABLE index_run_item ADD COLUMN requested_qty INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN wave_qty INTEGER",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -800,7 +1106,8 @@ CREATE TABLE IF NOT EXISTS esi_snapshot (
     active_jobs     TEXT NOT NULL,   -- json {activity_id: count}
     character_isk   REAL NOT NULL DEFAULT 0,
     corporation_isk REAL NOT NULL DEFAULT 0,
-    job_ends        TEXT             -- json {activity_id: [iso end dates]}
+    job_ends        TEXT,            -- json {activity_id: [iso end dates]}
+    job_starts      TEXT             -- json {type_id: [[start, units], ...]}
 );
 """
 
@@ -908,6 +1215,112 @@ def _recover_orphaned_class_setting(conn: sqlite3.Connection) -> None:
         )
     conn.execute("DROP TABLE class_setting_old")
     conn.commit()
+
+
+# Every column of run_purchase in table order, for the revision-4 CHECK
+# rebuild's copy (contract review A2: an explicit list, never SELECT *).
+_RUN_PURCHASE_COLUMNS = (
+    "purchase_id", "index_run_id", "type_id", "venue", "source", "quantity",
+    "unit_price", "note", "created_at", "esi_kind", "esi_id", "contract_k",
+    "date", "owner_kind", "owner_id", "via_type_id",
+)
+
+
+def _rebuild_run_purchase_for_other_venue(conn: sqlite3.Connection) -> None:
+    """v1.29 revision 4 (user ruling 2026-09-28): the run_purchase.venue
+    CHECK gained 'other' (a purchase anywhere but Jita 4-4 and the
+    structure market). SQLite cannot alter a CHECK, and enforcing the new
+    venue in _validate_purchase alone cannot work — the table's CHECK
+    still refuses every 'other' INSERT, and one such line rolls back the
+    matcher's whole pass (contract review A2). So a database already at
+    12 (dev, the scratch preview copy) gets a create-copy-swap rebuild;
+    a fresh database and the 11 -> 12 upgrade create the table from
+    STATE_SCHEMA with the new CHECK and return at the first test.
+
+    Called from ensure_schema AFTER the _MIGRATIONS loop, so the old table
+    already carries esi_kind .. owner_id and via_type_id. Idempotent: keyed
+    off the stored table SQL. One BEGIN IMMEDIATE ... COMMIT, like
+    _rebuild_class_setting_for_thukker, so a crash mid-rebuild can never
+    strand the lines.
+
+    SQLite's own order: create run_purchase_new, copy, drop the old
+    table, rename, THEN create the indexes. An index keeps its name
+    through ALTER TABLE ... RENAME, so a CREATE INDEX IF NOT EXISTS issued
+    while a renamed old table still existed would be silently skipped and
+    the DROP would then take the index with it (A2.4).
+
+    Connections run with PRAGMA foreign_keys = ON, so only lines whose run
+    still exists are copied; an orphan would otherwise make the INSERT —
+    and with it every start-up — raise. The dropped count is logged.
+    purchase_id is kept (list_purchases orders by it). SCHEMA_VERSION
+    stays 12, so no pre-upgrade backup is taken: accepted, the version is
+    unshipped and derived lines regenerate (A2.6)."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'run_purchase'"
+    ).fetchone()
+    if row is None or "'other'" in row[0]:
+        return
+    columns = ", ".join(_RUN_PURCHASE_COLUMNS)
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # A leftover from a rebuild that died before its COMMIT cannot
+        # exist (DDL is transactional), but IF EXISTS keeps a hand-made
+        # one from blocking every start-up.
+        conn.execute("DROP TABLE IF EXISTS run_purchase_new")
+        conn.execute(
+            """
+            CREATE TABLE run_purchase_new (
+                purchase_id   INTEGER PRIMARY KEY,
+                index_run_id  INTEGER NOT NULL REFERENCES index_run,
+                type_id       INTEGER NOT NULL,
+                venue         TEXT NOT NULL
+                              CHECK (venue IN ('hub','structure','delivered','other')),
+                source        TEXT CHECK (source IN ('sell','split','buy') OR source IS NULL),
+                quantity      INTEGER NOT NULL CHECK (quantity > 0),
+                unit_price    REAL NOT NULL CHECK (unit_price >= 0),
+                note          TEXT,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                esi_kind      TEXT CHECK (esi_kind IN ('transaction','contract')
+                                          OR esi_kind IS NULL),
+                esi_id        INTEGER,
+                contract_k    REAL,
+                date          TEXT,
+                owner_kind    TEXT CHECK (owner_kind IN ('character','corporation')
+                                          OR owner_kind IS NULL),
+                owner_id      INTEGER,
+                via_type_id   INTEGER
+            )
+            """
+        )
+        total = conn.execute("SELECT COUNT(*) FROM run_purchase").fetchone()[0]
+        copied = conn.execute(
+            f"INSERT INTO run_purchase_new ({columns}) "
+            f"SELECT {columns} FROM run_purchase "
+            "WHERE index_run_id IN (SELECT index_run_id FROM index_run)"
+        ).rowcount
+        conn.execute("DROP TABLE run_purchase")
+        conn.execute("ALTER TABLE run_purchase_new RENAME TO run_purchase")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS run_purchase_run "
+            "ON run_purchase (index_run_id, type_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS run_purchase_esi "
+            "ON run_purchase (index_run_id, esi_kind, esi_id)"
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    if total != copied:
+        log.warning(
+            "dropped %d run_purchase lines whose index run no longer exists "
+            "while widening the purchase venue CHECK",
+            total - copied,
+        )
 
 
 def _user_version(conn: sqlite3.Connection) -> int:
@@ -1113,6 +1526,12 @@ def ensure_schema(conn: sqlite3.Connection, profile: dict | None = None) -> None
     _check_schema_version(conn)
     _backup_before_migrating(conn)
     fresh = profile is not None and not _has_settings_row(conn)
+    if not _table_exists(conn, "buy_transaction"):
+        # Before the CREATE, not after it: executescript COMMITs the
+        # pending reset first, so a crash between the two can only repeat
+        # the (idempotent) reset on the next open, never skip it for good
+        # once buy_transaction exists (contract review C8).
+        _rewalk_wallets_for_buys(conn)
     conn.executescript(STATE_SCHEMA)
     conn.executescript(_SNAPSHOT_SCHEMA)
     _rebuild_class_setting_for_thukker(conn)
@@ -1138,6 +1557,9 @@ def ensure_schema(conn: sqlite3.Connection, profile: dict | None = None) -> None
                 )
             ):
                 raise
+    # After the loop: the rebuild copies via_type_id and the esi_* columns
+    # the ALTERs above add (contract review A2.2).
+    _rebuild_run_purchase_for_other_venue(conn)
     conn.execute("INSERT OR IGNORE INTO settings (id) VALUES (1)")
     _seed_class_settings(conn)
     if fresh:
@@ -1149,6 +1571,47 @@ def ensure_schema(conn: sqlite3.Connection, profile: dict | None = None) -> None
     # migration above may claim to be at this version.
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _rewalk_wallets_for_buys(conn: sqlite3.Connection) -> None:
+    """Reset every wallet-transactions cursor so the next pulls re-read the
+    history whose buys the Ledger used to throw away (contract review C8,
+    2026-09-27).
+
+    Up to v1.28.1 ledger.collect dropped every is_buy row, yet the shared
+    transactions cursor (sales_pull, family 'transactions') already covers
+    that history, so without a reset the current cycle's purchases from
+    before the upgrade would never arrive: the Buy tab's Remaining would
+    overstate and invite buying twice. ensure_schema calls this only on
+    the open that CREATES buy_transaction — every open re-runs the
+    migrations, and an unguarded reset would re-walk every wallet at every
+    start. The re-walk is safe: the sell upserts are idempotent, and the
+    feeds read 'partial' for a few refreshes while the backfill catches
+    up. Only the transactions family keeps an id cursor
+    (ledger._cursor), so orders and contracts rows are left alone. Does
+    not commit."""
+    if not _table_exists(conn, "sales_pull"):
+        return
+    cur = conn.execute(
+        "UPDATE sales_pull SET oldest_id = NULL, newest_id = NULL, "
+        "backfilled = 0 WHERE family = 'transactions'"
+    )
+    if cur.rowcount:
+        log.info(
+            "reset %d wallet-transaction cursors so the next pulls recover "
+            "the buys earlier builds dropped",
+            cur.rowcount,
+        )
 
 
 def _clear_legacy_client_secret(conn: sqlite3.Connection) -> None:
@@ -1291,6 +1754,11 @@ class Settings:
     # industry system (freight_in_isk_per_m3 is the Jita leg), and whether
     # inputs may be bought there at all.
     structure_freight_in_isk_per_m3: float = 0.0
+    # v1.29 revision 4 (user ruling 2026-09-28): the inbound rate for a
+    # PURCHASE anywhere but Jita 4-4 and the structure market — the
+    # 'other' purchase venue (freight_in_rate). 0 = such a purchase
+    # carries no freight.
+    freight_in_default_isk_per_m3: float = 0.0
     structure_buy_enabled: bool = True
     # v1.22 invention: racial Encryption Methods level (chance weighs /40);
     # the datacore sciences reuse skill_starship_engineering/skill_science.
@@ -1363,9 +1831,17 @@ class Settings:
 
     def freight_in_rate(self, venue: str | None) -> float:
         """Flat inbound ISK/m³ for a buy venue: 'structure' takes the
-        structure leg, anything else (hub, unpriced) the Jita leg."""
+        structure leg, 'other' (revision 4, 2026-09-28: a purchase
+        anywhere but Jita 4-4 and the structure market) the default
+        rate, anything else (hub, unpriced) the Jita leg.
+
+        'delivered' is deliberately NOT refused: it still falls to the
+        Jita leg and the callers guard it themselves (costing's
+        leg_rate, web._run_buy_rates) — contract review A3."""
         if venue == BUY_VENUE_STRUCTURE:
             return self.structure_freight_in_isk_per_m3
+        if venue == BUY_VENUE_OTHER:
+            return self.freight_in_default_isk_per_m3
         return self.freight_in_isk_per_m3
 
     def skill_levels(self) -> SkillLevels:
@@ -1390,6 +1866,46 @@ BUY_VENUE_STRUCTURE = "structure"
 # v1.25 fill pricing: a buy split across both venues (per-venue units
 # on the index_run_item row).
 BUY_VENUE_SPLIT = "split"
+# v1.29 Buy tab: a purchase venue only — never a plan venue. The price
+# the user paid is already landed (someone else hauled it), so costing
+# adds no freight to a delivered line and never resolves a freight rate
+# or price basis for it (Settings.freight_in_rate / price_basis would
+# silently hand back the HUB leg for an unknown venue).
+BUY_VENUE_DELIVERED = "delivered"
+# v1.29 revision 4 (user ruling 2026-09-28): a purchase venue only — a
+# buy at any location other than the Jita hub station and the configured
+# structure market (another NPC station, another structure, a contract
+# whose start location is elsewhere, or no location). Hauled at
+# settings.freight_in_default_isk_per_m3. run_purchase.venue repeats
+# PURCHASE_VENUES in a CHECK: keep the two in step (append, never
+# reorder).
+BUY_VENUE_OTHER = "other"
+PURCHASE_VENUES = (
+    BUY_VENUE_HUB, BUY_VENUE_STRUCTURE, BUY_VENUE_DELIVERED, BUY_VENUE_OTHER,
+)
+# Optional label on a purchase line: which side of which book the user
+# actually took. Advisory only — costing prices the line at unit_price.
+# Revision 3 derives every line from ESI and stores source NULL on all of
+# them (contract review C11); the label survives for non-derived lines.
+PURCHASE_SOURCES = ("sell", "split", "buy")
+# v1.29 revision 3 (user ruling R1, 2026-09-28): where a derived
+# run_purchase line came from — a wallet buy (buy_transaction) or an item
+# exchange the pool accepted (buy_contract). run_purchase.esi_kind repeats
+# these in a CHECK: keep the two in step.
+ESI_KIND_TRANSACTION = "transaction"
+ESI_KIND_CONTRACT = "contract"
+PURCHASE_ESI_KINDS = (ESI_KIND_TRANSACTION, ESI_KIND_CONTRACT)
+# Why a bought contract is listed but not costed (buy_contract.excluded,
+# contract review C9/C10; NULL = costed). The column's CHECK repeats them.
+BUY_EXCLUDED_INTERNAL = "internal"
+BUY_EXCLUDED_SWAP = "swap"
+BUY_EXCLUDED_NO_PRICE = "no_price"
+BUY_CONTRACT_EXCLUSIONS = (
+    BUY_EXCLUDED_INTERNAL,
+    BUY_EXCLUDED_SWAP,
+    BUY_EXCLUDED_NO_PRICE,
+)
+OWNER_KINDS = ("character", "corporation")
 
 # v1.26: the pricing basis of a market (settings.hub_price_basis /
 # structure_price_basis).
@@ -1547,6 +2063,514 @@ def next_run_number(conn: sqlite3.Connection) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Run purchase lines (Buy tab, v1.29)
+# ---------------------------------------------------------------------------
+#
+# What the pool ACTUALLY paid for an input of one index run, one line per
+# purchase (several per item: that is how a split buy is recorded).
+# Realized costing lets these win over the plan's price snapshot, so a run
+# with no lines costs exactly as it did before v1.29. These are run
+# purchase lines in `run_purchase`, NOT the dormant FIFO lots
+# engine.record_purchase writes (contract review A4).
+#
+# Revision 3 (user ruling R1, 2026-09-28): the lines are derived from ESI
+# — buying.assign_purchases matches buy_transaction / buy_contract rows to
+# a run's buying window and rewrites that run's derived lines wholesale
+# through replace_derived_purchases. A derived line carries esi_kind /
+# esi_id; add_purchase and the other per-line helpers stay as a complete
+# CRUD seam for lines that are not derived (esi_kind NULL), which no UI
+# path writes today.
+#
+# Every helper is scoped to the run: a purchase_id from another run
+# never edits or deletes anything here. Like the rest of store.py the
+# write helpers do NOT commit — the caller owns the transaction.
+
+
+# The widest integer SQLite stores (INTEGER is 64-bit signed); anything
+# above it raises OverflowError inside the INSERT rather than a ValueError.
+_MAX_SQLITE_INT = 2**63 - 1
+
+
+def _validate_purchase(
+    venue: str, quantity, unit_price, source: str | None
+) -> tuple[int, float]:
+    """Check a purchase line before it reaches SQLite and return the
+    coerced (quantity, unit_price).
+
+    The table's CHECK constraints say the same things, but an
+    IntegrityError reaches a packaged user as an unreadable traceback;
+    the web layer flashes str(exc) instead, so every message here names
+    the field in the user's own words.
+
+    Two refusals the CHECKs cannot make (review 2026-09-23). `float()`
+    accepts "nan" / "inf" / 1e400: NaN binds as NULL (a NOT NULL
+    IntegrityError the routes do not catch) and infinity stores happily,
+    then poisons the Profit tab and every Ledger cost vintage priced off
+    the run with inf/nan and no way to notice. And an integer wider than
+    SQLite's 64 bits raises OverflowError at the INSERT, which is not a
+    ValueError either. No form reaches them any more (revision 3,
+    2026-09-28: every line is derived from ESI rows and the R7 contract
+    allocation), so the guards are defensive: a corrupt ESI row or a
+    k * p_i that overflowed meets a sentence the caller can log or flash
+    rather than an IntegrityError or an OverflowError.
+    """
+    if venue not in PURCHASE_VENUES:
+        raise ValueError(
+            f"unknown purchase venue {venue!r} "
+            f"(expected one of {', '.join(PURCHASE_VENUES)})"
+        )
+    if source is not None and source not in PURCHASE_SOURCES:
+        raise ValueError(
+            f"unknown price source {source!r} "
+            f"(expected one of {', '.join(PURCHASE_SOURCES)})"
+        )
+    try:
+        qty = int(quantity)
+    except (TypeError, ValueError):
+        raise ValueError("quantity must be a whole number of units") from None
+    if qty <= 0:
+        raise ValueError("quantity must be at least 1 unit")
+    if qty > _MAX_SQLITE_INT:
+        raise ValueError("quantity is larger than Magoo can record")
+    try:
+        price = float(unit_price)
+    except (TypeError, ValueError):
+        raise ValueError("unit price must be a number") from None
+    if not math.isfinite(price):
+        raise ValueError("unit price must be a real number")
+    if price < 0:
+        raise ValueError("unit price cannot be negative")
+    return qty, price
+
+
+def _validate_via_type_id(venue: str, via_type_id) -> int | None:
+    """Coerce a line's via_type_id (revision 4, user ruling 2026-09-28:
+    the compressed ore an unplanned-ore purchase was refined from) to a
+    whole number or None, or raise ValueError.
+
+    Refused on every venue but 'delivered' (contract review A9): the
+    matcher writes a via line at its LANDED price — the ore's freight and
+    refining tax are already inside — so a via line on a freight-bearing
+    venue would haul the same m³ twice."""
+    if via_type_id is None:
+        return None
+    bad = ValueError("the refined-from ore must be a whole-number type id")
+    # A bool is an int to Python, and int(34.5) is 34 — another type
+    # entirely — so both are refused rather than coerced.
+    if isinstance(via_type_id, bool) or (
+        isinstance(via_type_id, float) and not via_type_id.is_integer()
+    ):
+        raise bad
+    try:
+        via = int(via_type_id)
+    except (TypeError, ValueError, OverflowError):
+        raise bad from None
+    if not 0 < via <= _MAX_SQLITE_INT:
+        raise bad
+    if venue != BUY_VENUE_DELIVERED:
+        raise ValueError(
+            f"a line refined from an ore is landed already: its venue must be "
+            f"{BUY_VENUE_DELIVERED!r}, not {venue!r}"
+        )
+    return via
+
+
+def list_purchases(
+    conn: sqlite3.Connection, index_run_id: int
+) -> dict[int, list[sqlite3.Row]]:
+    """Every purchase line of a run, grouped by type_id, oldest first
+    (purchase_id order — the order the lines were written in, which is
+    the order the Buy tab lists them in). Items with no lines are
+    absent."""
+    out: dict[int, list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        "SELECT * FROM run_purchase WHERE index_run_id = ? "
+        "ORDER BY purchase_id",
+        (index_run_id,),
+    ):
+        out.setdefault(row["type_id"], []).append(row)
+    return out
+
+
+def add_purchase(
+    conn: sqlite3.Connection,
+    index_run_id: int,
+    type_id: int,
+    venue: str,
+    quantity: int,
+    unit_price: float,
+    source: str | None = None,
+    note: str | None = None,
+    via_type_id: int | None = None,
+) -> int:
+    """Record one non-derived purchase line (esi_kind NULL); returns its
+    purchase_id. Raises ValueError (user-readable) on a bad venue /
+    source / quantity / price, or a via_type_id that is not a whole
+    number or sits on a venue other than 'delivered'. Does not commit.
+
+    Derived lines go through replace_derived_purchases instead, which
+    owns their esi_* / owner_* columns. via_type_id (revision 4,
+    2026-09-28) is passed through for the CRUD seam's completeness and
+    the costing / Buy-tab tests that build via lines by hand."""
+    qty, price = _validate_purchase(venue, quantity, unit_price, source)
+    via = _validate_via_type_id(venue, via_type_id)
+    cur = conn.execute(
+        "INSERT INTO run_purchase (index_run_id, type_id, venue, source, "
+        "quantity, unit_price, note, via_type_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (index_run_id, type_id, venue, source, qty, price, note or None, via),
+    )
+    return cur.lastrowid
+
+
+def update_purchase(
+    conn: sqlite3.Connection,
+    index_run_id: int,
+    purchase_id: int,
+    venue: str,
+    quantity: int,
+    unit_price: float,
+    source: str | None = None,
+    note: str | None = None,
+) -> None:
+    """Edit one purchase line in place (the type_id never moves: a line
+    belongs to the item it was booked under).
+
+    Raises ValueError when the line is not on this run — an edit that
+    matched nothing would otherwise be reported to the user as a save
+    that worked. Does not commit.
+
+    No UI path reaches this: revision 3 (2026-09-28) derives every line
+    from ESI, and a derived line edited here would be overwritten by the
+    next replace_derived_purchases anyway. Kept as a complete CRUD seam
+    for a future per-line editor."""
+    qty, price = _validate_purchase(venue, quantity, unit_price, source)
+    cur = conn.execute(
+        "UPDATE run_purchase SET venue = ?, source = ?, quantity = ?, "
+        "unit_price = ?, note = ? "
+        "WHERE purchase_id = ? AND index_run_id = ?",
+        (venue, source, qty, price, note or None, purchase_id, index_run_id),
+    )
+    if cur.rowcount == 0:
+        raise ValueError(
+            f"purchase line {purchase_id} is not on this run"
+        )
+
+
+def delete_purchase(
+    conn: sqlite3.Connection, index_run_id: int, purchase_id: int
+) -> None:
+    """Remove one purchase line of this run. Scoped to the run, so an id
+    belonging to another run deletes nothing. A line that is already
+    gone (double-submitted delete) is a silent no-op — the intent is
+    satisfied either way. Does not commit.
+
+    Like update_purchase, off the UI path since revision 3 derives every
+    line from ESI (2026-09-28)."""
+    conn.execute(
+        "DELETE FROM run_purchase WHERE purchase_id = ? AND index_run_id = ?",
+        (purchase_id, index_run_id),
+    )
+
+
+def delete_run_purchases_for_type(
+    conn: sqlite3.Connection, index_run_id: int, type_id: int
+) -> None:
+    """Drop every purchase line this run holds for ONE item — derived or
+    not. Kept from revision 2 as part of the CRUD seam (contract §2);
+    revision 3's writer rewrites a whole run's derived lines through
+    replace_derived_purchases instead. Does not commit."""
+    conn.execute(
+        "DELETE FROM run_purchase WHERE index_run_id = ? AND type_id = ?",
+        (index_run_id, type_id),
+    )
+
+
+def delete_run_purchases(conn: sqlite3.Connection, index_run_id: int) -> None:
+    """Drop every purchase line of a run, derived or not. run_delete must
+    call this before deleting the run: run_purchase.index_run_id is a
+    foreign key and connections open with PRAGMA foreign_keys = ON.
+
+    A deleted run's derived lines are simply gone: the ESI rows they came
+    from stay in buy_transaction / buy_contract, and the next
+    assign_purchases pass matches them to whichever run's window holds
+    them now. (Revision 2 also cleared run_buy_choice here; revision 3
+    retired that table — contract review C6.5.) Its frozen ore
+    conversions (run_purchase_refine, which also references index_run)
+    go with them. Does not commit."""
+    conn.execute(
+        "DELETE FROM run_purchase WHERE index_run_id = ?", (index_run_id,)
+    )
+    conn.execute(
+        "DELETE FROM run_purchase_refine WHERE index_run_id = ?", (index_run_id,)
+    )
+
+
+# The keys a derived line may carry (replace_derived_purchases). A key
+# outside this set is refused rather than dropped, so a typo in the
+# matcher ('k' for 'contract_k') fails loudly in its tests instead of
+# silently storing NULL.
+_DERIVED_REQUIRED = (
+    "type_id", "venue", "quantity", "unit_price", "esi_kind", "esi_id",
+)
+_DERIVED_OPTIONAL = (
+    "contract_k", "date", "owner_kind", "owner_id", "note", "source",
+    "via_type_id",
+)
+
+
+def _validate_derived_line(line: Mapping[str, Any]) -> tuple:
+    """One derived line -> the INSERT's values after the run id, in the
+    order (type_id, venue, quantity, unit_price, note, esi_kind, esi_id,
+    contract_k, date, owner_kind, owner_id, via_type_id), or ValueError
+    naming what is wrong. Every ESI line stores source NULL (contract
+    review C11): a 'source' key is tolerated only as None.
+
+    via_type_id is LAST (revision 4, 2026-09-28): buying._line_key and
+    _stored_lines compare against exactly this tuple for the matcher's
+    no-change check, so a change only in via_type_id must show in it
+    (contract review A9); it is a whole number or None, and only on a
+    'delivered' line (_validate_via_type_id)."""
+    keys = set(line.keys())
+    missing = [k for k in _DERIVED_REQUIRED if k not in keys]
+    if missing:
+        raise ValueError(f"derived purchase line lacks {', '.join(missing)}")
+    unknown = sorted(keys - set(_DERIVED_REQUIRED) - set(_DERIVED_OPTIONAL))
+    if unknown:
+        raise ValueError(
+            f"derived purchase line has unknown field(s) {', '.join(unknown)}"
+        )
+    if line.get("source") is not None:
+        raise ValueError(
+            "a derived purchase line carries no price source (it is NULL "
+            "on every ESI line)"
+        )
+    qty, price = _validate_purchase(
+        line["venue"], line["quantity"], line["unit_price"], None
+    )
+    esi_kind = line["esi_kind"]
+    if esi_kind not in PURCHASE_ESI_KINDS:
+        raise ValueError(
+            f"unknown purchase origin {esi_kind!r} "
+            f"(expected one of {', '.join(PURCHASE_ESI_KINDS)})"
+        )
+    try:
+        esi_id = int(line["esi_id"])
+        type_id = int(line["type_id"])
+    except (TypeError, ValueError):
+        raise ValueError(
+            "a derived purchase line needs a whole-number esi_id and type_id"
+        ) from None
+    owner_kind = line.get("owner_kind")
+    if owner_kind is not None and owner_kind not in OWNER_KINDS:
+        raise ValueError(
+            f"unknown purchase owner kind {owner_kind!r} "
+            f"(expected one of {', '.join(OWNER_KINDS)})"
+        )
+    owner_id = line.get("owner_id")
+    if owner_id is not None:
+        try:
+            owner_id = int(owner_id)
+        except (TypeError, ValueError):
+            raise ValueError("purchase owner id must be a whole number") from None
+    k = line.get("contract_k")
+    if k is not None:
+        try:
+            k = float(k)
+        except (TypeError, ValueError):
+            raise ValueError("contract scale k must be a number") from None
+        if not math.isfinite(k) or k < 0:
+            raise ValueError("contract scale k must be a finite number >= 0")
+    via = _validate_via_type_id(line["venue"], line.get("via_type_id"))
+    return (
+        type_id,
+        line["venue"],
+        qty,
+        price,
+        line.get("note") or None,
+        esi_kind,
+        esi_id,
+        k,
+        line.get("date"),
+        owner_kind,
+        owner_id,
+        via,
+    )
+
+
+def replace_derived_purchases(
+    conn: sqlite3.Connection,
+    index_run_id: int,
+    lines: Iterable[Mapping[str, Any]],
+) -> int:
+    """Rewrite a run's ESI-derived purchase lines wholesale; returns how
+    many were written.
+
+    Deletes every line of the run whose esi_kind is set, then inserts
+    `lines` in the order given (each a mapping: type_id, venue, quantity,
+    unit_price, esi_kind, esi_id required; contract_k, date, owner_kind,
+    owner_id, note, via_type_id optional — via_type_id names the ore a
+    refined mineral line came from, revision 4). Lines that are not derived (esi_kind NULL)
+    are never touched. An empty `lines` clears the run's derived lines —
+    what assign_purchases does to a run that became superseded, so the
+    same ESI purchase is never on two runs (contract review C4).
+
+    Every line is validated BEFORE anything is deleted (the same
+    _validate_purchase guards as add_purchase, plus the esi_* / owner_*
+    fields), so a bad line raises ValueError with the run untouched.
+    source is stored NULL on every line (C11). Does NOT commit: the
+    matcher wraps its whole pass over every run in one BEGIN IMMEDIATE
+    ... COMMIT, so a failure can never leave a purchase on two runs or on
+    none (C5)."""
+    rows = [(index_run_id, *_validate_derived_line(line)) for line in lines]
+    conn.execute(
+        "DELETE FROM run_purchase WHERE index_run_id = ? "
+        "AND esi_kind IS NOT NULL",
+        (index_run_id,),
+    )
+    conn.executemany(
+        "INSERT INTO run_purchase (index_run_id, type_id, venue, source, "
+        "quantity, unit_price, note, esi_kind, esi_id, contract_k, date, "
+        "owner_kind, owner_id, via_type_id) "
+        "VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    return len(rows)
+
+
+# A frozen conversion group: (contract_k, ((raw type_id, units, landed
+# unit price), ...) in ascending raw type id) keyed by (esi_kind, esi_id,
+# via_type_id) — buying._via_groups' shape.
+RefineGroups = dict[tuple[str, int, int], tuple[float | None, tuple]]
+
+
+def refine_freeze(conn: sqlite3.Connection, index_run_id: int) -> RefineGroups:
+    """A run's stored frozen ore conversions (run_purchase_refine), in
+    buying._via_groups' shape: {(esi_kind, esi_id, via_type_id):
+    (contract_k, ((type_id, quantity, unit_price), ...))}, each group's
+    lines by ascending raw type id — the order the matcher writes them."""
+    groups: dict[tuple, list] = {}
+    scale: dict[tuple, float | None] = {}
+    for r in conn.execute(
+        "SELECT esi_kind, esi_id, via_type_id, type_id, quantity, unit_price, "
+        "contract_k FROM run_purchase_refine WHERE index_run_id = ? "
+        "ORDER BY esi_kind, esi_id, via_type_id, type_id",
+        (index_run_id,),
+    ):
+        key = (r[0], int(r[1]), int(r[2]))
+        groups.setdefault(key, []).append((int(r[3]), int(r[4]), float(r[5])))
+        scale[key] = r[6]
+    return {key: (scale[key], tuple(lines)) for key, lines in groups.items()}
+
+
+def save_refine_freeze(
+    conn: sqlite3.Connection, index_run_id: int, groups: RefineGroups
+) -> int:
+    """Store (replace) the given conversion groups of an executed run;
+    groups not named are KEPT — that is the point: a record the pass is
+    not costing right now keeps its frozen conversion for when it counts
+    again. Returns how many groups were written. Does not commit (the
+    matcher's one transaction)."""
+    for (kind, esi_id, via), (k, lines) in groups.items():
+        conn.execute(
+            "DELETE FROM run_purchase_refine WHERE index_run_id = ? "
+            "AND esi_kind = ? AND esi_id = ? AND via_type_id = ?",
+            (index_run_id, kind, int(esi_id), int(via)),
+        )
+        conn.executemany(
+            "INSERT INTO run_purchase_refine (index_run_id, esi_kind, esi_id, "
+            "via_type_id, type_id, quantity, unit_price, contract_k) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (index_run_id, kind, int(esi_id), int(via), int(t), int(q),
+                 float(u), None if k is None else float(k))
+                for t, q, u in lines
+            ],
+        )
+    return len(groups)
+
+
+def drop_refine_groups(
+    conn: sqlite3.Connection, index_run_id: int, records: Iterable[tuple[str, int]]
+) -> None:
+    """Drop a run's frozen conversions of the given (esi_kind, esi_id)
+    records — the matcher's call for records that left the run's window
+    (a reopen / re-execute moved the bound), so a record that later moves
+    back converts fresh rather than reviving a stale freeze. Does not
+    commit."""
+    conn.executemany(
+        "DELETE FROM run_purchase_refine WHERE index_run_id = ? "
+        "AND esi_kind = ? AND esi_id = ?",
+        [(index_run_id, kind, int(esi_id)) for kind, esi_id in records],
+    )
+
+
+def clear_refine_freeze(conn: sqlite3.Connection, keep: Iterable[int]) -> None:
+    """Drop the frozen conversions of every run NOT in `keep` (the executed
+    buying windows): a reopened, superseded or window-less run re-derives
+    its conversions when it next collects. Does not commit."""
+    keep = sorted({int(i) for i in keep})
+    conn.execute(
+        "DELETE FROM run_purchase_refine "
+        f"WHERE index_run_id NOT IN ({','.join('?' * len(keep))})",
+        keep,
+    )
+
+
+def runs_with_derived_purchases(conn: sqlite3.Connection) -> set[int]:
+    """Every index_run_id that holds at least one ESI-derived line — the
+    runs assign_purchases must clear when they fall outside every buying
+    window (contract review C4)."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT index_run_id FROM run_purchase "
+            "WHERE esi_kind IS NOT NULL"
+        )
+    }
+
+
+def buys_enabled_owners(conn: sqlite3.Connection) -> set[tuple[str, int]]:
+    """Owners whose purchases count (R4: the Count buys toggle, honoured at
+    READ time — every owner's buys are stored, contract review C7).
+
+    Mirrors ledger.enabled_owners on count_buys: a pool character counts
+    while its flag is on (a character that left the pool counts no
+    longer); a corporation counts unless its esi_corp row turned the flag
+    off, so a corporation without an esi_corp row (pruned when its last
+    member left the pool, or seen only through a pull) still counts. The
+    corporation set is every corporation Magoo has seen as a buyer or a
+    pull owner: sales_pull, buy_transaction, buy_contract and esi_corp
+    (C6.6) — not the sale_* tables, which only name sellers."""
+    on = {
+        ("character", r[0])
+        for r in conn.execute(
+            "SELECT character_id FROM pool_character WHERE count_buys = 1"
+        )
+    }
+    off_corps = {
+        r[0]
+        for r in conn.execute(
+            "SELECT corporation_id FROM esi_corp WHERE count_buys = 0"
+        )
+    }
+    corps = {
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT owner_id FROM sales_pull "
+            "WHERE owner_kind = 'corporation' "
+            "UNION SELECT DISTINCT owner_id FROM buy_transaction "
+            "WHERE owner_kind = 'corporation' "
+            "UNION SELECT DISTINCT owner_id FROM buy_contract "
+            "WHERE owner_kind = 'corporation' "
+            "UNION SELECT corporation_id FROM esi_corp"
+        )
+    }
+    on |= {("corporation", c) for c in corps if c not in off_corps}
+    return on
+
+
+# ---------------------------------------------------------------------------
 # Production blacklist
 # ---------------------------------------------------------------------------
 
@@ -1586,13 +2610,21 @@ def save_esi_snapshot(
     character_isk: float,
     corporation_isk: float,
     job_ends: dict[int, list] | None = None,
+    job_starts: dict[int, list[list]] | None = None,
 ) -> int:
+    """job_starts: {product type_id: [[start_date, units], ...]} — one
+    pair per manufacturing/reaction job of that product that ESI
+    reports, delivered ones included, units = runs x portion
+    (esi.refresh_state; revision 7, 2026-09-29). The engine counts the
+    units started after the cycle cut as this cycle's wave. None stores
+    NULL — "not recorded", which the plan reads as nothing installed
+    (the full wave), not as a known empty list."""
     import json
 
     cur = conn.execute(
         "INSERT INTO esi_snapshot (fetched_at, on_hand, in_progress, "
-        "active_jobs, character_isk, corporation_isk, job_ends) "
-        "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)",
+        "active_jobs, character_isk, corporation_isk, job_ends, job_starts) "
+        "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?)",
         (
             json.dumps(on_hand),
             json.dumps(in_progress),
@@ -1600,6 +2632,7 @@ def save_esi_snapshot(
             character_isk,
             corporation_isk,
             json.dumps(job_ends or {}),
+            None if job_starts is None else json.dumps(job_starts),
         ),
     )
     # Old snapshots are superseded the moment a newer one exists (decision
@@ -1614,8 +2647,11 @@ def save_esi_snapshot(
 
 
 def latest_esi_snapshot(conn: sqlite3.Connection):
-    """(fetched_at, on_hand, in_progress, active_jobs, char_isk, corp_isk)
-    with int keys restored, or None if ESI has never been pulled."""
+    """The newest snapshot as a dict (fetched_at, on_hand, in_progress,
+    active_jobs, character_isk, corporation_isk, job_ends, job_starts)
+    with int keys restored, or None if ESI has never been pulled.
+    job_starts is {type_id: [[start, units], ...]} or None (not recorded,
+    or the old scalar format)."""
     import json
 
     row = conn.execute(
@@ -1628,6 +2664,19 @@ def latest_esi_snapshot(conn: sqlite3.Connection):
         job_ends = intkeys(row["job_ends"] or "{}")
     except (KeyError, IndexError):
         job_ends = {}
+    try:
+        raw_starts = row["job_starts"]
+    except (KeyError, IndexError):
+        raw_starts = None
+    job_starts = None if raw_starts is None else intkeys(raw_starts)
+    # The one reader that normalises (contract amendment 10): the
+    # pre-2026-09-29 scalar format ({type_id: latest start text}) carries
+    # no units, so it is "not recorded" — the plan sizes the full wave
+    # until the next ESI update writes the list format.
+    if job_starts is not None and not all(
+        isinstance(v, list) for v in job_starts.values()
+    ):
+        job_starts = None
     return {
         "fetched_at": row["fetched_at"],
         "on_hand": intkeys(row["on_hand"]),
@@ -1636,4 +2685,8 @@ def latest_esi_snapshot(conn: sqlite3.Connection):
         "character_isk": row["character_isk"],
         "corporation_isk": row["corporation_isk"],
         "job_ends": job_ends,
+        # None = not recorded (a snapshot saved before the column, by a
+        # caller that passed none, or in the old scalar format) —
+        # unknown, not "no jobs".
+        "job_starts": job_starts,
     }

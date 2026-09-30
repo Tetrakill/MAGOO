@@ -31,10 +31,15 @@
       <button {% if not characters or not sde_build %}disabled
         title="{% if not sde_build %}download the game data first — step 1 of setup{% else %}log in a character first — the ESI tab has the SSO button{% endif %}"{% endif %}>⟳ Update from ESI</button>
     </form>
+    {# v1.29 revision 6 (ruling R1, contract review A5): while the newest
+       run is not executed it is the OPEN run — the button re-plans it in
+       place (every ESI update does too); after Mark executed it plans the
+       next cycle's run. #}
+    {% set open_run = runs[0] if runs and runs[0].status != 'complete' else none %}
     <form method="post" action="{{ url_for('run_plan') }}">
       <button class="primary" {% if not pipelines or not esi_state %}disabled
-        title="{% if not pipelines and not esi_state %}needs pipelines and an ESI update first{% elif not pipelines %}add a pipeline first{% else %}run an ESI update first{% endif %}"{% endif %}>
-        ▶ Plan index run</button>
+        title="{% if not pipelines and not esi_state %}needs pipelines and an ESI update first{% elif not pipelines %}add a pipeline first{% else %}run an ESI update first{% endif %}"{% elif open_run %}title="run {{ open_run.run_number }} is this cycle's open run — re-plan it in place from the stored ESI snapshot and prices (every ⟳ Update from ESI does this too); a new run starts after you mark it executed"{% endif %}>
+        {% if open_run %}▶ Re-plan run {{ open_run.run_number }}{% else %}▶ Plan index run{% endif %}</button>
     </form>
   </div>
 </div>

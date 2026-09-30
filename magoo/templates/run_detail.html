@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
-{% block title %}Run {{ run.run_number }}{% endblock %}
+{% block title %}Run {{ run.run_number }} Industry Jobs{% endblock %}
 
 {% block content %}
 {# Null-aware, not truthiness: 0.0 corp ISK (NPC corp / no Accountant role)
@@ -9,26 +9,32 @@
 {% set exceeds = run.wallet_character_isk is not none and buy_total > wallets %}
 <div class="pagehead">
   <h1>{{ m.run_title(run, superseded) }}</h1>
-  {# A plain-English caption like the Chain and Profit tabs (user request
+  {# A plain-English caption like the Stockpile and Profit tabs (user request
      2026-09-01); the plan-time wallets still back the "exceeds wallets"
      badge in the strip below. #}
   {% if run.completed_at %}
-  <span class="cap">What you bought and which jobs you installed this cycle,
-    sized from your stock, in-flight jobs and prices as they stood when you
-    planned it ({{ run.planned_start }} UTC). Executed
-    {{ run.completed_at }} — it is in cost history.</span>
+  <span class="cap">Which jobs you installed this cycle, sized from your
+    stock, in-flight jobs and prices as they stood when you planned it
+    ({{ run.planned_start }} UTC). Executed {{ run.completed_at }} — it is
+    in cost history. What it bought, and what you paid, is on the
+    <a href="{{ url_for('run_detail', index_run_id=run.index_run_id, view='buy') }}">Buy tab</a>.</span>
   {% else %}
-  <span class="cap">What to buy and which jobs to install this cycle, sized
-    from your stock, in-flight jobs and prices as they stood when you planned
-    it ({{ run.planned_start }} UTC). Mark it executed once the buys and
-    installs are done — that puts the buy list and jobs into cost
-    history.</span>
+  {# v1.29 revision 6 (rulings R1, R2; contract review A8): the open run is
+     re-planned in place on every ESI update, always against the whole
+     configured slot pools — jobs already installed count through their
+     output in progress, not as busy slots. #}
+  <span class="cap">Which jobs to install this cycle, sized from your stock,
+    in-flight jobs and prices as they stood when this run was last planned
+    ({{ run.planned_start }} UTC){% if not superseded %} — every ⟳ Update
+    from ESI re-plans it in place from current stock. The slot counts
+    assume every configured line is free: jobs you already installed count
+    through their output in progress, not as busy slots{% endif %}. What to
+    buy for them — and where — is on
+    the <a href="{{ url_for('run_detail', index_run_id=run.index_run_id, view='buy') }}">Buy tab</a>. Mark it executed once the buys and installs are done; that puts the
+    buy list and jobs into cost history and the next ▶ Plan opens the next
+    cycle.</span>
   {% endif %}
   <div class="actions">
-    {% if buys %}
-    <button type="button" class="mini"
-      onclick="const d=document.getElementById('multibuy'); d.open=true; d.scrollIntoView({behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block:'center'})">Multibuy ↓</button>
-    {% endif %}
     {% if run.status != 'complete' %}
     <form method="post"
           action="{{ url_for('run_complete', index_run_id=run.index_run_id) }}"
@@ -50,7 +56,7 @@
 <div class="totals">
   <div class="stat">
     <span class="label">Buy total</span>
-    <span class="value {% if exceeds %}bad{% endif %}" title="{{ buy_total|isk }} ISK · {{ buys|length }} items">{{ buy_total|isk_short }}</span>
+    <span class="value {% if exceeds %}bad{% endif %}" title="{{ buy_total|isk }} ISK · {{ buys|length }} item{{ 's' if buys|length != 1 }} — the list itself, and what you paid for it, live on the Buy tab">{{ buy_total|isk_short }}</span>
   </div>
   <div class="stat">
     <span class="label">Mfg slots</span>
@@ -63,7 +69,7 @@
     {% set mfg_planned = mfg_slots_planned if mfg_slots_planned is defined else mfg_slots_used %}
     {% set mfg_pool = mfg_pool if mfg_pool is defined else settings.manufacturing_slots %}
     <span class="value {% if mfg_slots_used > mfg_pool %}bad{% endif %}"
-          title="manufacturing jobs to run now / manufacturing pool{% if mfg_pool < settings.manufacturing_slots %} — {{ mfg_pool }} of the {{ settings.manufacturing_slots }} configured slots: the rest are held by multi-cycle jobs running past the next run{% elif mfg_pool != settings.manufacturing_slots %} — the pool this run was planned against; Settings now reads {{ settings.manufacturing_slots }}{% endif %}{% if mfg_planned != mfg_slots_used %} — the plan allocated {{ mfg_planned }}; {{ mfg_slots_used }} run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow{% if install_short %} (see Short on stock){% endif %}{% if mfg_planned > mfg_pool %}; {{ mfg_planned - mfg_pool }} more than the pool: jobs stock cannot feed this cycle gave their slots to others and wait for stock{% endif %}{% endif %}{% if struct_builds or struct_buys %} · structure components: {{ struct_builds|length }} built in {{ struct_slots }} slot{{ 's' if struct_slots != 1 }} · {{ struct_buys|length }} bought{% endif %}">{{ mfg_slots_used }}<span class="sub">/ {{ mfg_pool }}{% if mfg_planned != mfg_slots_used %} · plan {{ mfg_planned }}{% endif %}{% if struct_builds %} · {{ struct_slots }} in structure comps{% endif %}</span></span>
+          title="manufacturing jobs to run now / manufacturing pool{% if mfg_pool != settings.manufacturing_slots %} — the pool this run was planned against; Settings now reads {{ settings.manufacturing_slots }}{% endif %}{% if mfg_planned != mfg_slots_used %} — the plan allocated {{ mfg_planned }}; {{ mfg_slots_used }} run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow{% if install_short %} (see Short on stock){% endif %}{% if mfg_planned > mfg_pool %}; {{ mfg_planned - mfg_pool }} more than the pool: jobs stock cannot feed this cycle gave their slots to others and wait for stock{% endif %}{% endif %}{% if struct_builds or struct_buys %} · structure components: {{ struct_builds|length }} built in {{ struct_slots }} slot{{ 's' if struct_slots != 1 }} · {{ struct_buys|length }} bought{% endif %}">{{ mfg_slots_used }}<span class="sub">/ {{ mfg_pool }}{% if mfg_planned != mfg_slots_used %} · plan {{ mfg_planned }}{% endif %}{% if struct_builds %} · {{ struct_slots }} in structure comps{% endif %}</span></span>
   </div>
   <div class="stat">
     <span class="label">Reaction slots</span>
@@ -71,7 +77,7 @@
                               + (alchemy_slots_planned if alchemy_slots_planned is defined else alchemy_slots_used) %}
     {% set reaction_pool = reaction_pool if reaction_pool is defined else settings.reaction_slots %}
     <span class="value {% if reaction_slots_used + alchemy_slots_used > reaction_pool %}bad{% endif %}"
-          title="reaction jobs to run now{% if alchemy_slots_used %} + {{ alchemy_slots_used }} alchemy{% endif %} / reaction pool{% if reaction_pool < settings.reaction_slots %} — {{ reaction_pool }} of the {{ settings.reaction_slots }} configured slots: the rest are held by multi-cycle jobs running past the next run{% elif reaction_pool != settings.reaction_slots %} — the pool this run was planned against; Settings now reads {{ settings.reaction_slots }}{% endif %}{% if reaction_planned != reaction_slots_used + alchemy_slots_used %} — the plan allocated {{ reaction_planned }}; {{ reaction_slots_used + alchemy_slots_used }} run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow{% if install_short %} (see Short on stock){% endif %}{% if reaction_planned > reaction_pool %}; {{ reaction_planned - reaction_pool }} more than the pool: jobs stock cannot feed this cycle gave their slots to others and wait for stock{% endif %}{% endif %}">{{ reaction_slots_used + alchemy_slots_used }}<span class="sub">/ {{ reaction_pool }}{% if reaction_planned != reaction_slots_used + alchemy_slots_used %} · plan {{ reaction_planned }}{% endif %}{% if alchemy_slots_used %} · {{ alchemy_slots_used }} alchemy{% endif %}</span></span>
+          title="reaction jobs to run now{% if alchemy_slots_used %} + {{ alchemy_slots_used }} alchemy{% endif %} / reaction pool{% if reaction_pool != settings.reaction_slots %} — the pool this run was planned against; Settings now reads {{ settings.reaction_slots }}{% endif %}{% if reaction_planned != reaction_slots_used + alchemy_slots_used %} — the plan allocated {{ reaction_planned }}; {{ reaction_slots_used + alchemy_slots_used }} run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow{% if install_short %} (see Short on stock){% endif %}{% if reaction_planned > reaction_pool %}; {{ reaction_planned - reaction_pool }} more than the pool: jobs stock cannot feed this cycle gave their slots to others and wait for stock{% endif %}{% endif %}">{{ reaction_slots_used + alchemy_slots_used }}<span class="sub">/ {{ reaction_pool }}{% if reaction_planned != reaction_slots_used + alchemy_slots_used %} · plan {{ reaction_planned }}{% endif %}{% if alchemy_slots_used %} · {{ alchemy_slots_used }} alchemy{% endif %}</span></span>
   </div>
   <div class="stat">
     <span class="label">Unmet</span>
@@ -81,20 +87,16 @@
     <span class="label">Low stock</span>
     <span class="value {% if low_stock %}warn{% endif %}" title="won't sustain the next run">{{ low_stock|length }}</span>
   </div>
-  {# Review 2026-09-05: the book badges join the gate (a hub-only unsourced run
-     used to lose its strip badge), and "N via C-J6" counts rows bought
-     ONLY there — split rows have their own badge and were double-counted. #}
-  {% set structure_only = structure_buys|length - (split_buys|length if split_buys is defined else 0) %}
-  {% if exceeds or buys_unpriced or structure_buys or compressed or split_buys or unsourced %}
+  {# v1.29 (ruling 2026-09-24): purchasing left this page, so every badge
+     describing the BUY LIST — unpriced, split, unsourced, via compressed,
+     via the structure market — moved to the Buy tab's header. What stays
+     is the one WALLET fact: the plan's buy list costs more than the ISK
+     you held when it was planned. #}
+  {% if exceeds %}
   <div class="stat">
     <span class="label">&nbsp;</span>
     <span class="tags">
-      {% if exceeds %}<span class="badge fill bad" title="buy total {{ buy_total|isk }} vs {{ wallets|isk }} in wallets at plan time">exceeds wallets</span>{% endif %}
-      {% if buys_unpriced %}<span class="badge warn" title="unpriced buy items count as 0 ISK — total understates">{{ buys_unpriced }} unpriced</span>{% endif %}
-      {% if structure_only > 0 %}<span class="badge accent" title="inputs cheaper landed (price + freight-in) at the structure market than at Jita — bought there in full">{{ structure_only }} via {{ settings.structure_market_label() }}</span>{% endif %}
-      {% if split_buys %}<span class="badge accent" title="buys split across Jita and {{ settings.structure_market_label() }} — by walking both sell ladders together, cheapest landed rung first, or, on rows planned before fill pricing, by how far {{ settings.structure_market_label() }}'s ladder beats the Jita landed price — Multibuy lists each market's share">{{ split_buys|length }} split</span>{% endif %}
-      {% if unsourced %}<span class="badge warn" title="buys whose stored sell orders (Jita's 300 cheapest, the whole {{ settings.structure_market_label() }} book) held fewer units than the plan buys — the remainder has no market at plan time: it is priced at the last order walked and belongs to no Multibuy block (it rides the Jita quantity only when Jita's stored list was cut off at 300 orders, so its real book continues)">{{ unsourced|length }} unsourced</span>{% endif %}
-      {% if compressed %}<span class="badge accent" title="compressed ore / moon ore / gas bought and reprocessed instead of {{ compressed_covered|length }} raw type{{ 's' if compressed_covered|length != 1 }} — saves {{ compressed_saving|isk }} ISK landed vs buying those raws direct at plan time (the cheaper market's sell ladder walked to depth — Jita and {{ settings.structure_market_label() }} compete)">{{ compressed|length }} via compressed</span>{% endif %}
+      <span class="badge fill bad" title="buy total {{ buy_total|isk }} vs {{ wallets|isk }} in wallets at plan time">exceeds wallets</span>
     </span>
   </div>
   {% endif %}
@@ -139,8 +141,8 @@
     cycle's buys can feed. Finals claim a scarce input first, highest
     return on cost first; intermediates that share one each install the
     same share of their plan. The job tables already show the reduced
-    jobs, with the plan's own figures in their tooltips — the Buy list
-    still covers the full plan.</p>
+    jobs, with the plan's own figures in their tooltips — the buy list
+    on the Buy tab still covers the full plan.</p>
   {% if install_finals %}
   <details style="margin:0 0 .6rem">
     <summary class="muted">Finals in install order — {{ install_finals|length }}</summary>
@@ -178,49 +180,6 @@
 </details>
 {% endif %}
 
-<details class="section" open data-key="buy">
-<summary><h2>Buy <span class="muted">— {{ buys|length }} items, <span title="{{ buy_total|isk }} ISK">{{ buy_total|isk_short }}</span></span></h2></summary>
-{% if buys %}
-<div class="tablewrap">
-<table class="sortable aligned">
-  <thead><tr><th>Item</th><th class="cat">Category</th><th class="num">Qty</th>
-      <th class="num">Unit price</th><th class="num">Total</th>
-      <th class="cat">Venue</th>
-      <th class="flags"></th></tr></thead>
-  {% for i in buys %}
-  <tr>
-{{ m.item_cell(i) }}
-    <td class="cat muted">{{ i.category }}</td>
-    <td class="num">{{ i.recommended_buy_qty|qty }}</td>
-{{ m.price_cell(i) }}
-    {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
-    <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
-{{ m.venue_cell(i) }}
-    <td class="flags">{% if i.capacity_limited %}<span class="badge warn">capacity</span>{% endif %}
-        {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
-        {{ m.compressed_badge(i) }}
-        {{ m.covered_badge(i) }}
-        {{ m.book_badge(i) }}
-        {% if i.type_id in region_wide %}<span class="badge" title="priced at plan time from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
-  </tr>
-  {% endfor %}
-</table>
-</div>
-<details id="multibuy">
-  <summary class="muted">Multibuy (paste into EVE's Multibuy window{% if multibuy_structure %} — one block per market{% endif %})</summary>
-  {% if multibuy_hub %}
-  <p class="muted">Jita</p>
-  <textarea class="multibuy" readonly onclick="this.select()"
-    aria-label="Multibuy — Jita">{{ multibuy_hub }}</textarea>
-  {% endif %}
-  {% if multibuy_structure %}
-  <p class="muted">{{ settings.structure_market_label() }} structure market</p>
-  <textarea class="multibuy" readonly onclick="this.select()"
-    aria-label="Multibuy — {{ settings.structure_market_label() }} structure market">{{ multibuy_structure }}</textarea>
-  {% endif %}
-</details>
-{% else %}<p class="muted">Nothing to buy.</p>{% endif %}
-</details>
 
 {# No invention section here (user ruling 2026-09-01): the run's invention
    vintage only feeds the Profit tab's cost line; everything else about
@@ -237,37 +196,9 @@
 {% endfor %}
 {% else %}<p class="muted">No manufacturing jobs.</p>{% endif %}
 {# Built structure components are the "Structure Components" group above
-   (2026-09-01); the bought ones keep this sub-table. #}
-{% if struct_buys %}
-<details class="section" open data-key="mfg:structure-components-bought">
-<summary><h3 class="subhead">Structure components bought <span class="muted">— {{ m.buy_stats(struct_buys) }};
-  cheaper to buy than build, blacklisted, or out of job slots; these also
-  appear in the Buy list and Multibuy above</span></h3></summary>
-<div class="tablewrap">
-<table class="sortable aligned">
-  <thead><tr><th>Item</th><th class="num">Qty</th>
-      <th class="num">Unit price</th><th class="num">Total</th>
-      <th class="cat">Venue</th>
-      <th class="flags"></th></tr></thead>
-  {% for i in struct_buys %}
-  <tr>
-{{ m.item_cell(i) }}
-    <td class="num">{{ i.recommended_buy_qty|qty }}</td>
-{{ m.price_cell(i) }}
-    {% set line_total = (i.recommended_buy_qty * i.price_snapshot) if i.price_snapshot is not none else none %}
-    <td class="num" title="{{ line_total|isk }}">{{ line_total|isk_short }}</td>
-{{ m.venue_cell(i) }}
-    <td class="flags"><span class="badge warn">buy</span>
-        {% if i.capacity_limited %}<span class="badge warn">capacity</span>{% endif %}
-        {% if i.price_snapshot is none %}<span class="badge warn">unpriced</span>{% endif %}
-        {{ m.book_badge(i) }}
-        {% if i.type_id in region_wide %}<span class="badge" title="priced at plan time from the region-wide best order in the NPC-goods region (no hub-station order)">region price</span>{% endif %}</td>
-  </tr>
-  {% endfor %}
-</table>
-</div>
-</details>
-{% endif %}
+   (2026-09-01). The BOUGHT ones left with the rest of purchasing in v1.29
+   (ruling R2, 2026-09-24): they are ordinary Buy tab rows under that same
+   group now, and only the Mfg-slots sub-line above still counts them. #}
 </details>
 
 <details class="section" open data-key="reactions">
@@ -329,161 +260,5 @@
 </details>
 {% endif %}
 
-{% if compressed %}
-<details class="section" open data-key="compressed">
-<summary><h2>Compressed sourcing <span class="muted">— {{ compressed|length }}
-  compressed buy{{ 's' if compressed|length != 1 }} cover {{ compressed_covered|length }}
-  raw type{{ 's' if compressed_covered|length != 1 }},
-  <span title="{{ compressed_saving|isk }} ISK landed vs buying those raws direct at plan time">saves {{ compressed_saving|isk_short }}</span></span></h2></summary>
-<p class="muted">Cheaper landed than the raw minerals, moon materials or gas
-  at plan time, walking the cheaper market's sell ladder for the quantity
-  bought — Jita and {{ settings.structure_market_label() }} compete, as for
-  every buy (a thin cheap order never wins alone). Reprocess at your asserted yields —
-  {{ settings.compressed_ore_yield|pct }}% for ore and moon
-  ore, {{ settings.compressed_gas_yield|pct }}% for gas{% if settings.compressed_reprocess_tax %},
-  after a {{ settings.compressed_reprocess_tax|pct }}% reprocessing tax on every refined-ore output (gas decompression is untaxed){% endif %}
-  (Settings → Compressed Sourcing). Outputs beyond this cycle's need are
-  leftover stock; they were worth nothing in the decision.</p>
-<div class="panel">
-  <h3 class="subhead" style="margin-top:0">After buying — reprocess:</h3>
-  <ul style="margin:.4rem 0 0 1.2rem">
-    {% for cs in compressed_section %}
-    <li>Reprocess <b>{{ cs.item.recommended_buy_qty|qty }} {{ cs.item.name }}</b>
-        → {% for o in cs.outputs if o.used %}~{{ o.used|qty }} {{ o.name }}{{ ', ' if not loop.last }}{% endfor %}{% for o in cs.outputs if o.leftover %}; leftover +{{ o.leftover|qty }} {{ o.name }}{% endfor %}</li>
-    {% endfor %}
-  </ul>
-</div>
-</details>
-{% endif %}
-
-<dialog id="deficit" class="breakdown" aria-labelledby="deficit-name">
-  <div class="dialog-head">
-    <h2 id="deficit-name"></h2>
-    <form method="dialog"><button class="mini">close</button></form>
-  </div>
-  <table id="deficit-math" style="max-width:24rem"></table>
-  <p class="muted" id="deficit-answer" style="margin:.6rem 0 0"></p>
-  <p style="margin:.4rem 0 0"><a id="deficit-chain">view in chain →</a></p>
-</dialog>
-<script>
-// One shared dialog, filled from the clicked row's data attributes — the
-// chain has 300+ items, so per-item dialogs would bloat the DOM. The
-// equation matches the engine's three deficit rules: intermediates end
-// the cycle back at target, raws buy just-in-time, finals always build.
-function openDeficit(btn) {
-  const d = btn.dataset;
-  const qty = n => Number(n).toLocaleString("en-US");
-  const target = Number(d.target), onhand = Number(d.onhand),
-        injobs = Number(d.injobs), deficit = Number(d.deficit);
-  let rows;
-  if (d.kind === "final") {
-    if (deficit < target) {
-      // A dual-role final: another pipeline consumes it, and the engine
-      // nets that component share against stock — so the build can be
-      // below the full cycle quantity.
-      rows = [
-        ["cycle quantity (incl. other pipelines' draw)", qty(target)],
-        ["− covered by stock / in-flight jobs", qty(target - deficit)],
-        ["= to build", qty(deficit)],
-      ];
-    } else if (deficit > target) {
-      // Review 2026-09-05 (A1): a dual-role final's component share is
-      // re-sized to what the consumers' allocated jobs actually draw, so
-      // from empty stock the build can exceed the cycle quantity.
-      rows = [
-        ["cycle quantity (incl. other pipelines' draw)", qty(target)],
-        ["+ their catch-up beyond stock", qty(deficit - target)],
-        ["= to build", qty(deficit)],
-      ];
-    } else {
-      rows = [["cycle quantity — finals always build", qty(deficit)]];
-    }
-  } else if (deficit > 0 && d.kind === "raw") {
-    rows = [
-      ["target — planned consumption + margin", qty(target)],
-      ["− on hand", qty(onhand)],
-      ["− in jobs", qty(injobs)],
-      ["= deficit", qty(deficit)],
-    ];
-    // Runs planned before the just-in-time raw rule persisted an extra
-    // cycle's draw in the deficit; recover it so the rows still sum.
-    const legacyDraw = deficit - target + onhand + injobs;
-    if (legacyDraw !== 0) rows.splice(1, 0, ["+ planned draw this cycle", qty(legacyDraw)]);
-  } else if (deficit > 0) {
-    // Buildable intermediate: the engine sizes the deficit against the
-    // allocation's actual draw (not the steady-state need), so recover
-    // that term from the identity deficit = target + draw − stock − jobs.
-    rows = [
-      ["target stock", qty(target)],
-      ["+ planned draw this cycle", qty(deficit - target + onhand + injobs)],
-      ["− on hand", qty(onhand)],
-      ["− in jobs", qty(injobs)],
-      ["= deficit", qty(deficit)],
-    ];
-  } else {
-    // Clamped to zero — stock and jobs exceed the requirement, so an
-    // operator equation would not sum. Plain facts instead.
-    rows = [
-      ["target stock", qty(target)],
-      ["steady cycle need", qty(d.need)],
-      ["on hand", qty(onhand)],
-      ["in jobs", qty(injobs)],
-      ["= deficit", "0"],
-    ];
-  }
-  const table = document.getElementById("deficit-math");
-  table.textContent = "";
-  rows.forEach(([label, value], i) => {
-    const tr = document.createElement("tr");
-    const td1 = document.createElement("td");
-    if (i === rows.length - 1 && rows.length > 1) {
-      const b = document.createElement("b");
-      b.textContent = label;
-      td1.appendChild(b);
-    } else {
-      td1.textContent = label;
-    }
-    const td2 = document.createElement("td");
-    td2.className = "num";
-    td2.textContent = value;
-    tr.append(td1, td2);
-    table.appendChild(tr);
-  });
-  document.getElementById("deficit-name").textContent = d.name;
-  const parts = [];
-  if (Number(d.buy)) parts.push("buys " + qty(d.buy));
-  if (Number(d.build)) parts.push("builds " + qty(d.build));
-  // Review 2026-09-05: a raw part-covered by compressed purchases used to
-  // read "buys N" for the direct remainder only — the covered leg was
-  // missing, so the answer never summed to the deficit.
-  if (Number(d.covered)) parts.push(
-    (parts.length ? "" : "buys nothing direct — ")
-    + qty(d.covered) + " come from reprocessing compressed purchases");
-  // Composite output from this cycle's alchemy jobs covers part of the
-  // deficit too (a displaced direct job, or a replaced purchase — the
-  // buy is already net of it), so it is neither "unmet" nor missing.
-  if (Number(d.alchemy)) parts.push(
-    "expects " + qty(d.alchemy) + " from the alchemy route");
-  // v1.26: a capacity loser buys only what the market holds; say what
-  // is left unmet rather than stop at "the plan buys N".
-  const shortfall = Number(d.deficit) - Number(d.build) - Number(d.buy)
-    - Number(d.covered) - Number(d.alchemy || 0);
-  const unmetNote = (d.kind !== "final" && parts.length && shortfall > 0)
-    ? " " + qty(shortfall) + " unmet: out of slots, and the market holds no more."
-    : "";
-  document.getElementById("deficit-answer").textContent =
-    d.kind === "final"
-      ? (deficit !== target
-          ? "Finals build their requested quantity every run; the share other pipelines' jobs draw is netted against stock and in-flight jobs."
-          : "Finals build the full cycle quantity every run — stock on hand is the previous wave, bound for sale.")
-      : Number(d.deficit) > 0
-        ? (parts.length ? "The plan " + parts.join(" and ") + "." + unmetNote
-                        : "Unmet — no market to buy from and no slots to build in.")
-        : "No deficit — covered by stock and jobs.";
-  document.getElementById("deficit-chain").href =
-    "{{ url_for('run_detail', index_run_id=run.index_run_id, view='chain') }}#item-" + d.type;
-  document.getElementById("deficit").showModal();
-}
-</script>
-
+{% include "_deficit_dialog.html" %}
 {% endblock %}

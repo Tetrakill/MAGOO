@@ -63,9 +63,11 @@ def _order_book(
     low_budget: threading.Event,
 ) -> list[dict] | None:
     """Every order of one type in one region from ONE paged pull (the
-    region's whole book for that type and side). None when the type has
-    no orders at all (404 on page 1); a 404 mid-pull (the book shrank
-    between pages) keeps the pages already collected.
+    region's whole book for that type and side; ``source`` is ESI's
+    order_type, so 'all' brings both sides down in the same request —
+    v1.29's Buy tab needs the bid alongside the sell ladder). None when
+    the type has no orders at all (404 on page 1); a 404 mid-pull (the
+    book shrank between pages) keeps the pages already collected.
 
     Runs on worker threads: network only, no database access. Raises
     _Throttled when ESI keeps answering 420/429 through esi_request's own
@@ -170,6 +172,38 @@ def _hub_ladder(orders: list[dict] | None, region_id: int) -> list:
     return ladder[: config.HUB_LADDER_MAX_RUNGS]
 
 
+# v1.29 (Buy tab): the hub station's best BUY order, cached under its own
+# source so the "Jita buy" and "Jita split" cells have a price whatever the
+# configured basis is. Under the 'max_buy' basis refresh_prices already
+# writes this same source for the plan quote — only one basis is ever
+# active, so the two writers never race (contract review A21).
+HUB_BUY_SOURCE = "buy"
+
+# "this pull never looked at the buy side" — distinct from None, which is
+# the answer "looked, nobody is bidding" and gets cached as NULL like a
+# sell quote does. A pre-v1.29 fetcher (tests monkeypatch _hub_ladder_quote
+# with a 3-tuple) means the former, so the buy cache is left untouched.
+_NO_BUY_QUOTE = object()
+
+
+def _hub_best_buy(orders: list[dict] | None, region_id: int) -> float | None:
+    """The hub station's highest BUY order with volume left from one
+    pulled book (v1.29 Buy tab) — region-wide where the region has no
+    configured hub station, as every other reduction here does. None when
+    nobody is bidding at the hub."""
+    if not orders:
+        return None
+    station = config.PRICE_STATION_FILTERS.get(region_id)
+    prices = [
+        o["price"]
+        for o in orders
+        if o.get("is_buy_order")
+        and (station is None or o.get("location_id") == station)
+        and int(o.get("volume_remain") or 0) > 0
+    ]
+    return max(prices) if prices else None
+
+
 def _hub_ladder_quote(
     client: httpx.Client,
     region_id: int,
@@ -177,28 +211,55 @@ def _hub_ladder_quote(
     source: str,
     low_budget: threading.Event,
     fallback_region_id: int | None,
-) -> tuple[float | None, int, list]:
-    """(price, hub flag, ladder) for a compressed sourcing candidate from
-    ONE pull: the same quote _fallback_price would cache (hub best order,
-    else the region-wide fallback) plus the hub sell ladder the
-    compressed pass walks. A candidate is a raw leaf, so the v1.9
-    fallback applies to it like any other."""
-    orders = _order_book(client, region_id, type_id, source, low_budget)
-    hub, region_wide = _reduce_prices(orders, region_id, source)
-    ladder = _hub_ladder(orders, region_id) if source == "sell" else []
+) -> tuple[float | None, int, list, float | None]:
+    """(price, hub flag, ladder, best buy) for a compressed sourcing
+    candidate from ONE pull: the same quote _fallback_price would cache
+    (hub best order, else the region-wide fallback) plus the hub sell
+    ladder the compressed pass walks. A candidate is a raw leaf, so the
+    v1.9 fallback applies to it like any other.
+
+    v1.29 (Buy tab): on the sell side the book comes down with
+    order_type='all', so the SAME request also yields the hub's best BUY
+    order — no extra pull against the token bucket. The sell quote and the
+    ladder are derived from the SELL orders only: neither _reduce_prices
+    nor _hub_ladder filters is_buy_order (they were only ever handed a
+    one-sided book), and _reduce_prices' min/max switch keys off the
+    literal source, so both are called with 'sell' (review A20). The
+    region-wide fallback re-pull stays one-sided too.
+
+    The 4th element is the best buy, None when nobody is bidding; callers
+    must treat a missing 4th element (a pre-v1.29 fetcher) as "no buy
+    quote fetched" and leave the buy cache alone — which is also what the
+    private _NO_BUY_QUOTE sentinel returned on a buy-side pull means."""
+    pull = "all" if source == "sell" else source
+    orders = _order_book(client, region_id, type_id, pull, low_budget)
+    if source == "sell":
+        sell_orders = (
+            None if orders is None
+            else [o for o in orders if not o.get("is_buy_order")]
+        )
+        best_buy: object = _hub_best_buy(orders, region_id)
+    else:
+        # A buy-side refresh pulls one side only and keeps today's shape:
+        # nothing to cache under HUB_BUY_SOURCE that refresh_prices is not
+        # already writing itself.
+        sell_orders = orders
+        best_buy = _NO_BUY_QUOTE
+    hub, region_wide = _reduce_prices(sell_orders, region_id, source)
+    ladder = _hub_ladder(sell_orders, region_id) if source == "sell" else []
     if hub is not None:
-        return hub, 1, ladder
+        return hub, 1, ladder, best_buy
     if fallback_region_id is None:
         # Not a fallback type (a buildable input): the hub quote only,
         # exactly like _best_order_price.
-        return None, 1, ladder
+        return None, 1, ladder, best_buy
     if fallback_region_id != region_id:
         _, region_wide = _order_prices(
             client, fallback_region_id, type_id, source, low_budget
         )
     if region_wide is None:
-        return None, 1, ladder
-    return region_wide, 0, ladder
+        return None, 1, ladder, best_buy
+    return region_wide, 0, ladder, best_buy
 
 
 def _best_order_price(
@@ -338,6 +399,16 @@ def refresh_prices(
     type with a fresh price but no ladder rows yet (the toggle was turned
     on inside the cache window) is refetched regardless of age.
 
+    v1.29 (Buy tab): on the sell side a ladder type's pull is an
+    order_type='all' pull, so the hub's best BUY order is cached alongside
+    (source HUB_BUY_SOURCE, hub = 1, same fetched_at) — the Buy tab quotes
+    a buy-order price and a split whatever the configured basis is. Those
+    rows are a sidecar: they are not counted in the return. They share a
+    source string with the max-buy basis' own plan quote (A21), so under
+    that basis a fallback type whose cached buy row has no price is
+    refetched regardless of age — a sidecar NULL means "no hub bid", not
+    "no bid in the region", and the plan's v1.9 fallback must still run.
+
     Returns (fetched, skipped, already_fresh)."""
     type_ids = list(type_ids)
     fallback = set(fallback_type_ids) if fallback_region_id else set()
@@ -361,14 +432,39 @@ def refresh_prices(
                 type_id in ladder_types
                 and row["hub"]
                 and row["price"] is not None
-                and conn.execute(
-                    "SELECT 1 FROM hub_sell_order "
-                    "WHERE region_id = ? AND type_id = ? LIMIT 1",
-                    (region_id, type_id),
-                ).fetchone()
-                is None
+                and (
+                    conn.execute(
+                        "SELECT 1 FROM hub_sell_order "
+                        "WHERE region_id = ? AND type_id = ? LIMIT 1",
+                        (region_id, type_id),
+                    ).fetchone()
+                    is None
+                    # v1.29: same reasoning for the best-buy sidecar — a
+                    # hub-priced ladder type with no buy row at all was
+                    # pulled before the Buy tab existed. "Nobody bids" is
+                    # cached as a NULL row, so this never loops.
+                    or conn.execute(
+                        "SELECT 1 FROM market_price WHERE type_id = ? "
+                        "AND region_id = ? AND source = ? LIMIT 1",
+                        (type_id, region_id, HUB_BUY_SOURCE),
+                    ).fetchone()
+                    is None
+                )
             )
-            if age < max_age_seconds and not missing_ladder:
+            # v1.29 (review 2026-09-23): the sidecar shares its source
+            # string with the max-buy PLAN quote (A21), so a sell-basis
+            # refresh leaves a fresh-looking 'buy' row behind. For a raw
+            # leaf that is not the same answer: the sidecar is station
+            # filtered and never re-pulls region-wide, so its NULL ("no
+            # hub bid") would suppress the v1.9 fallback the plan needs
+            # and the type would plan as unpriced for the cache window.
+            # Refetch a fallback type whose buy row carries no price.
+            missing_fallback = (
+                source == HUB_BUY_SOURCE
+                and type_id in fallback
+                and row["price"] is None
+            )
+            if age < max_age_seconds and not (missing_ladder or missing_fallback):
                 continue
         stale.append(type_id)
     already_fresh = len(type_ids) - len(stale)
@@ -378,6 +474,7 @@ def refresh_prices(
     low_budget = threading.Event()
     fetched: dict[int, tuple[float | None, int]] = {}
     ladders: dict[int, list] = {}
+    hub_buys: dict[int, float | None] = {}
     skipped = 0
 
     def fetch_one(client: httpx.Client, type_id: int) -> tuple:
@@ -417,9 +514,16 @@ def refresh_prices(
                 try:
                     result = future.result()
                     if type_id in ladder_types:
-                        price, hub, ladder = result
+                        price, hub, ladder = result[:3]
                         fetched[type_id] = (price, hub)
                         ladders[type_id] = ladder
+                        # v1.29: a pre-review fetcher (tests monkeypatch
+                        # _hub_ladder_quote) hands back a 3-tuple — no buy
+                        # quote was fetched, so leave the buy cache alone
+                        # rather than blanking it with a NULL row.
+                        best_buy = result[3] if len(result) > 3 else _NO_BUY_QUOTE
+                        if best_buy is not _NO_BUY_QUOTE:
+                            hub_buys[type_id] = best_buy
                     else:
                         fetched[type_id] = result
                 except (_Throttled, ValueError, httpx.HTTPError):
@@ -438,6 +542,18 @@ def refresh_prices(
             "(type_id, region_id, source, price, fetched_at, hub) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (type_id, region_id, source, price, now_iso, hub),
+        )
+    for type_id, best_buy in hub_buys.items():
+        # v1.29: the hub's best BUY order from the very same 'all' pull.
+        # None is cached too ("nobody is bidding" is an answer, like the
+        # sell side). hub = 1 always: this is the hub station's own book
+        # (region-wide only where the region has no station filter), never
+        # the v1.9 region-wide fallback — the fallback re-pull is one-sided.
+        conn.execute(
+            "INSERT OR REPLACE INTO market_price "
+            "(type_id, region_id, source, price, fetched_at, hub) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
+            (type_id, region_id, HUB_BUY_SOURCE, best_buy, now_iso),
         )
     for type_id, ladder in ladders.items():
         # Replaced per type: a candidate the pull answered with no hub
@@ -487,6 +603,21 @@ def cached_hub_ladders(
                 (row["price"], row["volume_remain"], row["min_volume"])
             )
     return ladders
+
+
+def cached_hub_best_buy(conn, region_id: int, type_ids) -> dict[int, float]:
+    """{type_id: the hub's best BUY order price} straight from the cache,
+    ANY age (v1.29 Buy tab: the "Jita buy" cell, and half of "Jita split"
+    with rung 0 of cached_hub_ladders). Cache-only; never touches the
+    network. Types nobody bids on (cached NULL) and types never pulled as
+    ladder types are absent.
+
+    The row is read whatever its hub flag says: under the 'max_buy' basis
+    refresh_prices itself writes this source for the plan quote and may
+    stamp hub = 0 on a v1.9 region-wide fallback (review A21) — a caller
+    that wants to badge that says so from
+    region_wide_types(conn, region_id, ids, HUB_BUY_SOURCE)."""
+    return cached_prices(conn, region_id, type_ids, HUB_BUY_SOURCE)
 
 
 def sell_ladders(conn, settings, type_ids) -> dict[str, dict[int, list]]:

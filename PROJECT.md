@@ -93,24 +93,74 @@ anywhere, iterates quickly, and owns its own data pipeline.
    superseded in Phase 7 by just-in-time purchase sizing) — **final
    products of active pipelines target their exact per-run quantity**
    (revised 2026-08-15: the buffer protects the feeder stages, not the
-   finished output). Final products also **ignore current stock and
-   in-flight jobs**: the line advances every cycle, always building the
-   requested quantities — finished and in-progress ships are the previous
-   wave, bound for sale. Stock and in-progress output still fully count for
-   every intermediate and raw material.
+   finished output). Final products **ignore the previous wave**: the line
+   advances every cycle, always building the requested quantities —
+   finished and in-progress ships from earlier cycles are bound for sale.
+   Since v1.29 revision 7 (user ruling 2026-09-29) final jobs STARTED
+   inside the current buying cycle are this cycle's wave: the plan sizes
+   only the rest of the requested quantity (§7 Phase 4, `installed_qty`).
+   Stock and in-progress output still fully count for every intermediate
+   and raw material.
 
 4. **ESI-based stock tracking, scoped by system** — Current stock is read from
    ESI assets. A global list of tracked solar systems constrains which assets
-   count.
+   count. Compressed ore, moon ore and gas in those hangars count as the
+   raws they reprocess into at the asserted yields, in whole batches
+   (never ice — v1.29 revision 6, user ruling 2026-09-28; §7 Phase 1).
 
 5. **Index run output** — Each run produces a concrete action list: what to
    buy, and which jobs to install (blueprint, run count, job count), sized to
-   close the gap between current stock and target.
+   close the gap between current stock and target. **One run per buying
+   cycle, kept live** (v1.29 revision 6, user ruling 2026-09-28): the
+   *open run* (`buying.collecting_run_id` — the newest run, while it is
+   not executed) is re-planned IN PLACE on every ⟳ Update from ESI and by
+   ▶ Plan index run — same `index_run_id` and `run_number`,
+   `planned_start` moved to the fetched_at of the ESI snapshot the plan
+   read (costing's pre-plan cut — a ▶ Plan from a stored snapshot hours
+   old never saw the purchases made since; review 2026-09-28), its
+   purchases kept — so every tab reads
+   the cycle as it stands. A new run number is created only when no run
+   is open, i.e. after Mark executed; an executed run is never re-planned
+   (Reopen makes the newest executed run the open run again, and the next
+   ESI update re-plans it). The ESI update's automatic re-plan is skipped,
+   with a flash note, when there is no open run, when the snapshot step
+   did not succeed in that request, or when there is nothing to plan
+   from. **No stop rule** (v1.29 revision 7, user ruling 2026-09-29 —
+   "the real fix", replacing revision 6's B1 default): every ESI update
+   re-plans the open run, the cycle's final jobs installing or not,
+   because final jobs started inside the current buying cycle are this
+   cycle's wave and the plan sizes only the rest. The cycle opens at the
+   cut `web._cycle_cut` takes from `buying.buying_windows` — the open
+   run's window's lower bound (the last Mark executed, else the run's
+   `opened_at`); with no open run, the last Mark executed; with no run
+   at all, none (the full wave) — and a job counts when its ESI
+   `start_date` is strictly after it (`esi_snapshot.job_starts`, jobs
+   delivered since included; §7 Phase 4). A re-plan after the installs
+   therefore plans the remainder, and every stage below the final keeps
+   its target (the components built now are the next wave's stock). The
+   Industry Jobs page lists a final with installs this cycle with an
+   `installed N/M` badge, even when nothing of its wave is left to run.
+   Known limits (unlikely, not impossible — the cut is the PC clock's
+   Mark executed, `start_date` CCP's server clock): finals of the
+   executed cycle installed after Mark executed, or within the clock
+   skew of it, count as the new cycle's wave, which then under-plans by
+   that many (and the Profit tab counts those hulls on both executed
+   runs); and on the first cycle, finals installed before the first
+   ▶ Plan are planned again. With the pools the configured ones (R2), a
+   re-plan after the installs fill every line still lists a slot-limited
+   final's rest as jobs to run now, and the executed run counts it as
+   started — pending the user's ruling (§7 Phase 4). While a live plan is older than the newest
+   ESI update (its re-plan was skipped or failed) the Buy tab says the
+   plan nets nothing since then instead of "already off Remaining", and
+   drops the `in transit?` cue.
 
 6. **Job slot constraints** — Plans respect real capacity: the user-entered
-   manufacturing and reaction slot pools, minus MULTI-CYCLE jobs still running
-   past the next index run (revised 2026-08-20; single-cycle jobs deliver
-   before planning by design).
+   manufacturing and reaction slot pools, taken as they are (v1.29
+   revision 6, user ruling 2026-09-28 — running jobs are never subtracted;
+   until then the multi-cycle jobs still running past the next index run
+   were, per the 2026-08-20 decision). Jobs already installed this cycle
+   drop out through stock (their output counts as in progress), so a
+   re-plan mid-cycle assumes every configured line is free.
 
 7. **Max run duration** — The user sets the interval until the next index run.
    Because all jobs are installed at once and cannot be restarted mid-cycle,
@@ -132,9 +182,14 @@ anywhere, iterates quickly, and owns its own data pipeline.
    (v1.5): each input of a hull delivered at executed run N is priced from
    the price/fee snapshot of the run its chain depth lags behind, clamped
    during spin-up. A finished product's profit reflects what
-   its materials actually cost several runs ago, not today's prices. (FIFO
-   lot genealogy was the original design; its machinery remains as dormant
-   Phase-8 primitives.)
+   its materials actually cost several runs ago, not today's prices. Since
+   v1.29 the snapshot is not the last word: the **purchases ESI matched**
+   to the lagged run's buying cycle (feature 20 — wallet buys and accepted
+   item exchanges, never typed in) win over its price snapshot inside the
+   snapshot loader, so an input bought below the plan's quote costs what
+   was paid. The plan's own columns are never rewritten, and a run with
+   no purchase lines costs exactly as it did before. (FIFO lot genealogy was the original design; its machinery
+   remains as dormant Phase-8 primitives.)
 
 10. **Alchemy (v1.4)** — When reaction slots are left over, cheaper Unrefined
     reaction routes substitute for direct composite reactions: run the
@@ -185,11 +240,15 @@ anywhere, iterates quickly, and owns its own data pipeline.
     across the two markets; units beyond every stored order are priced at
     the last order walked and — unless Jita's stored book was truncated,
     so its real book continues — are **unsourced**: attributed to no
-    market and listed in no Multibuy block; the row is badged *N unsourced*
-    (ruling 2026-09-05; the word was *shallow* until v1.26.1). The Buy list's unit price is the blended fill
-    average (per-venue fills in the tooltip); Multibuy lists each market's
-    share; freight splits by the venue quantities in the realized profit
-    view. Phase 1's single best-price quote remains the starting point (the
+    market and listed in neither Multibuy All block (a group's own list,
+    v1.29 revision 8, carries them as part of Remaining); the row is
+    badged *N unsourced*
+    (ruling 2026-09-05; the word was *shallow* until v1.26.1). That fill is
+    the Buy tab's **Ladder** — its unit price is the blended fill
+    average, landed — and Multibuy All's per-market blocks list each
+    market's share of what is still to buy (a group's own Multibuy, since
+    v1.29 revision 8, is one unsplit list); freight splits by the venue quantities in the
+    realized profit view. Phase 1's single best-price quote remains the starting point (the
     chain cost's inputs, the alchemy comparison and the Planning tab's
     live views still use it), but since v1.26 the build-vs-buy rule
     judges a buildable intermediate's own buy side at its fill: its cycle
@@ -257,17 +316,32 @@ anywhere, iterates quickly, and owns its own data pipeline.
     batches (100 units for ore and moon ore, 1 for gas) and stand only if
     strictly cheaper than the raws they cover. Surplus outputs are
     leftover stock and worth nothing in the decision; compressed items
-    already in the hangar are ignored. The run page lists the compressed
-    buys (badged, in Multibuy), badges the covered raws, adds a
-    "Compressed sourcing" section with the reprocess checklist and the
-    landed saving, and the realized costing prices a covered raw at its
-    blended landed cost. Ice products are out of scope. Requires an SDE
+    already in the hangar are not re-sourced — since v1.29 revision 6
+    (2026-09-28) they count as the raws they reprocess into, on hand
+    before the pass runs (feature 4). All of it surfaces on the **Buy
+    tab** (feature 20; since 2026-09-24 it is the only page that talks
+    about buying): a covered raw is one row at its whole demand, badged
+    and naming the ores behind it, while the compressed buy itself is a line of Multibuy All alone,
+    with the "After buying — reprocess" checklist (v1.29 revision 8,
+    2026-09-29: no group renders it; what ESI matched to it is in the
+    Purchased totals and the Purchases section),
+    and the header badge carries the landed saving. Realized costing
+    prices a covered raw at its blended landed cost — re-blended from what
+    the ores actually cost once purchases of them are matched to the run
+    (since v1.29 the engine persists the allocation shares and landed
+    totals the pass used, so the re-blend is the engine's own arithmetic,
+    not a reconstruction of it) and re-normalised onto the raws that
+    stayed on the ore's route when one of them is bought direct instead
+    (2026-09-24).
+    Ice products are out of scope. Requires an SDE
     download made since v1.25 (`ref_compressible`, `ref_type.portion_size`).
 
 18. **Ledger (v1.27.0, 2026-09-07)** — what the pipeline finals actually
     sold for. Every "⟳ Update from ESI" runs a second, independently
     guarded step after the snapshot (and, since the same day's user
-    request, the price refresh as a third — one button keeps the quotes,
+    request, the price refresh as a third, and since v1.29 the re-plan of
+    the open run in place as a fourth (revision 6, feature 5) and purchase
+    matching for the Buy tab as a fifth — one button keeps the quotes,
     undercut verdicts and contract splits current; the Planning tab's
     profit view keeps a prices-only button, the dashboard does not —
     user ruling 2026-09-11): for each character and corporation
@@ -335,10 +409,19 @@ anywhere, iterates quickly, and owns its own data pipeline.
     have sales in the window, and the contracts ESI gave no items for. Count sales is honoured at read time too
     (rows keep accruing). Needs four new scopes on the app registration
     and a re-login per character (the ESI tab badges *re-login needed*).
+    Since v1.29 the same pull also keeps the BUY side — wallet buys and
+    the item exchanges the pool accepted, in their own tables — for the
+    Buy tab (feature 20), under a sibling **Count buys** toggle and with
+    no new scope; the Ledger's own tables and queries are unchanged. An
+    owner with Count sales off but Count buys on still has its wallet and
+    contracts read, so a gap there is noted as purchases possibly missing
+    from the Buy tab, not sales (review 2026-09-28).
 
 19. **Install check (v1.27.1, 2026-09-09)** — every planned run verifies
     that this cycle's jobs can actually be INSTALLED from what is there:
-    each job's inputs are available at stock on hand + in-flight output +
+    each job's inputs are available at stock on hand (since v1.29
+    revision 6 including what hangar compressed ore reprocesses into —
+    startable once it is reprocessed) + in-flight output +
     this cycle's purchases (the Buy list is bought before the installs; a
     compressed-covered raw counts its reprocessed share) — never this
     cycle's own build output, which delivers next cycle (that one-cycle
@@ -361,7 +444,7 @@ anywhere, iterates quickly, and owns its own data pipeline.
     that fits; an **exact-quantity ship or a saturating reaction as full
     jobs at the plan's runs per job plus one last job with the
     remainder** (whole-copy rounding set aside) — and the draw is judged
-    at that packing. On the Plan tab the **job tables show the jobs to
+    at that packing. On the Industry Jobs tab the **job tables show the jobs to
     run now** (Runs/job with "· last N" on the remainder job, Jobs, Build
     qty; the plan's own figures in the tooltips; a `short` badge naming
     the binding input — no separate column, user ruling), the section
@@ -371,7 +454,7 @@ anywhere, iterates quickly, and owns its own data pipeline.
     short input's planned draw, availability (on hand + in jobs + bought
     + compressed-covered), shortfall and the cut jobs that eat it.
     Advisory: the plan's sizing, slots and buys stand underneath — the
-    Buy list is unchanged and the Chain tab keeps the plan; the run does
+    Buy list is unchanged and the Stockpile tab keeps the plan; the run does
     not re-plan around the shortage (§7 Phase 7.6). One thing does feed
     back (user ruling 2026-09-09): a slot held by a job stock cannot
     start is a free slot, so Phase 6 hands such slots — in savings order
@@ -387,6 +470,359 @@ anywhere, iterates quickly, and owns its own data pipeline.
     per-hull cost stays the **Ledger's cost basis** whether or not the
     cycle started a hull (user rulings 2026-09-09).
 
+20. **Buy tab (v1.29, user rulings 2026-09-23, 2026-09-24, 2026-09-28
+    and 2026-09-29)** — what this cycle requires, what is on hand, what is
+    left to buy and what was purchased, and realized cost priced at what was
+    actually PAID rather than the plan's estimate. It is one of four run
+    sub-tabs, renamed for what each page is about: **Industry Jobs | Buy |
+    Stockpile | Profit** (the `?view=` keys and every route keep the old
+    words `plan` / `buy` / `chain` / `profit`). **Purchasing lives here and
+    nowhere else**: the Industry Jobs tab is jobs and stock only — no Buy
+    section, no Multibuy, no "structure components bought" sub-table, no
+    Compressed sourcing section. It keeps the wallet facts (the Buy total
+    stat and its "exceeds wallets" badge) and the deficit-breakdown
+    dialog, which the Buy tab now shares, so a bought-only row still
+    answers "why this quantity".
+    **Purchases come from ESI, never from the page** (revision 3, user
+    rulings 2026-09-28): no forms, no option columns, no click-to-record,
+    no hand entry. The Ledger's sales pull (feature 18) already read every
+    owner's wallet transactions and contracts; it now also keeps the
+    wallet BUY transactions and the item exchanges the pool ACCEPTED
+    (`buy_transaction`, `buy_contract` / `buy_contract_item`, §6), and
+    `buying.assign_purchases` derives each run's `run_purchase` lines from
+    them. It runs as the fifth and last step of ⟳ Update from ESI (after
+    the price step, so contract reference prices come from this refresh,
+    and after the re-plan of the open run, so conversions and contract k
+    see the fresh plan; also when ESI is down — it reads only local rows);
+    after every action that
+    moves a buying window or changes whose buys count — planning a run
+    (a new run takes the lines of the cycle it opens; a re-plan in place
+    keeps them), discarding a run,
+    marking a run executed or reopening it, flipping a Count buys toggle,
+    removing a character; after saving Settings (revision 4: the venue
+    rule, the unplanned-ore conversion and the live inbound rates read
+    them — executed runs keep their frozen conversions and the structure
+    market they were planned against); and on a Buy tab view of a run that holds no
+    derived lines while any purchase is stored, but only when the pass's
+    inputs changed since the last successful pass (a safety net after a
+    failed pass or a restart, never a write on every view — review
+    2026-09-28). Its summary line joins the refresh flash, and a failure
+    never breaks the calling request. A per-owner **Count buys** toggle on the ESI tab (a sibling
+    of Count sales, default on) decides whether an owner's purchases
+    count. Like Count sales it is honoured at READ time: buys are always
+    stored, and the wallet and contract feeds are read while either toggle
+    is on, so switching it back on loses nothing.
+    **A purchase belongs to a buying cycle, not a plan.** An executed run
+    collects the purchases dated in (the previous executed run's
+    `completed_at`, its own `completed_at`]; the newest run, while it is
+    still a plan, collects everything after the last executed run's
+    `completed_at`; with no executed run before it, a window opens when
+    the run was first planned — `COALESCE(index_run.opened_at,
+    planned_start)` (revision 6: `planned_start` moves on every re-plan in
+    place, `opened_at` never does, so re-planning never empties the
+    cycle's first window). A superseded (legacy) plan collects nothing — its
+    tab says which run the purchases went to and reads none of its old
+    lines, even ones no pass has cleared yet — and each purchase is on one
+    run only. Bounds compare as parsed UTC timestamps (SQLite's
+    `YYYY-MM-DD HH:MM:SS` against ESI's `…Z`). A late pull may still add a
+    purchase dated inside an executed run's closed window (the window is a
+    date bound, not a freeze), which reprices later runs' lagged inputs on
+    the next read; the tab says so on an executed run. Reopen /
+    re-execute moves the bound. Since revision 6 a re-plan is in place,
+    so the open run keeps the whole cycle's purchases; a superseded run
+    arises only from runs planned before it (or rows built by hand), and
+    a new run is made only after Mark executed, when its window starts
+    at that `completed_at`.
+    **Where it was bought sets the freight** (revision 4, user ruling
+    2026-09-28, superseding revision 3's "NPC station → Jita, Upwell
+    structure → structure market, none → Jita"): only the price region's
+    hub station (Jita 4-4) is Jita and only the configured structure
+    market (`settings.structure_market()`) is the structure market; ANY
+    other location — another NPC station, another structure (a corp
+    Sotiyo in C-J6MT included: "C-J" is the market's structure id, not
+    its system), a contract handed over elsewhere, or no location — is
+    **elsewhere** (venue `other`), hauled at the new Settings rate
+    **Default Inbound Freight** (`freight_in_default_isk_per_m3`, default
+    0: until it is set, a purchase elsewhere carries no freight — which
+    changes the revision-3 costing of wallet buys at other stations and
+    structures, then charged the Jita / structure rate). The rule is
+    `buying.purchase_venue(location_id, settings)`; `costing.sale_venue`
+    stays the Ledger's rule for SALES. Every leg hauls at the RUN's
+    persisted rates (`index_run.freight_in_default_isk_per_m3` joins the
+    two existing ones; runs planned before it fall back to the live
+    setting). An EXECUTED run also classes its purchases against the
+    structure market it was planned against (`index_run.structure_market_id`,
+    review 2026-09-28), so pointing Settings at another structure never
+    moves that run's buys at the old one onto the default rate (or out of
+    its Null Sec Market Share); the open run, and a run planned before the
+    column, follow the live setting. Two readings are the implementer's,
+    **pending the user's confirmation** (contract A4 / A17, see §11): the
+    user's request named contracts, and the rate applies to every
+    purchase, since it is about where the goods sit, not how they were
+    bought; and "C-J" is the market's structure id, not the C-J6MT
+    system. **Any bought compressed ore covers the raws it yields**
+    (revision 4, user ruling 2026-09-28): the user buys whatever ore a
+    seller has, so a purchase of a compressed ore / moon ore / gas the
+    plan did NOT choose (no `index_run_item` row for it with
+    `compressed_outputs`) is not left outside the plan. The matcher
+    replaces its line with one `delivered` line per raw it reprocesses
+    into (`run_purchase.via_type_id` = the ore): whole batches only
+    (`units // portion_size`), outputs `CompressedSource.batch_output` at
+    the asserted ore / gas yield, and the ore's LANDED ISK — price × the
+    converted units + its venue freight at the run's rates + the refining
+    tax on the outputs' value (ore only; gas is untaxed) — spread over the
+    raws by their landed plan value (the run's `ladder_landed_unit`, else
+    the reference price + Jita freight; by units when nothing is priced).
+    `delivered` because the freight and tax are inside the price. The
+    units short of a whole batch stay an ore line, outside the plan. So
+    the raws' Purchased and realized cost take the ore in with no reader
+    changed (while the ore sits unrefined in a tracked hangar, the plan
+    counts it as those raws on hand anyway — revision 6, feature 4). Plan-chosen ores keep their revision-3
+    path (ore lines re-blended through `compressed_alloc`), bought surplus
+    included, and are never converted. Never converted either: ice (a
+    compressed source with no output in `COMPRESSED_SOURCE_GROUPS` — out
+    of scope, not refined at the ore yield), a kind whose yield is 0, a
+    record under one batch; the compressed Settings toggles do not gate
+    it. Conversion is per purchase RECORD, not per hangar stack (a
+    contract's items of one ore are pooled first), so a record
+    under-converts by less than one batch — at most one unit per output —
+    and a record below one batch stays wholly outside the plan; accepted,
+    because the freeze and the annotation work per record. An output the
+    run does not hold (Mexallon from an ore on a run that buys none) is
+    written too and counted outside the plan, its ISK uncosted. On an
+    EXECUTED run a record's conversion is frozen once written: the stored
+    via lines are re-emitted verbatim (a contract's only while its k is
+    unchanged), so a later yield, tax, rate or price change never reprices
+    history; the newest plan, a record new to the run and lines written
+    before revision 4 compute fresh. The conversion is also kept apart
+    from the lines (`run_purchase_refine`, review 2026-09-28): a record
+    the pass stops costing for a while — Count buys off, a character
+    removed and re-added — loses its lines, and gets the SAME conversion
+    back when it counts again rather than one at that day's settings.
+    Reopening a run drops its frozen conversions (it re-derives, as
+    before). Via lines are dated like any other line since revision 6
+    (`costing._pre_plan` is a pure date test; revision 4 made them always
+    post-plan). **A bought contract's price is spread over what it
+    delivered**: P = price − reward, `k = P / Σ p_i q_i` over the received
+    items at reference price p_i (the cached Jita sell quote, else CCP's
+    adjusted price; a blueprint copy is never priced, its adjusted price
+    being the original's), each item recorded at `k × p_i` — exactly P in
+    total — and an item with no reference price at 0 with the contract
+    badged *unpriced*. The allocation is frozen on the contract once every
+    received item that can be priced is — a blueprint copy never can, so
+    it counts as 0 for the freeze (still badged): a kit of a BPC and
+    minerals would otherwise re-split its price by the live quote ratio on
+    every pass and move an executed run's cost with the market (review
+    2026-09-28). Listed under Purchases with the reason and never costed:
+    an **internal** transfer (a wallet buy from one of the pool's own
+    characters or corporations, or a contract issued by one of its
+    characters or ON BEHALF of one of its corporations — ESI's
+    `for_corporation` — so the alt that buys at Jita and contracts the
+    goods to the main at 0 ISK is not recorded twice; a corpmate outside
+    the pool selling personally carries our corporation's id as ESI's
+    `issuer_corporation_id` too, and is a real purchase), a **swap** (the pool
+    also gave items, or price − reward ≤ 0), a contract with **no
+    reference price** for any received item, an owner with Count buys off.
+    **The page** (R8; columns and figures as ruled in revision 6, user
+    rulings 2026-09-28). The open run is kept live (feature 5), so the
+    page **subtracts nothing from the plan**: what was bought and reached
+    a tracked system is on hand at the next ESI update, and the re-plan
+    that update runs has netted it already. The **header strip** reads
+    **Required · On Hand · Remaining · Purchased**: Required, On Hand and
+    Remaining as ISK at the plan's own landed ladder price (On Hand capped
+    at each row's Required, its title giving the units on hand beyond it,
+    so the strip reads Required − On Hand ≈ Remaining), Purchased as the
+    LANDED ISK of the purchases matched to plan rows and compressed ores
+    (price + this run's inbound freight), with rows purchased / rows. Then
+    the badges that describe the buy list: unpriced (its units count 0 ISK
+    in Required, On Hand and Remaining) / via structure / split /
+    unsourced / via compressed / *N units outside the plan* / *N unpriced
+    contract items* / *unallocated* (the ISK of a compressed buy whose
+    outputs the plan valued at zero, so it allocated that cost to no raw).
+    Then **Multibuy All**: one Jita block and one structure block of the
+    plan's buy list across the groups, and a collapsed reprocess checklist
+    for the ores it lists. Then **Input Materials** (revision 8, user
+    ruling R3 2026-09-29: "the item group shall stay collapse under a
+    main header of Input Materials"): ONE top-level section, open by
+    default (`data-key="buy:inputs"`), headed by the group count and
+    what remains at the ladder, wrapping the groups by material family
+    (Minerals · Moon Materials · Gas · Planetary Industry · Fuel Blocks,
+    then every other group name alphabetically). Each group is a nested
+    `h3.subhead` section that starts COLLAPSED (`data-default="closed"`,
+    keyed `buy:inputs:<label>`), its summary carrying the row count and
+    the same four subtotals so a closed group still reads. base.html's
+    section-state script stores "open" or "closed" on every toggle, as it
+    always did; on load only the value that differs from a section's
+    default takes effect — "closed" for a default-open section (every
+    other page, unchanged), "open" for a `data-default="closed"` one. Each row reads **Item · Required · On Hand ·
+    Remaining · Purchased · Ladder · Δ**:
+    - **Required** (`web._required_of`) — what this cycle's plan needs of
+      the item in total: `deficit_qty + on_hand_qty + in_progress_qty`
+      while `deficit_qty > 0`, else `target_stock_qty`. For a raw bought
+      just in time that is its target — the allocated jobs' planned
+      consumption plus the purchase margin (not `cycle_need_qty`, which
+      the title quotes as the steady cycle need); for a buildable it is
+      target stock plus this cycle's draw, the Stockpile's deficit basis
+      (the identity its deficit dialog inverts). NULLs read 0.
+    - **On Hand** = `on_hand_qty + in_progress_qty` — the stock the plan
+      counted. `on_hand_qty` already includes what hangar compressed ore
+      reprocesses into (`on_hand_from_ore_qty`, feature 4), so the
+      deficit dialog's and the install panel's identities hold unchanged;
+      the title breaks it out as hangar (`on_hand_qty −
+      on_hand_from_ore_qty`) + from hangar compressed ore + in jobs (with
+      alchemy's expected credit from unrefined stock named inside it),
+      as of the ESI update the plan read (`web._plan_snapshot_cut`: the
+      newest retained snapshot fetched at or before `planned_start` —
+      exact after an update-time re-plan; the run stores no snapshot
+      time, so when snapshots have been pruned past it the title says
+      "no longer kept" and quotes `planned_start`).
+    - **Remaining** = `recommended_buy_qty + compressed_covered_qty` —
+      the plan's buy, floored at 0, purchases never taken off it; its
+      title splits direct vs from compressed ore. For a raw with a
+      deficit, Required − On Hand = Remaining exactly (the sourcing pass
+      splits the deficit into direct + covered). It diverges, and its
+      title says why, where stock exceeds Required ("On Hand covers
+      Required", Remaining 0) and on a buildable row, where the plan
+      builds part of the deficit, expects alchemy output or leaves a
+      capacity shortfall no market holds (unmet) — Remaining is only the
+      part it buys. Units the plan could not source are in Remaining but in
+      neither Multibuy All block (B35) — the group's own list carries
+      them, as part of Remaining — and the title counts them.
+    - **Purchased** — the cycle's purchase lines (`costing.bought_cell`'s
+      `bought_qty` / `bought_unit` / `bought_landed`): units and the
+      average landed unit, nothing else (revision 8, user ruling R1
+      2026-09-29: "for the purchased column, remove the tags"). The
+      sources from `web._line_sources` — Jita / the structure market /
+      **elsewhere** (where) / `contract` (its title or id, k and where it
+      was handed over) / one **via compressed** share (each ore's units
+      and landed ISK) — are one clause each of the cell's title, which
+      also names the units beyond `costing.purchase_basis` — "beyond what the cycle consumes —
+      stock for the next cycle", the units realized costing leaves
+      unpriced (R5).
+    - **Ladder** — the plan's landed unit price (`ladder_landed_unit`; a
+      covered raw's blended `effective_unit_cost`); **Δ** — Purchased
+      landed − Ladder × the purchased units.
+    **Known limit — purchases in transit** (contract review B2, the
+    recommended default copy, **pending the user's confirmation**): On
+    Hand counts only stock ESI shows in a tracked system, and a courier's
+    contents are in no asset list, so a Jita buy on its way to the
+    structure is re-planned into Remaining and the Multibuy until it
+    lands. The live-run caption and the Multibuy text say so, and on the
+    open run a row with Purchased > 0 and Remaining > 0 carries an
+    **in transit?** badge titled with both figures. An executed or
+    superseded run's page reads its plan as it was last planned, with
+    its own caption and no badge.
+    In the three raw groups **a row is the END-RESULT RAW at its whole
+    cycle demand** — `recommended_buy_qty + compressed_covered_qty` —
+    whether the plan buys it direct, covers it by reprocessing compressed
+    ore, or both, and the compressed ore itself is **not a row** — since revision 8
+    (R2b) it appears in no group at all: it is a line of Multibuy All
+    only, filed (for that block's order, and for whose Purchased ISK
+    its purchases join) under the group covering most of what it
+    reprocesses into, so it cannot be pasted, and bought, twice. Every
+    other group's rows are the items bought at `recommended_buy_qty`. On
+    top of those, every non-built row carrying purchase lines is a row
+    too — a re-planned row the plan no longer buys shows with Remaining 0
+    and a *not on the buy list* badge, since costing prices it — so the
+    tab shows every line costing uses. **Outside the plan** is exactly two
+    kinds of line, counted in the strip and never in Purchased: a type the
+    run does not hold, and a BUILDABLE row (`blueprint_id` set — built,
+    partly built, or even bought outright on a build-vs-buy "buy" verdict
+    — or an alchemy route), whose purchase is recorded but whose realized
+    cost comes from its own inputs, since `hull_cost` prices every such
+    row as an install. A buildable row the plan buys keeps its row (badged
+    *built*). A purchase of a type the local game data does not know yet
+    (CCP adds items before an SDE re-import) reads "type N" rather than
+    breaking the page.
+    **One compressed tag per row** (revision 5's tag cleanup, user ruling
+    2026-09-28: the tables were stretched — kept by revision 6). A covered
+    raw's Item cell carries exactly one compressed tag, the accent **"N
+    via compressed"** badge (N = the covered units); the ores it is
+    reprocessed out of are named in its title ("From <ore, ore, …> — each is a line in Multibuy All above, not a
+    row of its own; N units reprocessed out of them. This group's own
+    Multibuy lists the raw itself"), with no footnote under the name.
+    Since revision 8 a group names an ore only in tooltips: this tag
+    title (the ores the plan picked) and the Purchased title's via
+    clause below (an ore the pool bought that the plan did not pick) —
+    never as a row, a cell's text or a Multibuy line. In the
+    Purchased cell's title every via-ore share folds into ONE **via
+    compressed** clause (`web._line_sources`), listing each ore with its
+    units and landed ISK; the Jita / structure / elsewhere / contract
+    sources keep one clause each (badges until revision 8). The strip's "N via compressed" count badge and the
+    Purchases section are unchanged.
+    Each group ends with **"Multibuy — N items to buy"** (revision 8,
+    user ruling R2 2026-09-29: "the straight no compression, just the
+    item list with no jita vs c-j6 differing lists"): ONE read-only
+    textarea, `name qty` per line (`web._group_multibuy` over
+    `_multibuy_text`), one line per row whose Remaining > 0 at its
+    Remaining, in the table's order — the raw itself (a covered raw at
+    direct + covered, as if bought straight), unsourced units included
+    — not split by market and with no ore line; a group with nothing
+    remaining says so. The per-group ore table (Ore · Remaining ·
+    Purchased · Ladder · Δ) and the per-group reprocess checklist are
+    gone (R2b, user ruling 2026-09-29: "the only place that matters is
+    the multibuy all"). **Multibuy All is unchanged**: the plan's
+    sell-ladder buy, one block per market listing the plan's own venue
+    split exactly (hub units to Jita, structure units to the structure
+    market; nothing netted — revisions 3–5's `_reduce_shares` purchase
+    netting is gone), unsourced units in neither block (B35), a covered
+    raw at its direct share and every compressed ore the plan picked at
+    its plan quantity, followed by the collapsed **"After buying —
+    reprocess:"** checklist (moved from the Industry Jobs tab) with the
+    yields and tax its quantities depend on. What was paid for a
+    plan-chosen ore still counts in Purchased — the strip's and that of
+    the group it is filed under, unchanged by the table's removal — and
+    is listed under Purchases; its Ladder ISK is added to no total (it
+    is inside the covered raws' Ladder figures already), and realized
+    costing still re-blends it into the covered raws. The last
+    section, **Purchases**, lists every wallet buy and bought contract
+    dated in the run's window, costed or not: date, owner, venue (an
+    elsewhere record names its solar system — `location_system` +
+    the SDE; the app has no station or structure names — or "location
+    N" while unresolved), items (each at its recorded unit price, badged
+    *given* / *copy* / *outside the plan* / *refined* where so), price
+    and k. A refined ore record carries "C <ore> → refined into N
+    Tritanium, M Pyerite (landed X ISK incl. freight and refining tax)",
+    plus "; M Pyerite outside the plan" for the outputs the run does not
+    buy (the strip counts them outside too — review 2026-09-28) and
+    "; R short of a batch stay outside the plan" for a remainder,
+    summed from its stored via lines (`buying.refined_ores`); the tax is
+    not shown apart because the lines store only a landed unit price. A
+    plan-chosen ore record keeps its plain wording. When the record
+    reader fails the section is rebuilt from the run's lines; a record
+    there with refined lines prices them LANDED (the ore's own order price
+    is stored nowhere) and its Price title says so instead of "before
+    freight". In the Purchased cell's title the via-ore shares are one **via
+    compressed** clause — one for every ore since revision 5, each
+    ore's units and landed ISK (revision 4 badged each **via <ore>**;
+    revision 8 moved every source from badges into the title) — and an
+    elsewhere share an **elsewhere** clause naming the location; the strip's *outside the plan* excludes converted ore units
+    and its tooltip names any remainder left outside. The price refresh
+    also pulls the Jita order book for the received items of every
+    contract not yet priced, so its k uses a real sell quote where one
+    exists (the ids join the order-book pull only, not the region-wide
+    fallback or the ladders; under the Max Buy Order hub basis the
+    refresh pulls bids only and k keeps the adjusted-price fallback).
+    Every figure is LANDED at the run's persisted rates — there is no
+    freight toggle and no order-price view. Purchased, Ladder and Δ come
+    from `costing.bought_cell` / `ladder_landed_unit`: Purchased is the
+    lines landed (`blend_purchases` against an empty plan; the cell's
+    `need` / `remaining` / pre- and post-plan fields are no longer read by
+    the page since revision 6), Ladder the plan
+    blend's landed unit (a covered raw's `effective_unit_cost`). They are
+    per-unit cells, not the Profit tab's change — realized costing prices
+    against the consumption basis and re-blends covered raws (§7 Phase
+    7.5). The Profit tab badges a repriced line *bought*, and *approx.*
+    where a pre-v1.29 run's missing shares had to be approximated, and
+    *elsewhere* for a line bought wholly at neither market. A purchased
+    line is a split whenever any two of Jita, the structure market, delivered
+    and elsewhere hold units; its badge and title name only the venues
+    that supplied units ("Jita + delivered", "delivered + elsewhere"), and
+    say "both markets" only for a Jita + structure split (review
+    2026-09-28). The `delivered` venue (a
+    price already landed) is used by exactly one kind of ESI line since
+    revision 4: the raws refined from an unplanned ore.
+
 ---
 
 ## 3. Architecture
@@ -400,25 +836,39 @@ magoo/
     config.py             verified industry constants, paths, activity IDs
     sdeimport.py          CCP JSONL SDE download + import into reference tables
     refdata.py            read layer over imported reference data
-    industry.py           ME/TE/facility/rig math, job cost
+    industry.py           ME/TE/facility/rig math, job cost, hangar
+                          compressed ore as refined raws (v1.29)
     bom.py                multi-stage BOM expansion (Phase 2)
     engine.py             index run planning (Phases 2-7 + consumption
                           feedback loop; Phase 8 FIFO primitives dormant;
-                          Phase 1 snapshots arrive via esi.py/market.py)
-    costing.py            lag-based per-hull realized cost + sell-side
-                          fee model (v1.5/v1.6) + the buy-venue chooser
-                          (v1.10, pure)
+                          Phase 1 snapshots arrive via esi.py/market.py;
+                          creates a run or re-plans the open one in
+                          place, v1.29 revision 6)
+    costing.py            lag-based per-hull realized cost (ESI
+                          purchase lines override the plan snapshot,
+                          v1.29) + the Buy tab's Purchased / Ladder / Δ
+                          cells + sell-side fee model (v1.5/v1.6) + the
+                          buy-venue chooser (v1.10, pure)
     esi.py                OAuth2 PKCE; corp+char assets, industry jobs,
                           wallets; structure resolution + market orders;
                           the Ledger feeds (sell orders, wallet
                           transactions, contracts + items; v1.27.0)
     ledger.py             sales pull (two-phase per owner × family, the
-                          contiguous transactions cursor) + the Ledger
-                          tab's read side (v1.27.0)
+                          contiguous transactions cursor; since v1.29
+                          also the buy side: wallet buys + accepted item
+                          exchanges) + the Ledger tab's read side
+                          (v1.27.0)
+    buying.py             v1.29: matches ESI purchases to runs' buying
+                          cycles, prices bought contracts, writes the
+                          derived run_purchase lines (never imported by
+                          ledger.py)
     charts.py             pure SVG chart geometry for the Ledger (v1.27.0)
     market.py             price snapshots: regional hub quotes, the
                           structure market's best prices + sell ladders,
-                          and the per-type buy quote (v1.10)
+                          the per-type buy quote (v1.10) and the hub's
+                          best buy order cached on every sell-side
+                          refresh (v1.29; no reader since revision 3 —
+                          §6 market_price)
     store.py              schema creation and state persistence
     web.py                Flask routes
     templates/            Jinja2 views
@@ -972,6 +1422,19 @@ Hulk, ME10 / TE20, in a Sotiyo in nullsec, with a Large Ship ME rig fitted:
 
 Reference tables are described in §4. Application state follows.
 
+**Schema version and the pre-upgrade snapshot.** `store.SCHEMA_VERSION` is
+stamped into `PRAGMA user_version` after a successful migration, and a build
+refuses a database a NEWER build wrote. Before its first migration an
+existing database is snapshotted to `backups/magoo-pre-<version>.sqlite`,
+named after `magoo.__version__` and never overwritten — so a
+schema-changing release must **stamp the version before the build is ever
+run against `data/magoo.sqlite`**. Run it unstamped and the snapshot the
+previous release already wrote under that name suppresses a fresh one, and
+the migrated database cannot be opened by the installed build it was
+migrated from (no rollback point). The same applies to the `magoo` /
+`magoo-dev` launch entries, which use the real data dir — preview a
+schema-changing branch against a scratch copy instead.
+
 ### Pipelines
 
 **`pipeline`**
@@ -1020,9 +1483,10 @@ included. Deleted with its run or its pipeline.
 | `character_id` | PK |
 | `character_name` | |
 | `include_assets` | Count this character's wallet toward buying power (stock is corp-scope since 2026-08-20) |
-| `include_job_slots` | Count this character's PERSONAL jobs toward slot occupancy / multi-cycle netting (2026-08-25: corp-feed jobs count under the corp's `count_jobs` toggle instead — the corp feed runs first and claims corp jobs in the dedup) |
+| `include_job_slots` | Count this character's PERSONAL jobs toward slot occupancy (2026-08-25: corp-feed jobs count under the corp's `count_jobs` toggle instead — the corp feed runs first and claims corp jobs in the dedup). Since v1.29 revision 6 (2026-09-28) planning never subtracts running jobs from the pools, so the toggle is planning-inert: it gates only the ESI update's active-job count (the flash and the dashboard). Kept, and relabelled **Count active jobs** on the ESI tab (the corp column reads **Count jobs**) |
 | `count_assets` | 2026-08-25: opt this character's PERSONAL hangars into stock on hand (default 0) |
 | `count_sales` | v1.27.0: pull this character's sell orders, sale transactions and contracts for the Ledger and count them (default 1; honoured at read time — a character switched off also stops carrying its corporation's wallet sales that only its own feed reports) |
+| `count_buys` | v1.29 (2026-09-28): count this character's wallet buys and accepted item exchanges as purchases on the Buy tab (default 1). Honoured at READ time only (`store.buys_enabled_owners`, in `buying.assign_purchases`): the wallet and contract feeds are read while `count_sales` OR `count_buys` is on, and buys are always stored, because the transactions cursor is shared — skipping the write would move it past buys no later toggle could recover |
 
 **`esi_corp`** — corporations reachable through the pool (ESI tab); upserted
 on every ESI refresh, `count_assets` is user state and survives; rows pruned
@@ -1034,11 +1498,12 @@ when every member has left the pool.
 | `corporation_name` | From the public corp endpoint |
 | `count_assets` | Default 1; 0 = this corp's hangars don't feed stock (the assets pull is skipped) |
 | `count_wallet` | Default 1; 0 = this corp's ISK leaves the buying-power line (wallets pull skipped) |
-| `count_jobs` | Default 1; on = every corp-feed job counts toward in-progress stock AND slot occupancy / multi-cycle netting (corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs); 0 = the pull is skipped (pool characters' own jobs still arrive via their character feed, then gated by `include_job_slots`) |
+| `count_jobs` | Default 1; on = every corp-feed job counts toward in-progress stock AND the active-job count (slot netting until v1.29 revision 6; corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs); 0 = the pull is skipped (pool characters' own jobs still arrive via their character feed, then gated by `include_job_slots`) |
 | `assets_via` / `jobs_via` / `wallet_via` | character_id that answered the endpoint family (NULL = no role or skipped) |
 | `asset_rows` / `job_rows` | Rows returned at the last refresh (pull diagnostics) |
 | `refreshed_at` | |
 | `count_sales` | v1.27.0: pull this corporation's sell orders, wallet sales (7 divisions) and issued contracts for the Ledger and count them (default 1; read-time too). Its sales provenance lives in `sales_pull`, not here |
+| `count_buys` | v1.29 (2026-09-28): count this corporation's wallet buys and accepted item exchanges as purchases (default 1; read time only, as for characters). A corporation with no `esi_corp` row but buys on record counts as on |
 
 ### Settings
 
@@ -1078,6 +1543,7 @@ Tools blacklisted.
 | `standing_broker_faction` / `standing_broker_corp` | 0.0 — NPC broker fee |
 | `freight_in_isk_per_m3` / `freight_out_isk_per_m3` | 0.0 — flat courier rates: "Courier Highsec Market → Industry Hub" (bought materials in) and "Courier Industry Hub → High Sec Market" (finished products out); freight-in is the Jita leg since v1.10 |
 | `structure_freight_in_isk_per_m3` | 0.0 — "Courier Null Sec Market → Industry Hub": flat ISK/m³ from the structure market (C-J6) to the industry system (v1.10); on an EXISTING database seeded once as a copy of the Jita rate when the column is added, so a configured Jita rate never makes the structure look freight-free by default |
+| `freight_in_default_isk_per_m3` | 0.0 — "Default Inbound Freight" (v1.29 revision 4, user ruling 2026-09-28): flat ISK/m³ for a purchase at neither Jita 4-4 nor the structure market (venue `other`: another station or structure, a contract handed over elsewhere, no location); `Settings.freight_in_rate('other')` returns it. Blank reads 0, a negative clamps to 0, a bad number saves nothing. NOT seeded from the Jita rate on an existing database, so until it is set such purchases carry no freight (the help text says so). A save re-runs the purchase matching pass |
 | `compressed_minerals_enabled`, `compressed_moon_enabled`, `compressed_gas_enabled` | 0 each — v1.25: one toggle per raw group (minerals / moon materials / gas): buy the compressed form and reprocess when cheaper landed (the author's first-run profile turns all three on). Replaced the single `compressed_sourcing_enabled` flag the same day; the migration copies it into all three, then drops it |
 | `compressed_ore_yield` | 0.9063 — refinery yield for compressed ore and moon ore; user-asserted, pure yield (default was 0.75 until v1.25.1: the maintainer's refinery figure, user 2026-09-06) |
 | `compressed_gas_yield` | 0.95 — decompression yield for compressed gas; user-asserted, pure yield (default was 0.60 until v1.25.1) |
@@ -1156,11 +1622,14 @@ Structure bonuses are read from the structure type's own attributes via
 |---|---|
 | `index_run_id` | PK |
 | `run_number` | Sequential, UNIQUE-indexed (2026-08-20, vs the duplicate-number race) |
-| `planned_start`, `actual_start`, `planned_end` | |
+| `planned_start`, `actual_start`, `planned_end` | `planned_start` = when the plan was last computed: since v1.29 revision 6 (user ruling 2026-09-28) a re-plan in place (`engine.plan_index_run(…, replace_index_run_id=)`) moves it to the fetched_at of the ESI snapshot the plan read (`datetime('now')` when that reads later than now or the Snapshot carries none — review 2026-09-28, so a ▶ Plan from a stored snapshot never moves the cut past purchases that snapshot did not see) on every ESI update and ▶ Plan while the run is open; a new run is stamped `datetime('now')` — costing's pre-plan cut and the pages read it |
+| `opened_at` | v1.29 revision 6 (an ALTER in `_MIGRATIONS` under schema 12, no version bump): when the run was first planned — the engine INSERT writes `datetime('now')`; the replace sets `opened_at = COALESCE(opened_at, planned_start)` in the SAME UPDATE that moves `planned_start` (SQLite evaluates SET against the old row, so a legacy open run keeps its original opening) and never touches it otherwise. `buying.buying_windows` opens a run's first window (no executed run before it) at `COALESCE(opened_at, planned_start)`, so re-planning never empties the cycle's window. NULL on runs planned before the column |
 | `compressed_saving_isk` | v1.25: landed ISK the compressed sourcing pass saved vs buying the covered raws direct at plan time (NULL when it changed nothing) |
 | `hub_price_basis` / `structure_price_basis` | v1.26: the pricing bases the run was planned under (NULL on older runs: ladder) |
-| `manufacturing_slots_available`, `reaction_slots_available` | v1.27.1 (schema 11): the slot pools the run was planned and capped against — the settings' pools less the multi-cycle jobs running past the next run (`engine.snapshot_from_state`); the run page's strip denominator. NULL on older runs (the page shows the settings' pools) |
+| `manufacturing_slots_available`, `reaction_slots_available` | v1.27.1 (schema 11): the slot pools the run was planned and capped against — since v1.29 revision 6 (user ruling 2026-09-28) the settings' pools unchanged (`engine.snapshot_from_state`; rows planned before hold the settings' pools less the multi-cycle jobs then running past the next run); the run page's strip denominator. NULL on older runs (the page shows the settings' pools) |
 | `freight_in_isk_per_m3`, `structure_freight_in_isk_per_m3` | 2026-09-05 review: the plan-time freight-in rates (Jita leg, structure leg) the fill landed with — `costing.hull_cost` prices inbound freight at this vintage; NULL on pre-column runs falls back to live settings |
+| `freight_in_default_isk_per_m3` | v1.29 revision 4 (2026-09-28): the plan-time default inbound rate (venue `other`), written by `engine.plan_index_run` (0 is stored as 0.0, not NULL) and read by `costing._run_freight_rates`, `web._run_buy_rates` and the matcher's ore conversion; NULL on runs planned before the column falls back to the live setting — the same vintage rule as its two siblings |
+| `structure_market_id` | v1.29 revision 4 review (2026-09-28): the structure market (`settings.structure_market()`) the run was planned against, written by `engine.plan_index_run`; an EXECUTED run's purchases are classed hub / structure / other against it (`buying.BuyWindow.structure_market_id` → `purchase_venue`). NULL on older runs, and ignored on the open run: the live setting. The Buy and Profit tabs still NAME the structure leg by the live setting's label |
 | `status` | planned / active / complete |
 | `completed_at` | v1.5: stamped on "Mark executed" — lag costing walks completed runs only |
 | `wallet_character_isk`, `wallet_corporation_isk` | ISK snapshot at plan time (buying-power check) |
@@ -1173,10 +1642,13 @@ The core output table.
 | `index_run_item_id` | PK |
 | `index_run_id` | FK |
 | `type_id` | |
-| `on_hand_qty` | ESI assets in tracked systems |
+| `on_hand_qty` | The stock the plan netted: ESI assets in tracked systems, plus — since v1.29 revision 6 — what hangar compressed ore reprocesses into (`on_hand_from_ore_qty` is inside it) |
+| `on_hand_from_ore_qty` | v1.29 revision 6 (user ruling 2026-09-28; an ALTER in `_MIGRATIONS` under schema 12, no version bump): the part of `on_hand_qty` credited from hangar compressed ore / moon ore / gas at the asserted yields (`industry.refined_equivalents`, §7 Phase 1). 0 when nothing is credited and on compressed ore rows (they never net hangar ore); NULL on runs planned before the column, read as 0. Hangar-only stock = `on_hand_qty − on_hand_from_ore_qty` (the Buy tab's On Hand title and the Stockpile's On hand title break it out) |
 | `in_progress_qty` | Output of active jobs — counts as stock |
 | `target_stock_qty` | `cycle_need_qty × (1 + buffer)` since 2026-09-09 (the merged minimum × (1 + buffer) before), prorated by the feedback loop to the consumers holding jobs, plus the composite extra-runs adder |
-| `deficit_qty` | `max(0, target + cycle_need − on_hand − in_progress)` (`merged_min` in that term until 2026-09-09); final products: Phase 4 seeds `= target`, and the feedback loop re-sizes a dual-role final to `requested + max(0, other pipelines' allocated draw − on_hand − in_progress)` (review 2026-09-05, A1) |
+| `deficit_qty` | `max(0, target + cycle_need − on_hand − in_progress)` (`merged_min` in that term until 2026-09-09); final products (v1.29 revision 7, 2026-09-29 — `engine._final_wave`): `wave_left + max(0, component share − free_stock)` in Phase 4 and `wave_left + max(0, other pipelines' allocated draw − free_stock)` in the feedback loop, where `wave_left` = the requested wave less what was installed this cycle and `free_stock = max(0, on_hand + in_progress − wave_credit)` (§7 Phase 4). Before revision 7: Phase 4 seeded `= target` and the loop re-sized a dual-role final to `requested + max(0, draw − on_hand − in_progress)` (review 2026-09-05, A1) |
+| `installed_qty` | v1.29 revision 7 (user ruling 2026-09-29; an ALTER in `_MIGRATIONS` under schema 12, no version bump): units of this type whose jobs STARTED after the plan's cycle cut (`engine._installed_this_cycle` over `esi_snapshot.job_starts`, delivered jobs included). Written on every row, 0 when none; NULL only on rows planned before the column, read as 0. A final nets it from its wave (§7 Phase 4); on every row it also keeps the row a consumer "holding jobs" for the R7 target proration and the composite extra-runs adder; `costing.hull_cost` adds it to the executed run's hull counts. The UI shows it for finals only (Industry Jobs' `installed N/M` badge, the deficit dialog's "already installed this cycle" row) |
+| `requested_qty`, `wave_qty` | v1.29 revision 7 fix pass (2026-09-29; ALTERs under schema 12, no version bump): `requested_qty` is the pipelines' direct request (0 on non-finals); `wave_qty` is the wave `engine._final_wave` sized a final against (`engine._wave_units`: the request, or once part of it is installed the whole blueprint copies it was planned at), NULL on non-finals. The Industry Jobs badge reads `installed N/M` with M = `wave_qty` and N = `installed_qty` capped at it (8 requested on 10-run copies, one copy installed: `10/10`, not `10/8`; units installed beyond the wave are named in the title as stock), and the deficit dialog builds a final's rows from them (requested, + rest of the whole copies, − installed, + other pipelines' draw beyond free stock), naming other pipelines only when that last term is nonzero. Both NULL on rows planned before the columns: the badge falls back to `target_stock_qty` and the dialog to its target-based rows |
 | `recommended_action` | buy / build / both — `both` when jobs build part and the rest is bought (a capacity loser, or since v1.26 an item the market beats on part of its quantity) |
 | `blueprint_id`, `activity_id` | Activity selects the slot pool |
 | `time_per_run` | ME/TE/facility adjusted |
@@ -1195,7 +1667,7 @@ The core output table.
 | `buy_venue` | v1.10: `hub` / `structure` / NULL (unpriced; NULL on pre-v1.10 rows = hub); v1.25: `split` when the fill spans both markets — plan-time venue of price_snapshot |
 | `structure_units_cheaper` | v1.10, structure buys: units of the structure's sell ladder landing at or below the hub landed price; on single-quote pages (pre-v1.25 runs, the Planning tab, the Invention tab) the venue cell reads "Jita Z · C-J6 X" and Multibuy splits the same way when `recommended_buy_qty` exceeds it (v1.26.1; a *shallow* badge before) — since v1.25 the engine NULLs it on every fill-priced row |
 | `depth`, `item_class`, `merged_min_qty` | Merged chain depth (display), class, one cycle's consumption as the merged BOM rounds it (the pipeline-share attribution basis) |
-| `cycle_need_qty` | v1.27.1 (schema 10): one cycle's consumption at the jobs' own rounding (Phase 3.5) — the target and deficit basis; ≥ `merged_min_qty` within one pipeline, possibly below it where pipelines share a consumer (the pass merges before rounding); NULL on runs planned before it existed (the Chain tab then shows `merged_min_qty`) |
+| `cycle_need_qty` | v1.27.1 (schema 10): one cycle's consumption at the jobs' own rounding (Phase 3.5) — the target and deficit basis; ≥ `merged_min_qty` within one pipeline, possibly below it where pipelines share a consumer (the pass merges before rounding); NULL on runs planned before it existed (the Stockpile tab then shows `merged_min_qty`) |
 | `unit_install_fee` | v1.5: hypothetical per-unit install fee snapshotted for every buildable |
 | `savings_unpriced_inputs` | Unpriced raw leaves in the savings chain (UI badge) |
 | `unit_chain_cost` | 2026-08-23: the vertically-integrated chain cost per unit behind `build_savings_per_unit` (savings = landed buy price − this); NULL on older rows, which the run page recovers as price − savings |
@@ -1214,6 +1686,9 @@ The core output table.
 | `structure_buy_qty`, `structure_fill_price`, `structure_fill_orders` | v1.25: the structure market's share of the same buy |
 | `unfilled_qty`, `unfilled_price` | v1.25: units no stored ladder held and the last rung walked they are priced at — the *N unsourced* badge (v1.26.1 wording; *shallow* before). Since 2026-09-05 (R5) these units are UNSOURCED unless folded into `hub_buy_qty` (truncated Jita book): `hub_buy_qty + structure_buy_qty + unfilled_qty == recommended_buy_qty`, and Multibuy lists the two venue quantities only |
 | `install_runs`, `install_jobs`, `install_per_job`, `install_limited_by`, `install_priority`, `install_return` | v1.27.1 (schema 10), rows holding jobs: the runs and jobs to install now from stock on hand + in-flight output + this cycle's buys (Phase 7.6) and the runs per installed job — uniform for an intermediate (`install_per_job × install_jobs == install_runs`, the per-job count rounded up the way Phase 7 sizes it), the plan's own count for an exact-quantity ship or a saturating reaction, whose last job takes the remainder; the input that bound the figure (NULL when every planned run installs; −1 = the slot pool, `engine._LIMITED_BY_SLOTS`: the job could start but the pool has no slot for it after the Phase 6 backfill); on a pipeline final, its rank in the install order (1 = highest return on cost) and the return on cost that ranked it (`engine.final_return` on the snapshot's sell quote — `Snapshot.sell_quotes`, the run route's `ledger.final_quote` per final, so a capital hull is quoted at the structure market — against `unit_chain_cost`, which is stamped for every contender since v1.27.1 even when its own buy price is unknown; NULL = unpriced, ranked last). NULL on rows without jobs and on runs planned before the check |
+| `compressed_alloc` | v1.29 (schema 12), compressed buy rows: json `{raw_type_id: share}` — the share of THIS pick's landed cost the sourcing pass allocated to each covered raw (`per_m[m] / total_value`). Persisted as the pass used it, never normalised: the shares sum to 1.0 whenever `total_value > 0` and are all 0.0 in the degenerate case the pass allocates nothing. Keys are JSON text — decode with `int(k)` |
+| `compressed_landed_isk`, `compressed_tax_isk` | v1.29, compressed buy rows: the pick's landed cost (order ISK + freight + reprocessing tax) and the tax term of it. The tax is 0.0 (never NULL) on a compressed-gas row, which is untaxed, and stays the plan's figure when purchases re-price the ore — it is a function of the outputs, not of the ore price |
+| `direct_landed_isk` | v1.29, covered raw rows: the landed ISK of the direct remainder at plan time (`direct_cost(r, direct)`); 0.0 on a fully covered raw. Identity on a v1.29 plan: `effective_unit_cost × (recommended_buy_qty + compressed_covered_qty) == direct_landed_isk + Σ_c compressed_landed_isk_c × compressed_alloc_c[r]` — the three columns above exist so the realized re-blend is the engine's own arithmetic rather than a reconstruction of it. All four are NULL on runs planned before v1.29 (the re-blend then approximates and badges *approx.*) |
 | `install_draw_qty`, `install_short_qty` | v1.27.1, consumed rows: what every planned job of the row's consumers draws this cycle (per-job rounding, `_draw_calculator` — the same walk `_planned_consumption` sums) and the units that exceeds `on_hand + in_progress + recommended_buy_qty − unfilled_qty + compressed_covered_qty` by (0 = not short; a buy's unsourced units are not there to install with). NULL when nothing planned consumes the row |
 
 **`index_run_item_pipeline`** — attributes shared demand back to pipelines.
@@ -1223,6 +1698,82 @@ The core output table.
 | `index_run_item_id`, `pipeline_id` | Composite PK |
 | `qty_attributable` | This pipeline's share |
 | `depth` | 2026-08-20: the item's depth within THIS pipeline's own chain — the depth lag costing prices from; NULL on pre-fix rows falls back to the merged depth |
+
+**`run_purchase_refine`** (v1.29 revision 4 review, 2026-09-28, schema 12
+unshipped: plain `CREATE TABLE IF NOT EXISTS`) — an EXECUTED run's frozen
+unplanned-ore conversions, one row per refined line: (`index_run_id`,
+`esi_kind`, `esi_id`, `via_type_id`, `type_id`) → `quantity`,
+`unit_price` (landed) and the `contract_k` they were written under.
+`buying._assign` stores each executed run's conversions here (only the
+groups that changed), `buying._RunOres` reads them beside the run's via
+lines (the lines win where both exist), and every run that is not an
+executed window has its rows cleared (`store.clear_refine_freeze`), so a
+reopen re-derives; so is a group whose record left the run's window (a
+moved bound — `store.drop_refine_groups`). A group stays while its record
+is in the window, costed or not. The point is the gap the lines alone left: a pass
+that stops costing a record (Count buys off, a character removed) drops
+its lines, and the freeze used to go with them. `store.refine_freeze` /
+`save_refine_freeze` (replaces the named groups, keeps the rest);
+`store.delete_run_purchases` clears a run's rows (they reference
+`index_run`).
+
+**`run_purchase`** (v1.29, schema 12) — what was actually PAID for this
+run's inputs, one row per purchase LINE: a wallet buy is one line, a bought
+contract one line per received item record. These are not the dormant
+FIFO lots `engine.record_purchase` writes; the two vocabularies stay
+apart. Realized costing lets them override the run's price snapshot, so
+the plan's own columns are never rewritten and a run with no rows here
+costs bit-identically to before v1.29. Deleted with the run
+(`store.delete_run_purchases`, before the `index_run` row — connections
+open with `PRAGMA foreign_keys = ON`). Since revision 3 (user rulings
+2026-09-28) the lines are DERIVED from ESI, never entered on a page:
+`buying.assign_purchases` replaces a run's rows that carry an `esi_kind`
+wholesale (`store.replace_derived_purchases`, which validates every line
+before it deletes anything, stores `source` NULL and never commits — the
+whole pass over every run is one `BEGIN IMMEDIATE … COMMIT`), leaves a run
+whose lines did not change untouched (so `purchase_id`s stay stable), and
+clears every run that fell out of every buying window, so each
+`(esi_kind, esi_id, type_id)` is on at most one run. A row whose
+`esi_kind` is NULL was recorded by hand in an unshipped revision 1–2 dev
+build; the pass never touches it and costing prices it like any other.
+`store.add_purchase` / `update_purchase` / `delete_purchase` remain as the
+CRUD seam, on no UI path. The six ESI columns and their index were added
+to the unshipped schema 12 in place through `_MIGRATIONS` (ALTER ADD
+COLUMN, then `CREATE INDEX IF NOT EXISTS run_purchase_esi`), not in
+`STATE_SCHEMA`, whose `CREATE TABLE IF NOT EXISTS run_purchase` runs first
+and would meet a table without the columns; revision 2's `run_buy_choice`
+table is dropped (`DROP TABLE IF EXISTS`), because a leftover choice row
+would otherwise make `run_delete` fail under the foreign keys.
+Revision 4 (2026-09-28) adds `via_type_id` the same way (an ALTER before
+the index) and widens the venue CHECK to `other`. SQLite enforces a
+table CHECK on every INSERT, so widening only the Python validation would
+roll back every matching pass on a database already at 12; `STATE_SCHEMA`
+carries the new CHECK for fresh databases and the 11 → 12 upgrade, and
+`store._rebuild_run_purchase_for_other_venue` rebuilds an existing table
+once, after the `_MIGRATIONS` loop (skipped when the stored SQL already
+names `'other'`): one `BEGIN IMMEDIATE … COMMIT`, a `run_purchase_new`
+with every column and constraint spelled out, an explicit-column copy
+that keeps `purchase_id`, drops orphan lines (their run gone — logged;
+the foreign keys are on), drops the old table, renames the new one and recreates BOTH indexes
+after the old table is gone (an index keeps its name through a rename,
+so creating it earlier is silently skipped and the drop removes it).
+`SCHEMA_VERSION` stays 12, so no pre-upgrade backup is taken for it —
+accepted: the schema is unshipped and derived lines regenerate.
+
+| Column | Notes |
+|---|---|
+| `purchase_id` | PK |
+| `index_run_id` | FK — the run whose buying cycle the purchase's date falls in (feature 20), never a superseded plan |
+| `type_id` | Any type: a line for a type the run does not hold, or for a buildable row (`blueprint_id` set, bought or built), is stored too (over-buying is stock, R3) — the Buy tab counts it *outside the plan* and costing touches no row for it. No FK, so an SDE re-import can neither orphan nor block a row |
+| `venue` | `hub` / `structure` / `delivered` / `other` (CHECK; `store.PURCHASE_VENUES`). ~~An ESI line is `hub` or `structure` by where it was bought (`costing.sale_venue`: NPC station → hub, Upwell structure → structure, no location → hub)~~ Since revision 4 (user ruling 2026-09-28) `buying.purchase_venue`: the price region's hub station (Jita 4-4 where the region has no configured station) → `hub`, the configured structure market → `structure`, any other location or none → `other` (`store.BUY_VENUE_OTHER`), hauled at the default inbound rate. `delivered` is a purchase venue only, never a plan venue; its `unit_price` is ALREADY landed, so costing adds no freight and never resolves a freight rate or price basis for it (`Settings.freight_in_rate` / `price_basis` still hand back the HUB leg for it, so callers guard). The one ESI line that uses it is a raw refined from an unplanned ore (`via_type_id`). `other` is never a plan venue either (the plan buys only at the two markets), and never counts as Null Sec Market spend (`CostLine.structure_share`), even at another null-sec structure |
+| `source` | `sell` / `split` / `buy` (CHECK) or NULL — a hand-entry label from revisions 1–2; every ESI line stores NULL. Advisory only; costing prices the line at `unit_price` |
+| `quantity`, `unit_price` | CHECKed `> 0` and `>= 0`. The order price, except for `delivered` (landed); a contract line's is its frozen `k × p_i` |
+| `note`, `created_at` | Free text (blank normalises to NULL) and the stamp |
+| `esi_kind`, `esi_id` | v1.29 revision 3: `transaction` (`esi_id` = the wallet `transaction_id`) / `contract` (`contract_id`; two records of one type give two lines with the same id) / NULL (hand-entered). Index `run_purchase_esi (index_run_id, esi_kind, esi_id)` |
+| `contract_k` | A contract line's k, copied from `buy_contract.k`; NULL on a transaction |
+| `date` | The ESI date the window matched (`…Z`) |
+| `owner_kind`, `owner_id` | The buyer (`character` / `corporation`, CHECK) |
+| `via_type_id` | v1.29 revision 4 (2026-09-28): the unplanned compressed ore this raw line was refined from (feature 20); NULL = a direct purchase line. Validated as a whole-number type id and allowed only on venue `delivered` (`store._validate_via_type_id`); the matcher's no-change check and its executed-run freeze key on it. Dated like any other line: since v1.29 revision 6 (hangar compressed ore counts as its raws) `costing._pre_plan` is a pure date test (revision 4 had made a via line always post-plan) |
 
 **`job_link`** — RESERVED, UNIMPLEMENTED: schema only; no code reads or
 writes it. The intended plan-vs-reality reconciliation was superseded by the
@@ -1277,7 +1828,32 @@ plus `hub` (v1.9): 1 = the configured quote (hub station where the region
 has one), 0 = region-wide fallback for a raw leaf with no hub-station order;
 structure-market and adjusted rows are always 1. `index_run_item.price_region_wide`
 carries the same flag per planned item (plan-time provenance of
-`price_snapshot`).
+`price_snapshot`). Since v1.29 the sell-side refresh of a ladder type also
+stores the **hub's best buy order** as a sidecar row under source
+`buy` (`market.HUB_BUY_SOURCE`, `hub = 1`, the same `fetched_at`) —
+pulled with `order_type=all` in one paged call, the sell ladder derived
+from the sell side of the same book. It was written for revision 2's Jita
+buy and split cells; since revision 3 (2026-09-28) the Buy tab quotes
+nothing live, so the sidecar and `market.cached_hub_best_buy` have no
+reader. They are left in place (their tests pin them) until a cleanup
+removes them.
+NULL price = pulled, nobody bidding; no row = never pulled for that type. A
+hub-priced ladder type with no row at all is refetched regardless of price
+age (the rule the sell ladder already has), so the first refresh after the
+upgrade pulls every hub-priced ladder type once.
+The Max Buy Order basis writes its plan quote under the same source (only
+one basis is active at a time, so the two writers never race) and may
+stamp a v1.9 region-wide fallback `hub = 0`, which the Industry Jobs tab
+labels "region price". Because the two share a row, a
+type eligible for the v1.9 fallback whose buy row carries no price is
+refetched regardless of age under that basis: the sidecar is station
+filtered and never re-pulls region-wide, so its NULL means "no hub bid",
+not "no bid in the region", and treating it as a current plan quote left
+such a type unpriced for the cache window after a basis switch.
+The `adjusted` rows cover the plan's demand set plus, since revision 3,
+every type ever received on a bought contract (`SELECT DISTINCT type_id
+FROM buy_contract_item`, from the same CCP response), because they are the
+fallback reference price of a contract's allocation (feature 20).
 **`structure_sell_order`** (v1.10) — the structure market's SELL ladder per
 wanted type: (structure_id, type_id, price, volume_remain), ascending by
 price, replaced wholesale on every structure refresh (same authed pull as the
@@ -1298,7 +1874,21 @@ time for a fill cost. A book shorter than 300 rungs is the WHOLE book
 **`esi_snapshot`** — the persisted ESI pull that decouples planning from the
 network: fetched_at, on_hand / in_progress / active_jobs JSON, wallet ISK,
 and `job_ends` (2026-08-20: active-job end dates per activity, for
-multi-cycle slot netting). Pruned to the most recent five rows.
+multi-cycle slot netting — still stored, read by no planning step since
+v1.29 revision 6), and `job_starts` (v1.29 revision 7, 2026-09-29:
+`{product type_id: [[start_date, units], …]}` — one pair per
+manufacturing / reaction job, `start_date` ESI's `…Z` text verbatim,
+`units = runs × portion` as the in_progress credit computes it, through
+the same tracked-system filter and corp-first job_id dedup; lab jobs
+never recorded. Jobs `delivered` in the last 90 days (the job feeds ask
+for `include_completed=true`) are recorded here ONLY — never in
+in_progress, active_jobs or job_ends — so a wave that finished and was
+delivered still counts as installed; cancelled / reverted jobs record
+nothing. Engine Phase 4 reads it against the cycle cut, parsing both
+sides. NULL = a snapshot saved without it; revision 6's scalar format
+(`{type_id: latest start}`, dev databases only) reads as NULL through
+`store.latest_esi_snapshot` — either way the plan sizes the full
+wave). Pruned to the most recent five rows.
 
 ### Sales ledger (v1.27.0)
 
@@ -1316,8 +1906,9 @@ a character-feed order flagged `is_corporation`, or a transaction with
 (the documented limit: a character who changed corps inside the stored
 window credits today's corp); a contract is exact (`issuer_corporation_id`
 when `for_corporation`, else the issuing character; acceptor / assignee
-rows are dropped); corp feeds store their own corporation with the wallet
-division. The upsert rule is **corp beats character**: a row the corp feed
+rows never enter `sale_contract` — since v1.29 an accepted item exchange
+goes to `buy_contract` instead, below); corp feeds store their own
+corporation with the wallet division. The upsert rule is **corp beats character**: a row the corp feed
 sees re-owns itself (`source_feed`, owner columns, division) whatever a
 character feed stored first.
 
@@ -1368,8 +1959,13 @@ transactions the cursor `oldest_id` / `newest_id` / `backfilled`. A non-ok
 write never clobbers the cursor (`COALESCE` / `MAX`).
 
 **The transactions cursor** is ONE contiguous covered id range per owner
-and division, buys included (they are read for the cursor and never
-stored). Pass A walks the newest page downward until it meets the stored
+and division, buys included (until v1.28.1 they were read for the cursor
+and thrown away; since v1.29 they are stored in `buy_transaction`, and the
+open that creates that table resets every transactions cursor once —
+`store._rewalk_wallets_for_buys`, before `STATE_SCHEMA` runs, so a crash
+can only repeat the reset — so the next pulls re-walk the wallets and
+recover the buys already behind the cursor; the sell upserts are
+idempotent and the feeds read `partial` meanwhile). Pass A walks the newest page downward until it meets the stored
 range — uncapped once a range exists, so a burst larger than a page is
 walked to the join and `newest_id` moves only when the join happened; on a
 first pull it IS the backfill and is capped at
@@ -1381,7 +1977,11 @@ exclusive `from_id` both terminate; a boundary-only page is the end.
 
 **Pull mechanics.** Corporations first (every corp Magoo knows, so an
 outage still stamps their rows), then characters; per owner × family:
-toggle off → `off` with no call; ESI down → `skipped`; a dead refresh token
+toggle off → `off` with no call (orders follow `count_sales`; since
+v1.29 transactions and contracts are read while `count_sales` OR
+`count_buys` is on, sells and sale contracts written only under
+`count_sales`, buys and bought contracts always — `mark_skipped` follows
+the same rule); ESI down → `skipped`; a dead refresh token
 → that character's own families `error` with the re-auth message and corp
 families fall through to the next member; corporation membership unknown
 this pull (the public `/characters/{id}/` call failed) → orders and
@@ -1404,9 +2004,97 @@ wallet whose division 1 finds no role holder stamps divisions 2..7
 reconciliation (`missing_since`) runs only for an owner whose own two
 order calls answered.
 
+### Purchases from ESI (v1.29 revision 3, 2026-09-28)
+
+Buy-side history for the Buy tab (feature 20), written by the same
+`ledger.pull_sales` step as the sales tables, through the same fetches,
+owner resolution and cursor, and never mixed into them: every `sale_*`
+table and every Ledger query is byte-identical with the buy side present.
+Kept whatever `count_buys` says (read time only, §6 `pool_character`);
+nothing is ever deleted. `buying.assign_purchases` reads these tables to
+derive `run_purchase`. The pull's summary line adds "; N buys, M bought
+contracts" only when either is non-zero (`PullSummary.new_buys` /
+`bought_contracts`, appended after `skipped`).
+
+**`buy_transaction`** (`transaction_id` PK) — wallet transactions with
+`is_buy`: the same columns as `sale_transaction` (owner columns, CHECKed;
+`division`; `source_feed`; `type_id`, `quantity`, `unit_price`, `date`,
+`location_id`, `journal_ref_id`, `fetched_at`), `client_id` being the
+SELLER — a seller in `ledger.internal_ids` makes the buy an internal
+transfer, listed and never costed. Upserted with the same corp-beats-
+character re-own rule. Indexes `(date)`, `(owner, id)`.
+
+**`buy_contract`** (`contract_id` PK) — item exchanges the pool ACCEPTED
+(`type = 'item_exchange'` only — a courier our pilot hauled also names us
+as acceptor): character feed, `acceptor_id` = the character → owned by
+the character, `acceptor_id` = its corporation → by the corporation; corp
+feed, `acceptor_id` = the corporation. ESI has no acceptor-side
+`for_corporation` flag (to verify live, §11). `ledger._contract_owner`
+(the issuer side) is unchanged; `_contract_buyer` is the acceptor side.
+Columns: owner columns (the buyer), `issuer_id`, `issuer_corporation_id`,
+`for_corporation` (ESI's flag, 0/1, an ALTER since review 2026-09-28 —
+the issuer's corporation is on EVERY contract, so only a contract issued
+on a corporation's behalf may be internal by its corporation; the upsert
+overwrites it on every pull), `acceptor_id`, `type`, `status`, `price` (nullable, counts as 0),
+`reward` (the acceptor pays `price` and RECEIVES `reward`: P = price −
+reward), `title`, `date_issued` / `date_accepted` / `date_completed`,
+`start_location_id` (the venue), `via_character_id` (provenance, NULLed
+on character delete), `first_seen_at`, `last_seen_at`, the
+`items_fetched_at` / `items_status` / `items_attempts` bookkeeping of
+`sale_contract` (the settled set and backlog are read per side, one item
+budget is shared, items routed by the list the contract came from), and
+the allocation, frozen per CONTRACT, not per run: `k` (P / Σ p_i q_i;
+NULL until priced), `unpriced_items`, `priced_at` (set once every received
+item that can be priced has a reference price, then never recomputed — a
+reopen that moves the contract to another run keeps its prices; while
+such an item is unpriced it is re-derived on every pass, so a later cache
+fill fixes it; a blueprint copy never can be priced and counts as 0 for
+the freeze, review 2026-09-28), and
+`excluded` (CHECK `internal` — the issuer is ours, or the contract was
+issued for one of our corporations (`for_corporation` and
+`issuer_corporation_id` ours) /
+`swap` — an `is_included = 0` row or P ≤ 0 / `no_price` — no received
+item priced, k NULL / NULL = costed). A contract is matched to a window by
+`date_completed`, else `date_accepted`, once `finished` with its items
+read. Index `(type, status, date_completed)`.
+
+**`buy_contract_item`** (PK `(contract_id, record_id)`) — `type_id`,
+`quantity`, `raw_quantity` (−1 singleton, −2 blueprint copy: never priced,
+its adjusted price being the original's), `is_included` (1 = received,
+0 = the pool GAVE it — a swap), `is_singleton`, `unit_price` (the frozen
+`k × p_i`; 0 for an unpriced item). Index `(type_id)`.
+
 ---
 
 ## 7. Run Planning Calculation
+
+**Create or re-plan in place** (v1.29 revision 6, user ruling 2026-09-28:
+one run per buying cycle, kept live). `engine.plan_index_run(…,
+replace_index_run_id=None)` creates a run as it always has — its INSERT
+now also writes `opened_at = datetime('now')`. With
+`replace_index_run_id` (the open run, `buying.collecting_run_id`; both
+⟳ Update from ESI and ▶ Plan pass it while a run is open) it re-plans
+that run under the same `index_run_id` and `run_number`. A read-only
+check refuses before planning a run that is missing, executed or not the
+newest, and `persist=False` with a replace (ValueError). At persist
+time, inside ONE transaction: a guarded UPDATE first (`WHERE
+index_run_id = ? AND status != 'complete' AND index_run_id = (SELECT
+MAX(index_run_id) FROM index_run)` — a Mark executed or a newer run
+landing during the ~1.6 s plan is caught here; no row updated →
+rollback + ValueError) that moves `planned_start` to the snapshot's
+fetched_at (never later than `datetime('now')`; review 2026-09-28),
+sets `opened_at = COALESCE(opened_at, planned_start)` and rewrites every
+per-run column the INSERT writes (wallets, `compressed_saving_isk`, the
+three freight rates, both price bases, both slot pools,
+`structure_market_id` — one shared value set, so the two cannot drift),
+never run_number, status, actual_start, planned_end or completed_at;
+then the run's `index_run_item_pipeline`, `index_run_item` and
+`index_run_invention` rows are deleted in that FK order and the usual
+INSERTs write the new plan; one commit. `run_purchase` and
+`run_purchase_refine` rows stay. Any exception in the persist step (create
+or replace) rolls back and re-raises — `ledger._begin` does not open a
+transaction when one is already open, so the matcher that runs next would
+otherwise commit a half-deleted run.
 
 ### Phase 1 — Snapshot inputs
 
@@ -1423,12 +2111,45 @@ order calls answered.
   location is a solar system — anchored Upwell structures, sov hubs, POCOs,
   starbases) are skipped; items stored INSIDE an excluded structure still
   count.
+- **Hangar compressed ore counts as its raws** (v1.29 revision 6, user
+  ruling 2026-09-28). At the top of `plan_index_run`,
+  `engine._with_hangar_ore` credits every raw with what the snapshot's
+  compressed ore / moon ore / gas reprocesses into
+  (`industry.refined_equivalents`, pure over the injected Refdata, the
+  yields passed in): per compressed type whose source converts — its
+  kind's yield (`compressed_ore_yield` for ore and moon ore,
+  `compressed_gas_yield` for gas) is above 0 and at least one output is
+  in `config.COMPRESSED_SOURCE_GROUPS`, the same predicate as the
+  matcher's `buying._OrePass.convertible`, which is what excludes ICE
+  (its outputs are Ice Products only) — `batches = units //
+  portion_size` (a short stack credits nothing) and every output gains
+  `CompressedSource.batch_output(batches, m, yield)`, one floor per
+  material over the hangar total. The Settings compressed toggles do not
+  gate it (they pick what the plan may BUY), and no reprocessing tax
+  applies to units. The plan runs against a copy of the snapshot whose
+  `on_hand` includes the credit (the caller's is not mutated), so Phase
+  4, the alchemy pass's added raw rows, the allocation and final
+  availability, the backfill and the install check all read one stock
+  figure — the install check treats the credit as startable input,
+  true once the ore is reprocessed. The credit is persisted per row as
+  `index_run_item.on_hand_from_ore_qty` (inside `on_hand_qty`);
+  compressed ore rows net no hangar ore, so nothing counts twice. The
+  matcher keeps its own copy of the arithmetic for purchase lines (a
+  test pins the two agree; the hangar total can exceed the sum of the
+  per-record floors by under one batch per record). Known limit: an ore
+  bought earlier in the cycle that the re-plan chooses again keeps its
+  ore lines (the run chose it), and its credited raws' stock slice stays
+  at the plan's effective cost in realized costing.
 - Active industry jobs (corp AND personal) → `in_progress_qty` per item as
   `Σ(runs × portion_size)`, filtered by DELIVERY location to tracked systems
   (unresolvable locations keep the credit). **In-flight production counts as
   stock**, preventing duplicate recommendations for work already underway.
-- Capacity per pool: the user-entered slot totals, minus active jobs whose
-  end date lies beyond the next index run (multi-cycle overhang, 2026-08-20).
+- Capacity per pool: the user-entered slot totals, as they are (v1.29
+  revision 6, user ruling 2026-09-28 — `snapshot_from_state` subtracts no
+  running jobs; the 2026-08-20 multi-cycle netting and
+  `_multi_cycle_overhang` are gone). Jobs installed this cycle drop out
+  through stock, so a mid-cycle re-plan assumes every configured line
+  is free.
 - Price snapshot per configured source — since v1.10 one quote per type from
   `market.buy_quotes`: the hub cache (with its v1.9 region-wide fallback)
   against the structure market's cached sell ladder, the cheaper LANDED
@@ -1499,7 +2220,7 @@ for a sub-capital final), jobs at its window (`_job_windower`, the
 helper `_size_jobs` now shares), then `_steady_packing` — an
 exact-quantity ship as Phase 7's divmod split, a saturating reaction as
 full windows per job, everything else as uniform jobs rounded up. The
-result is `cycle_need_qty` on every item (persisted; the Chain tab's
+result is `cycle_need_qty` on every item (persisted; the Stockpile tab's
 *Cycle need* and the deficit dialog read it, falling back to
 `merged_min_qty` on older runs) and the per-consumer shares the feedback
 loop prorates by (`_steady_shares` is now this pass). Within one pipeline `cycle_need_qty ≥
@@ -1522,10 +2243,71 @@ it is a pure additional buffer the user may lower.
 target_stock_qty = cycle_need × (1 + stockpile_buffer)             [intermediates/raw]
                  = requested output qty                            [final products]
 
-deficit_qty      = target_stock_qty                                [final products, Phase 4 seed]
-                 = requested + max(0, consumers' draw − on_hand − in_progress)  [final products, feedback loop]
+deficit_qty      = wave_left + max(0, component share − free_stock)  [final products, Phase 4]
+                 = wave_left + max(0, consumers' draw − free_stock)  [final products, feedback loop]
                  = max(0, target + cycle_need − on_hand − in_progress)  [others]
+
+  wave_credit = min(wave, installed_qty)      installed_qty: units started after the cycle cut
+  wave_left   = wave − wave_credit            wave: requested (whole-copy units once part is installed)
+  free_stock  = max(0, on_hand + in_progress − wave_credit)
 ```
+
+**This cycle's installed finals (v1.29 revision 7, user ruling
+2026-09-29).** Final jobs started inside the current buying cycle are
+this cycle's wave; the plan sizes the rest (`engine._final_wave`, one
+rule for Phase 4 and the feedback loop's final branch).
+`plan_index_run(…, cycle_cut=)` takes the moment the cycle opened (web's
+`_cycle_cut`, from `buying.buying_windows`: the open run's window's
+lower bound; with no open run, the last Mark executed; with no run,
+None) and `_installed_this_cycle` sums the units of every
+`Snapshot.job_starts` pair whose start is STRICTLY after it — both sides
+parsed with `costing._when`, never compared as text (on the same day
+SQLite's `2026-09-25 10:00:00` sorts before ESI's
+`2026-09-25T09:30:00Z`); a job started in the cut's own second is the
+previous wave's, like the windows' `(lo, hi]`. No cut or no record → the
+full wave. `installed_qty` is stamped on every merged row (before
+`_apply_targets`, again before persisting) and persisted.
+- `free_stock` nets the wave's installed units out of the stock a
+  dual-role final's component share draws on — in-flight output (or,
+  delivered, the hangar) already holds them, so netting the share
+  against the raw stock would credit them twice (requested 8, another
+  pipeline drawing 4, 8 installed: the share still builds 4). A wave
+  delivered and sold since is still netted out, so the share errs toward
+  building.
+- A sub-capital final built in whole copies counts its wave in the
+  whole-copy units it was planned at once part of it is installed
+  (`_runs_for_units(requested) × portion`), and sizes the remainder in
+  exact runs (`_runs_for_units(…, whole_copies=False)`): 8 requested on
+  10-run copies is a wave of 10, and 5 installed leave 5, not 3
+  re-rounded to a fresh copy. With nothing installed the wave is the
+  request, sized as before.
+- The `_cycle_need` seed (Phase 3.5) stays the FULL wave: it is every
+  stage's target basis, the R7 proration's shares and the realized-cost
+  basis, none of which may shrink as the wave installs. And a consumer
+  counts as holding jobs this cycle for R7 when `runs_allocated > 0` OR
+  `installed_qty > 0` (feedback loop and the composite adder), so a fully
+  installed wave plans 0 runs of the final and leaves every intermediate
+  unchanged — the components built now are the next wave's stock.
+- The low-stock projection's stock term for a final is `wave_credit +
+  free_stock` (= `max(on_hand + in_progress, wave_credit)`), so a wave
+  installed, delivered and sold before the next update is not flagged.
+- Known limits (unlikely, not impossible): the cut is a PC-clock click
+  (`completed_at` / `opened_at`, SQLite `datetime('now')`), the start
+  dates CCP's server clock — finals of the executed cycle installed
+  after Mark executed, or within the clock skew of it, count as the new
+  cycle's wave, which under-plans by that many (the Industry Jobs badge
+  shows it) — and the Profit tab counts those hulls on both executed
+  runs (the old run's last plan still holds them as runs, the new run's
+  `installed_qty` holds them too); on the first cycle, finals installed
+  before the first ▶ Plan are planned again.
+- Known limit, pending the user's ruling (review 2026-09-29): the slot
+  pools stay the configured pools (ruling R2, 2026-09-28), so after the
+  installs fill every line a re-plan still lists a slot-limited final's
+  (or reaction's) rest as jobs to run now — Hulk ×8 on 6 manufacturing
+  slots, 6 installed: 2 more listed — and `costing.hull_cost`'s started
+  count (`install_runs` + `installed_qty`) counts them as started (8, not
+  6). Netting this cycle's still-running jobs out of the pool the re-plan
+  sees would fix both, but reopens R2; it is not built.
 
 (`cycle_need` — Phase 3.5, one cycle's consumption at the jobs' own
 rounding — replaced `merged_min` in every target and deficit formula on
@@ -1644,8 +2426,8 @@ MILP via `scipy.optimize.milp`:
 - **Fallback:** priced INTERMEDIATE losers are not left unfulfilled — their
   shortfall becomes `recommended_buy_qty` (lowest-margin items are the ones
   bought) — capped, since v1.26, at the units the dearer rungs hold
-  (`market_fallback_qty`); the rest is unmet ('+unmet' on the Chain tab,
-  the Plan tab's Unmet count). A final's shortfall is never bought: it
+  (`market_fallback_qty`); the rest is unmet ('+unmet' on the Stockpile tab,
+  the Industry Jobs tab's Unmet count). A final's shortfall is never bought: it
   stays a `capacity_limited` unmet build.
 
 Items with no snapshot price on record (no orders at the hub, or never
@@ -1821,18 +2603,24 @@ depth strictly — every consumer of a material sits shallower than it), so
 the loop caps at max buildable depth + 1 passes; the cap is also the guard
 for the no-fixed-point case where tiers trade the last contended slots back
 and forth forever (the final allocation stands, and its flags tell the
-truth). Finals keep their exact-requested rule, and `low_stock` /
+truth). Finals keep their wave rule (Phase 4 — since v1.29 revision 7
+the loop's final branch re-sizes to `wave_left + max(0, draw −
+free_stock)`, the same remainder Phase 4 uses, or the loop would put the
+installed wave back), and `low_stock` /
 `capacity_limited` evaluate the FINAL allocation — with the loop converged,
 a surviving flag is a genuinely uncoverable shortfall. (Until 2026-08-28
 the pass ran once on the first-order-error-dominates assumption; run 59
 showed heavy multi-tier catch-up breaking it — six processed-material
 low-stock flags, and capacity-starved buy flips sized off the stale draft
 draw.) Review 2026-09-05: a dual-role final's re-sized deficit is its
-REQUESTED quantity plus `max(0, component draw − stock)` — the component
+REQUESTED quantity plus `max(0, component draw − stock)` (revision 7: the
+wave left plus `max(0, draw − free_stock)`) — the component
 share is netted against stock, the sale share never is (the 2026-08-27
 rule, which the loop had been overriding); and an intermediate's stockpile
 target is PRORATED each pass by the share of its one-cycle steady draw
-(`_steady_shares`) that comes from consumers holding runs this cycle — a
+(`_steady_shares`) that comes from consumers holding runs this cycle
+(revision 7: runs allocated, or jobs already installed this cycle —
+`installed_qty > 0`) — a
 stage whose consumers all flipped to buy (or are over-stocked with no
 jobs) has target 0 and is neither bought nor built, no floor kept (ruling
 R7); the composite extra-runs adder applies only to composites holding
@@ -1855,7 +2643,168 @@ injected ones). It reduces covered raws' direct buys, stamps their blended
 type (`recommended_action = 'buy'`, the fill average as `price_snapshot`,
 its venue, the outputs tuple and ladder depth), and reports the landed
 saving on the run. The steady-state planner never runs it (like alchemy):
-the Slot Planner buys raws direct.
+the Slot Planner buys raws direct. Hangar compressed stock is not
+re-sourced: since v1.29 revision 6 it reaches the pass already credited
+as the raws it reprocesses into (Phase 1), so it lowers the raws'
+deficits the pass sources, and its own ore rows net no hangar ore. The
+pass's cost model is unchanged — it prices only ore the plan BUYS.
+
+Since v1.29 the pass also persists the arithmetic it did, so realized
+costing can re-do it against real prices instead of reconstructing it: per
+chosen ore its landed cost, the reprocessing-tax term of that cost and the
+allocation shares it gave each covered raw (`compressed_alloc`,
+`compressed_landed_isk`, `compressed_tax_isk`), and per covered raw the
+landed ISK of the direct remainder (`direct_landed_isk`). §6 states the
+identity those four satisfy.
+
+**Realized costing takes the purchase lines over the snapshot (v1.29).**
+`costing.hull_cost` walks the lagged runs and loads each through
+`_run_snapshot`, which — given the refdata and that run's persisted freight
+rates — lets the run's `run_purchase` lines (derived from ESI since
+revision 3, feature 20) win over its `price_snapshot`. A direct buy blends
+its lines with the unbought remainder (`blend_purchases`): the result is a
+raw unit cost plus every venue share, hub, structure and (since revision 4) other hauling at the
+run's own rates and the delivered share hauling nothing. A
+compressed-covered raw is re-blended instead, from the realized landed cost
+of the ores covering it at the shares the pass recorded, the tax term left
+at the plan's. Runs planned before v1.29 carry neither shares nor landed
+totals, so those are approximated and the line is badged *approx.* What the
+approximation cannot touch: an ore nobody bought contributes exactly its
+plan cost, and neither does the part of a bought row's cost nobody moved —
+a pre-v1.29 row prices its direct remainder from its OWN plan side (never
+by backing it out of the persisted identity, which buried the ore's
+unknowable refining tax in the one term a raw purchase replaces, so buying
+a covered raw at the plan's own fill silently moved it by the tax) and
+carries whatever the identity cannot explain through as a residual. What IS
+approximate is the SPLIT of a purchase's delta between the raws an ore
+covers, which is what the badge means; and under the displacement rule the TOTAL across those
+raws is not conserved at all, deliberately — see the ruling below. With
+`ref` absent, or with no purchase lines on the run, `_run_snapshot` returns
+the rows it returned before v1.29 by an early return — that, not
+arithmetic, is what guarantees a run with no purchases costs bit-identically
+(reconstructing the plan's own split from `hub_buy_qty` /
+`structure_buy_qty` would understate an unsourced row, whose
+`price_snapshot` averages in the unfilled units at the marginal price while
+the per-venue quantities exclude them). One line anywhere on the run arms
+the pass for every row; a row with no lines, and a covered raw whose
+cluster nothing moved, keep their exact plan floats.
+
+**A fourth venue and a third freight leg (revision 4, user ruling
+2026-09-28).** A line bought elsewhere (venue `other`, feature 20) is its
+own bucket in `blend_purchases` (keyword `other_rate`; `PurchaseBlend`
+gains `other_fraction` / `other_fill_price`, and its `venue` may read
+`other`) and in `bought_cell` (`other_qty`; hub + structure + delivered +
+other = `post_plan_qty`). It hauls at `index_run.freight_in_default_isk_per_m3`
+(`_run_freight_rates` key `other`, the live setting on older runs) —
+in `_purchase_math`'s `venue_rate` too, so a PLAN-CHOSEN ore bought
+elsewhere and a pre-plan stock fill land at the default rate. A
+purchase-priced `CostLine` states its `other_fraction` explicitly (0.0
+when nothing was bought elsewhere; None on a plan-priced line), and
+`_freight_in_lines` adds a third leg, **"Inbound freight (other
+locations)"** (`costing.OTHER_FREIGHT_LINE_NAME`), not emitted while the
+rate or the volume is 0. With nothing bought elsewhere every added term is
+exactly 0, so a run with no such line costs bit-identically.
+**Raws refined from an unplanned ore** reach costing as ordinary
+`delivered` lines (landed, no freight), so the blend, the displacement
+order and the stock slice take them unchanged. Since v1.29 revision 6
+there is no exception: `costing._pre_plan` (shared by `bought_cell` and
+`_prefill_split`) is a pure date test — a line is pre-plan when its date
+parses and falls at or before the cut — because hangar compressed ore
+is stock at its yields (Phase 1), so an ore bought before the plan WAS
+netted. Revision 4 had made a `via_type_id` line post-plan whatever its
+date, when the plan still ignored hangar compressed stock.
+
+**The purchase basis is what the cycle consumes (revision 3, user ruling
+2026-09-28).** Purchases belong to a buying cycle, not to the plan's buy
+list, so a row's blend is sized to `costing.purchase_basis(row) =
+max(cycle_need_qty or merged_min_qty, recommended_buy_qty +
+compressed_covered_qty)` (NULLs read as 0; `_run_snapshot` reads both need
+columns tolerantly): `min(bought, basis)` units at the lines' pro-rata
+average across lines and venues (not FIFO), the rest of the basis — the
+stock the cycle draws besides what the plan bought — at `price_snapshot`
+with the plan's own venue split. Units bought beyond the basis are stock
+for the next plan (R3) and cost this run nothing. Since revision 6 (R1:
+the open run is re-planned after every ESI pull) `recommended_buy_qty` is
+what is STILL to buy and drops to 0 once the purchases land, so the
+second term only holds until the next re-plan (and on an executed or
+legacy run); after an update has re-planned, the basis is the
+consumption alone and the purchase margin's units read as next cycle's
+stock (review 2026-09-28). Revision 2's skip of a
+row the plan does not buy (`recommended_buy_qty <= 0`) is gone — a
+re-planned run can carry lines on a row it no longer buys, and those units
+are consumed and priced like any other; only an empty basis (nothing
+consumed, nothing bought) keeps its plan price. A compressed ore has no
+pipeline attribution (`merged_min_qty` 0), so its basis is its own buy and
+its lines reach a hull only through the re-blend. On rows that carry no
+need column the basis is revision 2's direct + covered exactly. **Known
+limit, documented not fixed:** a purchase of an item the plan BUILDS is
+recorded and repriced, but `hull_cost`'s install branch wins, so realized
+costing still expands the build and the purchase moves no hull; an
+alchemy-route row and a buildable partly or wholly flipped to buy (costed
+as BUILT — `blueprint_id` is set whatever the build-vs-buy verdict) are
+the same shape.
+
+**Buying a compressed-covered raw direct displaces the ore (2026-09-24,
+revision 3 order 2026-09-28).** A covered raw's row is its whole demand,
+so its lines can be for more units than the plan buys direct, and the
+extra units mean "I bought these myself instead of reprocessing them". So,
+per raw r: `f_r = clamp((bought_r − direct_r) / covered_r, 0, 1)` — bought
+units displace the DIRECT remainder first, then the covered ones. Each
+ore's share for r is scaled by `(1 − f_r)` and then **re-normalised over
+the raws that stayed on its route**, back to the total the shares carried
+before: the ore is still bought whole, so its cost falls on whoever is
+left. Only when every covered raw of an ore reaches `f = 1` does the ore
+contribute nothing to anybody — a ruling about the buy list (nobody
+reprocesses it any more), not an arithmetic identity, and it is why ISK is
+deliberately NOT conserved across an ore's raws: a sibling raw leaving the
+route makes the raws that stayed dearer. r's realized landed cost over its
+demand is then the direct part (its lines' landed average over
+`min(bought, direct)` units plus the unbought direct remainder at the
+plan's price, the over-buy pro-rata cap included — this blend stays sized
+to the DIRECT buy) + the spill part (`f_r × covered_r` at those same
+lines' landed price) + Σ over its ores of `share' × the ore's realized
+landed cost` + the residual carry-through, which is what keeps a pre-v1.29
+row moving by exactly what the purchase changed instead of snapping to a
+reconstruction. Since revision 3 a covered raw may also carry a **stock
+slice** — `basis − direct − covered`, units the cycle consumes from stock —
+priced at the plan's `effective_unit_cost` (LANDED: `hull_cost` adds no
+freight to an effective line, so `price_snapshot` there would drop the
+slice's freight) and displaced LAST: only units bought beyond the whole
+demand reach it, at the lines' landed average, capped at the basis.
+**Pre-plan lines fill the slice first (review 2026-09-28).** A buying
+window can open before its run was planned — the newest plan's opens at
+the last execution (or its `opened_at`), and since v1.29 revision 6 every
+re-plan in place moves `planned_start` to the fetched_at of the snapshot
+it read — the ESI update that re-planned it, or the stored snapshot a
+▶ Plan read — so after an update nearly every line of the cycle is
+pre-plan — and the plan buys raws just in time, net of on-hand stock, so
+units bought then sit inside the slice. Lines dated at or before the
+run's `planned_start` (compared parsed, like the windows) therefore fill
+the slice first, oldest first and capped at `stock_qty`, at their own
+landed price, and never count toward `f_r`; only the rest (lines after
+the plan, a pre-plan surplus past the slice, a hand-entered line with no
+date) follow direct → covered → stock. Without it a raw whose pre-plan
+units reached `f = 1` left an ore the plan still bought whole, the ore
+re-normalised onto its sibling raws, and the slice still charged its own
+share at `effective_unit_cost`: the ore counted twice (8,400 ISK of cost
+for 6,400 spent in the review's two-raw case). `CoveredRawCost.prefilled_qty`
+reports those units (they are in `stock_displaced_qty` too).
+Guards: when no raw of an ore has `f > 0` the persisted shares are used
+verbatim with no division at all (so float sums an ulp short of 1.0, and
+the degenerate pick whose shares are all 0.0, are never rescaled), and
+`compressed_covered_qty` of 0 means `f = 0`. With nothing bought, `f = 0`
+everywhere and an untouched raw's realized figure IS its plan figure — the
+same float, not a reconstruction of it.
+`costing.covered_raw_costs(rows, purchases, ref, rates, settings, planned_start)` exports
+this as `{type_id: CoveredRawCost}` — plan and realized landed over the
+demand, the displaced fraction, the stock slice (`basis`, `stock_qty`,
+`stock_displaced_qty`, plan and realized slice ISK), whether anything
+feeding the row moved, and `unit_cost` = realized total / basis. It takes
+the whole run, not one row: the re-normalisation needs every raw an ore
+covers. The Buy tab does NOT read it: its Purchased / Ladder / Δ cells are
+per-unit figures of the lines themselves (`costing.bought_cell`,
+`ladder_landed_unit`; feature 20), which is why its Δ is not the Profit
+tab's change.
 
 ### Phase 7.6 — Install check (v1.27.1, 2026-09-09)
 
@@ -1935,7 +2884,7 @@ input that stops the next run — the one most over — or the one that
 froze the fraction / forced the trim; NULL when every planned run
 installs) land on each consumer. The run page's job tables, section
 stats and slot stats show THESE as the jobs to run (`web._jobs_to_run`);
-the plan's figures stay in the tooltips and on the Chain tab. The pool
+the plan's figures stay in the tooltips and on the Stockpile tab. The pool
 is a hard limit on what can START whatever the plan lists (v1.27.1):
 Phase 6's backfill hands the slots of unstartable jobs to others, and a
 job can become startable after the allocation (a loser's fallback buy
@@ -1946,12 +2895,18 @@ time, the item's last (shortest) job first — and stamps
 `install_limited_by = −1` (`_LIMITED_BY_SLOTS`, "the slot pool — no
 free slot this cycle"); such a row's badge reads `no slot`, its
 tooltips name the pool, and the short-on-stock panel does not list it
-as held back by an input. The pool the run was planned against — the
-settings' pools less multi-cycle overhang (`snapshot_from_state`) — is
-persisted on the run (`manufacturing_slots_available`,
+as held back by an input. The pool the run was planned against — since
+v1.29 revision 6 (user ruling 2026-09-28) always the settings' pools, no
+running jobs subtracted (`snapshot_from_state`; the multi-cycle overhang
+until then) — is persisted on the run (`manufacturing_slots_available`,
 `reaction_slots_available`, schema 11) and is the strip's denominator;
 a run planned before it was recorded shows the settings' figure (review
-2026-09-10). Advisory:
+2026-09-10). Jobs already installed this cycle drop out through stock
+(in-progress output), so after part of the cycle is installed a re-plan
+still offers every configured line: "jobs to run now" assumes all lines
+free — intended, and the Industry Jobs caption says so. Hangar compressed
+ore credited in Phase 1 is available here too (startable once
+reprocessed). Advisory:
 nothing decided in Phases 4–7.5 changes — the sizing, the slots and the
 buys stand, and the raw buys still cover the full planned jobs (the
 surplus nets off next cycle). Runs on the
@@ -2035,18 +2990,19 @@ learns the outcome by polling `/sso/status`.
 | `esi-industry.read_character_jobs.v1` | Personal jobs → in-progress stock + slot occupancy |
 | `esi-assets.read_corporation_assets.v1` | Corp assets → stock on hand (the only stock source) |
 | `esi-industry.read_corporation_jobs.v1` | Corp jobs → in-progress stock + slot occupancy |
-| `esi-wallet.read_character_wallet.v1` | Character ISK (buying-power check) |
-| `esi-wallet.read_corporation_wallets.v1` | Corp ISK (buying-power check) |
+| `esi-wallet.read_character_wallet.v1` | Character ISK (buying-power check); v1.27.0 Ledger wallet transactions; v1.29 Buy tab: the character's wallet BUY transactions |
+| `esi-wallet.read_corporation_wallets.v1` | Corp ISK (buying-power check); v1.27.0 Ledger wallet transactions; v1.29 Buy tab: the corporation's wallet BUY transactions |
 | `esi-universe.read_structures.v1` | Structure → solar-system resolution |
 | `esi-markets.structure_markets.v1` | v1.6 capital sell quotes from the structure market |
 | `esi-markets.read_character_orders.v1` | v1.27.0 Ledger: the character's own sell orders (open + 90-day history) |
 | `esi-markets.read_corporation_orders.v1` | v1.27.0 Ledger: corporation sell orders (Accountant or Trader) |
-| `esi-contracts.read_character_contracts.v1` | v1.27.0 Ledger: contracts the character issued, with items |
-| `esi-contracts.read_corporation_contracts.v1` | v1.27.0 Ledger: contracts issued for the corporation, with items (no role documented — verify) |
+| `esi-contracts.read_character_contracts.v1` | v1.27.0 Ledger: contracts the character issued, with items; v1.29 Buy tab: item exchanges the character (or its corporation on its behalf) ACCEPTED, with items — the same listing |
+| `esi-contracts.read_corporation_contracts.v1` | v1.27.0 Ledger: contracts issued for the corporation, with items (no role documented — verify); v1.29 Buy tab: item exchanges the corporation accepted |
 
 The two wallet scopes also cover the Ledger's wallet transactions
 (character; corporation per division with Accountant or Junior
-Accountant). The four v1.27.0 scopes must be enabled on the app
+Accountant), and since v1.29 the Buy tab's wallet buys from the same
+pages — the buy side needs no scope of its own (feature 20). The four v1.27.0 scopes must be enabled on the app
 registration at developers.eveonline.com BEFORE any character re-logs —
 SSO answers `invalid_scope` otherwise — and every existing token needs
 that re-login: `_store_tokens` records the JWT's `scp` claim on every
@@ -2084,7 +3040,7 @@ confirmed open item (2026-08-20).
 | Multi-stage BOM expansion | Done — **reproduces prior anchor exactly: Hulk → 78 items, depth 5** |
 | Own schema (`store.py`) | Done — full state schema, seeded defaults |
 | Engine Phases 2–8 | Done — planning + MILP allocation; the Phase-8 FIFO lot primitives are DORMANT (dead code kept for a future receipts model — nothing in the app writes them, tests only); Phase 1 snapshot arrives via `Snapshot` from esi/market |
-| ESI integration | **Done — live end-to-end incl. corporation data** (SSO login; corp assets→systems for stock — corp-scope since 2026-08-20; char + corp industry jobs deduped with delivery-location filtering; user-entered slot pools net of multi-cycle jobs; char + corp wallets). Live test: 1,020 types on hand, 129 products in progress, 11.06B corp ISK. Full snapshot ~80s (corp asset pagination dominates) |
+| ESI integration | **Done — live end-to-end incl. corporation data** (SSO login; corp assets→systems for stock — corp-scope since 2026-08-20; char + corp industry jobs deduped with delivery-location filtering; user-entered slot pools (used as entered since v1.29 revision 6 — running jobs are not subtracted; job end dates are still stored); char + corp wallets). Live test: 1,020 types on hand, 129 products in progress, 11.06B corp ISK. Full snapshot ~80s (corp asset pagination dominates) |
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
@@ -3658,7 +4614,7 @@ user's Windows machine against the live database.
 | Facility math depth | Structure bonuses from data; rig tier asserted per class | Rig-applicability filtering not needed at planning time |
 | Ship batching | ~~Multiples of 8 (configurable), capacity wins; **runs-per-BPC, when set, replaces the multiple**~~ 2026-09-05: the global multiple is REMOVED (schema 6 drops `settings.ship_batch_multiple`) — runs-per-BPC is the only batch unit; a sub-capital ship with none set builds its exact quantity | Revised 2026-08-15; removed 2026-09-05: every invention pipeline materialises runs-per-BPC and overrode the multiple, and a BPO-built hull has no copy to fill — the setting only ever misled |
 | Capital vs. non-capital | **Reinstated 2026-08-15**: capitals (incl. supers/titans), Freighters (513), Jump Freighters (902) build in exact quantities — no batch rounding (`EXACT_QTY_SHIP_GROUPS`) | User builds capitals in exact counts |
-| Dual-role finals vs. stock (ruled 2026-08-27) | A final consumed as another pipeline's intermediate nets that component share against on-hand/in-flight stock; the requested share keeps the exact ignore-stock rule. Steady-state drafts seed finals at ZERO stock so the netting stays a no-op there (v1.17) | 20 Covetors on hand shouldn't trigger 13 fresh builds when only 5 are for sale; the exact-requested rule exists for the sale share, not the component share |
+| Dual-role finals vs. stock (ruled 2026-08-27) | A final consumed as another pipeline's intermediate nets that component share against on-hand/in-flight stock; the requested share keeps the exact ignore-stock rule. Steady-state drafts seed finals at ZERO stock so the netting stays a no-op there (v1.17). **Amended 2026-09-29 (v1.29 revision 7):** the share nets against `free_stock` — on hand + in progress less this cycle's installed wave credit — and the requested share is the wave left after this cycle's installs | 20 Covetors on hand shouldn't trigger 13 fresh builds when only 5 are for sale; the exact-requested rule exists for the sale share, not the component share |
 | Profit card cycle basis (ruled 2026-08-27) | Requested scale (Units = configured qty); the Slot Planner keeps the v1.13 built scale | "Units" answers what was configured, the materials bill answers what the line consumes — the two views deliberately differ, documented at the `hulls_per_cycle` site |
 | Runs per BPC | Per-pipeline input (paste column 3) | Caps runs/job (drives parallel-slot math) and is the batch rounding unit |
 | Raw input purchasing | Just-in-time: allocated-job consumption × (1 + margin), net of stock (2026-08-16) | User buys per cycle for the jobs actually planned; no raw stockpile targets |
@@ -3687,7 +4643,7 @@ user's Windows machine against the live database.
 | Price snapshot venue (2026-08-20) | Jita 4-4 station only (location 60003760), not region-wide min sell — the HUB leg; the structure leg (v1.10) ~~deliberately takes its best order plus a depth flag, see "Structure depth rule (2026-08-22)"~~ walks its sell ladder with Jita's since v1.25 (see "Split buys across venues (2026-09-05)") | A 1-unit scam/stale order in a backwater Forge station must not set cost basis or MILP savings |
 | Stock scope (2026-08-20) | on_hand counts **corporation assets only** (tracked systems); personal hangars excluded. Amended 2026-08-25: both ends became toggles on the ESI tab — per-character `count_assets` opts personal hangars IN (default off), per-corp `esi_corp.count_assets` / `count_wallet` / `count_jobs` opt a corp's hangars / ISK / jobs OUT (defaults on; off skips that pull) | Corp hangars are the production stock; personal assets (parked ships, fittings, cargo) are noise — but the user wants the exception to be theirs to make |
 | In-progress scope (2026-08-20) | Corp AND personal jobs still credit in-progress output | Personal job output is delivered into corp hangars |
-| Multi-cycle slot netting (2026-08-20) | Active jobs whose end date lies beyond the next index run are netted from the slot pool; single-cycle jobs stay un-netted per v1.1. Amended 2026-08-25: the corp feed runs first and claims corp jobs — they count toward slots under the corp's `count_jobs` toggle; `include_job_slots` gates only the character's remaining personal jobs | The v1.1 "pools as entered" premise assumes all jobs deliver before planning; multi-cycle capital jobs violate it. Corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs |
+| Multi-cycle slot netting (2026-08-20) | Active jobs whose end date lies beyond the next index run are netted from the slot pool; single-cycle jobs stay un-netted per v1.1. Amended 2026-08-25: the corp feed runs first and claims corp jobs — they count toward slots under the corp's `count_jobs` toggle; `include_job_slots` gates only the character's remaining personal jobs **Superseded 2026-09-28 (v1.29 revision 6, user ruling):** planning never subtracts running jobs — see "Slot pools are always the configured pools"; `include_job_slots` now gates only the active-job count | The v1.1 "pools as entered" premise assumes all jobs deliver before planning; multi-cycle capital jobs violate it. Corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs |
 | Finals never overbuild (2026-08-20) | Uniform round-up is skipped for pipeline finals incl. EXACT_QTY groups — the last job runs short | Finals ignore stock, so overbuild never nets off; also keeps batch/BPC-rounded totals exact (batch multiple is a hard contract) |
 | ~~Component run caps (2026-08-20)~~ | ~~maxProductionLimit caps manufacturing runs/job~~ Superseded 2026-08-21: maxProductionLimit is the max licensed runs per blueprint COPY and does not cap manufacturing | In-client verification showed the game accepts far more runs |
 | Per-job run ceiling (2026-08-21) | ONE rule for manufacturing AND reactions: runs keep being added while the job's total **modified** time is under 30 days, so the last run may overhang — `ceil(30d / time_per_run)`; a single run over 30 days installs as 1 run. ~~Reaction formulas' maxProductionLimit kept as an extra ceiling where lower (unverified)~~ removed 2026-09-05 (ruling R2: client-verified, the client accepts more runs than the formula's maxProductionLimit). The earlier verified reaction caps (544, alchemy 272) were this same rule at the user's Tatara (543 runs = 29d 23:21:59, the 544th allowed) | User-verified in client 2026-08-21; supersedes the flat-544/base-time-scaled reaction machinery and the (misread) maxProductionLimit manufacturing cap |
@@ -3708,7 +4664,7 @@ user's Windows machine against the live database.
 | Thukker rigs (2026-08-21) | Fourth rig tier `thukker`, offered only on the component classes; ME magnitude splits by product group (−3.7% capital groups 873/913, −2.0% plain components) on the Thukker bands 0.1/1.9/0.1 | Lowsec capital-component specialist rigs; product group threads through build_multiplier so one class row prices both legs correctly |
 | Build savings model (2026-08-21) | Vertically-integrated chain cost: each stage = install fee + inputs at min(market + inbound freight, own chain cost), raw leaves at market (unpriced ones cost 0 and are counted for a UI badge), finals add BPC amortization; savings stays GROSS of sell fees for the MILP; the finals badge shows net proceeds − chain cost; alchemy comparison stays single-stage. **2026-08-23:** the buy side of the savings figure is the item's LANDED price (raw + its venue's courier rate × m³), matching how its inputs were already landed; `unit_chain_cost` is persisted | The old single-stage figure priced the whole chain below at market and read negative while the Profit page showed real profit (run 41 told the user to buy 19 of 26 finals) |
 | Finals never market-bought (2026-08-21) | Pipeline finals are exempt from the negative-savings buy rule; their negative margin surfaces as a badge, not a buy order | Finals are built to SELL — "buy your own product" is never actionable advice |
-| Consumption feedback pass (2026-08-21) | After the draft allocation, supplier deficits are re-sized against the draft's ACTUAL planned draw (catch-up consumers, saturating-reaction overshoot, per-job rounding) and Phases 5–7 re-run once; low_stock evaluates the final allocation. **2026-08-28:** iterated to convergence — the correct-and-re-run cycle repeats until deficits stop moving, capped at max buildable depth + 1 passes (a correction propagates one strictly-layered BOM tier per pass; the cap also guards the no-fixed-point case under slot contention, where the final allocation stands and its flags tell the truth) | Phase 4's steady-state merged_min underestimated real draw, leaving truthful-but-unactioned low-stock flags; one pass captured the first-order gap, but run 59's heavy multi-tier catch-up left six deep-chain low-stock flags and stale-draw buy flips the loop now closes — finals keep the exact-requested rule, steady state still converges after one correction |
+| Consumption feedback pass (2026-08-21) | After the draft allocation, supplier deficits are re-sized against the draft's ACTUAL planned draw (catch-up consumers, saturating-reaction overshoot, per-job rounding) and Phases 5–7 re-run once; low_stock evaluates the final allocation. **2026-08-28:** iterated to convergence — the correct-and-re-run cycle repeats until deficits stop moving, capped at max buildable depth + 1 passes (a correction propagates one strictly-layered BOM tier per pass; the cap also guards the no-fixed-point case under slot contention, where the final allocation stands and its flags tell the truth). **Amended 2026-09-29 (v1.29 revision 7):** the finals' branch re-sizes to Phase 4's remainder (`wave_left + max(0, draw − free_stock)`), and the R7 proration counts a consumer with jobs installed this cycle as holding jobs | Phase 4's steady-state merged_min underestimated real draw, leaving truthful-but-unactioned low-stock flags; one pass captured the first-order gap, but run 59's heavy multi-tier catch-up left six deep-chain low-stock flags and stale-draw buy flips the loop now closes — finals keep the exact-requested rule, steady state still converges after one correction |
 | Finals never buy (2026-08-21) | Pipeline finals pre-allocate slots ahead of the MILP and are exempt from the Phase-7 buy flip; a starved final stays a flagged unmet build | Buying your own product is never actionable advice — completes the run-41 finals exemption under contention |
 | Structures item class (2026-08-22) | One class `structures` = categories 65 + 66 + group 536 — the Upwell/Standup/component subset of CCP rig filter 12; the filter's other members (Starbase 23, Infrastructure Upgrades 39, Sovereignty Structures 40, Fuel Blocks 1136, Skyhooks 4736) stay `other`; Thukker tier allowed (standard leg) | The Structure ME/TE rig family bonuses all three sets identically; a single row lets the user assert that facility separately from Everything Else |
 | Structure pricing (2026-08-22) | Sub-capital sell model (hub quote, standings fees, ISK/m³ freight-out on packaged volume); Keepstar, Palatine Keepstar and Sotiyo (800,000 m³) are freight-out exempt; no structure-market routing | The user chose the subcap model; per-m³ hauling of an XL hull is not a real cost, everything smaller is comparable to hulls already accepted |
@@ -3752,7 +4708,7 @@ user's Windows machine against the live database.
 | Compressed sourcing (v1.25, 2026-09-05) | Raw minerals / moon materials / gas may be bought as compressed ore / moon ore / gas and reprocessed: one LP over every candidate's ladder rungs (landed) plus a direct-buy variable per raw; whole reprocessing batches; strictly cheaper or the raw stays; two user-asserted PURE yields (ore/moon ore, gas) and an explicit reprocessing tax on output value (same day: first folded into the yields like alchemy's, then made its own figure at the user's request); one Settings toggle | User request. Compressed goods are often cheaper per output unit and haul at 1/100 the volume; a per-line "is compressed cheaper" check would misrank ores that yield several materials, so one LP spans the three groups |
 | Compressed depth = fill cost (2026-09-05) | ~~The Jita sell LADDER is persisted for compressed candidates (`hub_sell_order`) and each candidate is costed by filling the quantity it would take — the one exception to the 2026-08-22 "best price + flag, never a fill price" rule, scoped to compressed types; every direct buy keeps the single best-price quote~~ same day, later: fill pricing extended to EVERY buy (see below); the Jita ladder is now stored for every input | Compressed books are thin: a 1-unit cheap order must not win the whole demand. The exception is bounded (candidates only) so the buy list's meaning is unchanged everywhere else |
 | Compressed surplus uncounted (2026-09-05) | Outputs beyond the cycle's demand are leftover stock and worth nothing in the decision (only demanded raws have LP rows) | Crediting surplus at market value invites buy-ore-to-sell-minerals loops and recommends ore for minerals nobody needs |
-| Compressed hangar stock ignored (2026-09-05) | Compressed ore / gas already in tracked hangars credits nothing; only purchases are planned from compressed | The user reprocesses hangar ore on their own schedule; a credit would assume it |
+| Compressed hangar stock ignored (2026-09-05) | Compressed ore / gas already in tracked hangars credits nothing; only purchases are planned from compressed | The user reprocesses hangar ore on their own schedule; a credit would assume it. **Superseded 2026-09-28 (v1.29 revision 6, user ruling R3):** hangar compressed ore / moon ore / gas counts as the raws it reprocesses into — see "Hangar compressed ore counts as the raws it reprocesses into" |
 | One venue per compressed row (2026-09-05) | The LP sees both venues' rungs; a chosen type is assigned the venue holding the larger share and re-filled there. **2026-09-07 (v1.26.1):** the assignment is a PIN (that venue, capped at what it fills at the wanted quantity — a min-volume order can make a deeper book unfillable) and the LP re-solves over the pinned rungs, up to max(`config.COMPRESSED_LP_PASSES`, candidates + 1) passes, so another candidate or the direct raw covers what the pin gave up | One `buy_venue`, one Multibuy block per market — the "no order splitting" spirit at row level; the re-solve keeps the shortfall from falling silently to the direct raw (user: "does the engine look for an alternative source?" — it did not) |
 | Compressed pass once, after convergence; Planning tab excluded (2026-09-05) | `_sourcing_pass` (née `_compressed_pass`) runs after the feedback loop and before the invention vintage; `plan_steady_state` passes `compressed=False` | Raw sizing never feeds job sizing; the Slot Planner's live views are single-quote and must reconcile with the Profit view's what-if, which has no depth model |
 | Compressed candidates imported, not ruled (2026-09-05) | `compressibleTypes` -> `ref_compressible`; `portionSize` -> `ref_type.portion_size`; candidates = targets joined to fixed reprocess outputs of the two kinds. Inert (empty) on a pre-v1.25 database | Data-derived like alchemy routes; a group/name rule would guess portion sizes and mis-catch legacy and weapon types named "Compressed ..." |
@@ -3762,7 +4718,7 @@ user's Windows machine against the live database.
 | SDE zip cache retention (2026-09-05) | After a successful import the cache keeps the current build's archive plus one previous; older archives are deleted | Every other accumulating store is pruned; ~99 MB per build was kept forever |
 | Fill pricing for every buy (2026-09-05) | Every bought input walks its Jita and structure sell ladders (merged, cheapest landed first); `price_snapshot` = the blended raw fill average; Jita's 300 cheapest orders are stored for every priced input on each refresh | User request after seeing 5.1B Tritanium "available" at C-J6's single best order with no freight — a fiction that also tilted the compressed comparison |
 | Split buys across venues (2026-09-05) | A buy may split across Jita and C-J6 by venue quantity on one row (`buy_venue = split`); Multibuy lists each market's share; realized freight splits by the hub fraction | The 2026-08-22 "no order splitting" rule is withdrawn at the user's request: a shallow C-J6 ladder should call for the rest in Jita, not a flag |
-| Remainder at marginal, ~~listed under Jita~~ unsourced (2026-09-05; ruling R5 the same day) | Units beyond every stored ladder cost the last rung walked and stay in the row's quantity. ~~They ride the Jita quantity (the structure's only when the item has no Jita ladder)~~ They ride the Jita quantity ONLY when Jita's stored ladder is TRUNCATED (exactly `HUB_LADDER_MAX_RUNGS` rungs, so the real book continues); a remainder beyond an EXHAUSTED book (shorter than the cap, or no Jita ladder at all) is UNSOURCED — attributed to no venue, listed in no Multibuy block; the *N unsourced* badge names the count and says so (v1.26.1 wording; *shallow* before). Landed cost of the remainder: marginal price + the hub freight rate when the item has a hub ladder, else the structure rate | Conservative — never invents a price cheaper than the book showed, and never tells the user to buy in Jita what Jita's whole stored book could not supply |
+| Remainder at marginal, ~~listed under Jita~~ unsourced (2026-09-05; ruling R5 the same day) | Units beyond every stored ladder cost the last rung walked and stay in the row's quantity. ~~They ride the Jita quantity (the structure's only when the item has no Jita ladder)~~ They ride the Jita quantity ONLY when Jita's stored ladder is TRUNCATED (exactly `HUB_LADDER_MAX_RUNGS` rungs, so the real book continues); a remainder beyond an EXHAUSTED book (shorter than the cap, or no Jita ladder at all) is UNSOURCED — attributed to no venue, listed in no Multibuy block (since v1.29 revision 8, 2026-09-29: in neither Multibuy All block — a group's own list carries them as part of Remaining); the *N unsourced* badge names the count and says so (v1.26.1 wording; *shallow* before). Landed cost of the remainder: marginal price + the hub freight rate when the item has a hub ladder, else the structure rate | Conservative — never invents a price cheaper than the book showed, and never tells the user to buy in Jita what Jita's whole stored book could not supply |
 | **Review fixes (2026-09-05)** | | |
 | Reaction run ceiling (R2) | A reaction formula's `maxProductionLimit` is NOT a run cap; the 30-day modified-time rule is the only reaction ceiling | Client-verified: it accepts more runs than the formula's figure — the clamp was under-sizing bulk reactions |
 | Per-batch reprocessing floor (R3) | ~~`batch_output = n × floor(base × yield)`~~ 2026-09-06: reversed — `floor(n × base × yield)`, the floor once over the job, as the client computes it | ~~Conservative; the whole-quantity floor credited up to n − 1 phantom units per output~~ The per-batch floor valued every compressed gas (a batch of one yielding one) at zero output below a 100% yield, so no compressed gas was ever chosen (v1.25.0); ore differs by at most n − 1 units |
@@ -3806,7 +4762,7 @@ user's Windows machine against the live database.
 | No station / structure name cache (v1.27.0) | The Ledger names the solar system through `location_system`; a structure the puller cannot dock at reads "—" with the id in the tooltip | Measure the unresolved volume on real data before adding a name table |
 | Install check is advisory (v1.27.1, 2026-09-09) | Phase 7.6 annotates the converged plan (what to install now, what is short) and re-plans nothing: sizing, slots and buys stand, raw buys still cover the full planned jobs | User asked to VERIFY inventory against the plan and prioritise under shortage; feeding the rationing back into the MILP / raw sizing is a separate decision (freed slots, deferred buys) — the annotated plan stays the one source of truth |
 | Availability for installs (v1.27.1) | on hand + in-flight output + this cycle's buys less their unsourced units (compressed-covered share included); never this cycle's build output or alchemy output | User wording "on hand + in production" and the codebase's stock definition; the pipeline's one-cycle lag means a stage never feeds its own cycle's consumers; an unsourced unit has no market to be bought from (review 2026-09-09) |
-| Executed-run Profit tab counts the hulls started (user request 2026-09-09) | `costing.hull_cost`: `hulls_per_cycle` = the final's `install_runs × portion_size`, this pipeline's share pro rata to the cycle need where another pipeline consumes the final (`hulls_planned` keeps the plan's count; per-hull lines still divide by it); `ledger.cost_bases` is unchanged — the latest executed run is the basis even when it started no hull (user ruling the same day) | "Mark executed" means the buys and installs the page listed are done — those installs are the install check's jobs, so the Units and cycle figures follow them; the cost basis is a per-hull figure at the latest prices the line bought at, which needs no hull started |
+| Executed-run Profit tab counts the hulls started (user request 2026-09-09) | `costing.hull_cost`: `hulls_per_cycle` = the final's `install_runs × portion_size`, this pipeline's share pro rata to the cycle need where another pipeline consumes the final (`hulls_planned` keeps the plan's count; per-hull lines still divide by it); `ledger.cost_bases` is unchanged — the latest executed run is the basis even when it started no hull (user ruling the same day). **Amended 2026-09-29 (v1.29 revision 7):** started = (`install_runs`, else `runs_allocated`) × portion + `installed_qty` — the last re-plan before Mark executed usually follows the installs, leaving the final 0 runs | "Mark executed" means the buys and installs the page listed are done — those installs are the install check's jobs, so the Units and cycle figures follow them; the cost basis is a per-hull figure at the latest prices the line bought at, which needs no hull started |
 | Targets sized at the jobs' own rounding (user ruling 2026-09-09) | Phase 3.5 `_cycle_need`: the finals' requested output propagated top-down through the packing Phases 5–7 will install (per-job ceilings, uniform round-up, full reaction windows, whole copies) gives `cycle_need_qty`, the target / deficit / low-stock basis and the loop's proration shares; `merged_min_qty` stays the BOM figure for attribution; the composite extra-runs adder stays on top | The execution simulation showed a stage stocked to the merged BOM figure starts every cycle 1–3 % short of what its consumers' jobs draw (six one-run capital jobs each round up; reactions run full windows), so the install check could never reach zero; unlike the rejected "target = realized draw" (2026-09-05 review — a catch-up draw compounds down the chain), this is the STEADY draw, so nothing compounds |
 | Finals with unpriced inputs rank after fully priced ones (review 2026-09-09) | The sort key: unpriced last, then `savings_unpriced_inputs > 0`, then return descending; the figure itself is kept and marked ≈ in the panel | A chain cost with a 0-priced leaf understates, so its return is inflated — ranking scarce stock on a figure the row's own badge disowns would starve a fully priced final |
 | Finals ranked by return on cost (v1.27.1) | (net proceeds after sell fees − chain cost) ÷ chain cost at plan-time prices, unpriced last; each final in turn takes the most runs its remaining inputs feed. The sell reference is `Snapshot.sell_quotes` (the run route's `ledger.final_quote` per final — the capital structure's sell quote for capital-class hulls, which the plan's `prices` never hold), and the chain cost is stamped for every contender whether or not its own buy price is known; the figure is persisted (`install_return`) and never recomputed by the page | "Highest return" read as return on the ISK tied up, the Profit views' margin as a rate; greedy in rank order is what a person would do with a scarce component. The first real-data pass ranked every capital hull LAST as "unpriced" (Jita quotes none of them) — the user's biggest products — which is why the sell reference and the chain cost are sourced independently of the buy side |
@@ -3822,11 +4778,11 @@ user's Windows machine against the live database.
 | Backfill sizes its extra jobs as Phase 7 will (review 2026-09-10) | `feedable` draws the extra jobs at `_sized_runs` — Phase 7's rule: saturating reactions at full windows, finals and exact-quantity ships at the runs still needed, everything else re-split uniform and rounded up across all the row's jobs — over the allocation-time model the rationing charged; `_fallback_buy_of` covers need at the same sizing | A Capital Drone Bay at 4 jobs of 9 runs with 37 needed was backfilled a fifth job as ONE run while Phase 7 re-split it to 5 × 8 = 40: the real extra draw was 4× what the fit test and the leftover bookkeeping assumed |
 | Steady-state planner never backfills (review 2026-09-10) | `plan_steady_state` passes `backfill=False` through `plan_index_run` to `_allocate_slots` | The Slot Planner's what-if had 11 manufacturing jobs against a 10-slot pool — a what-if has no stock to backfill from and must allocate within the pool it was given |
 | Route-only goo never gates alchemy (review 2026-09-10) | The startability test of the alchemy jobs covers only inputs that are plan rows (the fuel block, goo the chain already buys); goo no direct formula demands is added after the swaps and bought just in time | The gate read such goo through `_allocation_availability`, which returns on-hand for a type absent from the plan — 0 — so Solerium and every other route needing Scandium or Titanium was rejected however cheap, purely by an availability-lookup artifact |
-| Runs persist the pools they were planned against (schema 11, review 2026-09-10) | `index_run.manufacturing_slots_available` / `reaction_slots_available` = `snapshot.slots_available` at plan time (settings less multi-cycle overhang); the strip measures the plan against them, older runs against the settings' pools; a slot-trimmed row badges `no slot` and the strip's panel pointer appears only when an input is short | With 480 multi-cycle jobs running past the next run the engine planned 21 jobs against a 20-slot pool while the page measured them against "/ 500" and never said the plan exceeded the pool |
-| Profit-tab hull counts measured on the BUILD (review 2026-09-10) | `costing.hull_cost`: `hulls_planned` and `hulls_per_cycle` are both this pipeline's share of what the plan BUILDS (`runs_allocated × portion`, and `install_runs × portion` for the started figure), pro rata to the cycle demand and capped at `qty_attributable`, which stays the per-hull divisor alone; `install_runs` NULL falls back to the build, so a final holding no jobs reads 0 planned and 0 started | `qty_attributable` is the DEMAND attribution, so publishing it as the plan's count badged every slot-limited run `short on stock` although the check cut nothing, and — because NULL means both "planned before the check" and "no jobs on this row" — a final the allocator could not seat reported a whole cycle started, adding its cost and profit to the cycle totals |
+| Runs persist the pools they were planned against (schema 11, review 2026-09-10) | `index_run.manufacturing_slots_available` / `reaction_slots_available` = `snapshot.slots_available` at plan time (settings less multi-cycle overhang); the strip measures the plan against them, older runs against the settings' pools; a slot-trimmed row badges `no slot` and the strip's panel pointer appears only when an input is short **Amended 2026-09-28 (revision 6):** the persisted pools are now the settings' pools unchanged — nothing is subtracted | With 480 multi-cycle jobs running past the next run the engine planned 21 jobs against a 20-slot pool while the page measured them against "/ 500" and never said the plan exceeded the pool |
+| Profit-tab hull counts measured on the BUILD (review 2026-09-10) | `costing.hull_cost`: `hulls_planned` and `hulls_per_cycle` are both this pipeline's share of what the plan BUILDS (`runs_allocated × portion`, and `install_runs × portion` for the started figure), pro rata to the cycle demand and capped at `qty_attributable`, which stays the per-hull divisor alone; `install_runs` NULL falls back to the build, so a final holding no jobs reads 0 planned and 0 started. **Amended 2026-09-29 (v1.29 revision 7):** both figures add the row's `installed_qty` (NULL or absent → 0), the jobs installed this cycle before the last re-plan | `qty_attributable` is the DEMAND attribution, so publishing it as the plan's count badged every slot-limited run `short on stock` although the check cut nothing, and — because NULL means both "planned before the check" and "no jobs on this row" — a final the allocator could not seat reported a whole cycle started, adding its cost and profit to the cycle totals |
 | Alchemy never overwrites a demanded row (review 2026-09-10) | `_alchemy_pass` skips a route whose unrefined product is already a plan row | The pass ends by assigning `merged[unrefined_id]`, and the feedback loop then deletes that row each pass as an alchemy row: a pipeline selling one of the 17 unrefined products lost its request, cycle need and attribution silently, with no unmet flag and no cost basis |
 | The steady built-scale bump is the rounding excess (review 2026-09-10) | `_steady_output_qty` measures `built − deficit_qty`, not `built − cycle_need_qty` | The deficit is what job sizing rounded up, so the difference is batch / whole-copy rounding alone. Measured against the cycle need it also carried the consumers' one-time stockpile fill, which scales with the request: where a pipeline final feeds another pipeline's intermediate the request climbed every pass (1,000 → 1,809 → 2,609 → 3,409 → 4,209) and the loop exited on its cap, overstating the Slot Planner's cycle. Pre-existing: the `merged_min` formula it replaced diverged identically |
-| The slot-pool clause blames overhang only downward (review 2026-09-10) | The run strip explains a pool below the configured setting as multi-cycle overhang; a pool ABOVE it reads "the pool this run was planned against; Settings now reads N" | Overhang can only reduce the pool, so comparing the run's persisted pool with today's setting rendered "500 of the 20 configured slots" after any settings change |
+| The slot-pool clause blames overhang only downward (review 2026-09-10) | The run strip explains a pool below the configured setting as multi-cycle overhang; a pool ABOVE it reads "the pool this run was planned against; Settings now reads N" **Superseded 2026-09-28 (revision 6):** with no overhang, a persisted pool differing from Settings reads "the pool this run was planned against; Settings now reads N" in both directions | Overhang can only reduce the pool, so comparing the run's persisted pool with today's setting rendered "500 of the 20 configured slots" after any settings change |
 | The cap never overwrites a row's binding input (review 2026-09-10) | Phase 7.6 stamps `_LIMITED_BY_SLOTS` only where `install_limited_by` is still NULL; a row cut by BOTH a short input and the pool keeps the input, and the page's `short` badge keeps naming what to buy | The sentinel destroyed the one actionable fact on the row and blamed the pool for a cut stock had already made |
 | The run page states what runs, not what caused it (review 2026-09-10) | The short-on-stock headline reads "N of the M planned jobs run this cycle"; the slot stats read "N run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow"; the row tooltips say "no more can run this cycle" beside the binding input | The install check rations in two steps and only the second survives on the row, so every figure the page reads is post-cap while the prose said "stock feeds N" — on a capped run that understated what stock fed (650 against 774) and pointed at a panel that could not explain the gap. Stating the outcome needs no second persisted figure |
 | Alchemy is trimmed before direct jobs when a pool overflows (user ruling 2026-09-10) | The cap's order is backfilled jobs, then unpriced (every alchemy install), then priced by savings, finals last | Confirmed by the user when the review questioned it: alchemy is the opportunistic route, so it yields its slot first |
@@ -3837,6 +4793,46 @@ user's Windows machine against the live database.
 | Alchemy may replace the market-beaten share of a split row, never this cycle's draw (user ruling 2026-09-12) | A row that builds AND buys offers its `market_buy_qty` as a buy move beside the swap, against the landed price; any move (swap or buy) may shrink the purchase only while it covers this cycle's startable consumers' draw beyond stock; `alchemy_buy_qty` is credited against that share only | The share never reached the pass while the row held jobs (run 19: Ferrofluid 903,200 bought at 30.1k vs a 17.3k route). Output lands at cycle end and the install check never counts it, so replacing units consumers draw now would idle their slots; crediting the share's output against the build shortfall too under-bought the shortfall |
 | Alchemy ranks on the units its jobs SUPPLY (2026-09-11) | The score is `savings_per_unit × min(residual, jobs × out_per_job) ÷ net slots` | A clamped buy replacement credited its whole residual while covering part of it, so it out-ranked honest candidates: Ferrofluid seized 20 slots for a claimed 2.67B and crowded out a better route; scored honestly it takes 4 for 0.55B and a second route wins slots |
 | Job tables show the jobs to run now (user ruling 2026-09-09) | Runs/job ("· last N"), Jobs and Build qty on the Plan tab's job tables are the install figures, the plan's own in the tooltips; section stats and the Mfg / Reaction slots stats count the same jobs with "· plan N" beside them where stock feeds fewer; no separate Install now column or stat; the `short` badge and the short-on-stock panel stay | The user reads the job tables as the worksheet of what to install; a second column made them compare two numbers per row |
+| Purchase lines override the plan snapshot; plan columns are never rewritten (user ruling 2026-09-23) | The run's `run_purchase` lines (derived from ESI since 2026-09-28) live in their own table and win inside `costing._run_snapshot`, so every reader of realized cost (the Profit tab, the Ledger's per-sale vintages) gets them for free. A run with no lines returns the pre-v1.29 rows by an early return | The realized cost of an executed run must be what was actually PAID — the user routinely beats the plan's quotes (buy orders delivered to C-J6, split prices). Rewriting the plan's own columns would destroy the estimate the plan is judged against, and reconstructing the plan's split arithmetically cannot reproduce an unsourced row bit-for-bit, so the identity rests on not touching it at all |
+| Freight is per venue at the RUN's rates; a delivered price is already landed (user ruling 2026-09-23) | A hub line hauls at `index_run.freight_in_isk_per_m3`, a structure line at `structure_freight_in_isk_per_m3` (live settings where NULL), × packaged m³. The `delivered` venue adds no freight and never resolves a rate or a price basis | Freight is a venue fact, and the plan-time vintage is already the rule for inbound freight (2026-09-05). "Delivered" means someone else hauled it and the price says so; `Settings.freight_in_rate` hands back the HUB leg for any unknown venue, so asking it would silently charge Jita freight on a landed price |
+| A partial purchase prices the remainder at the plan (user ruling 2026-09-23; basis widened 2026-09-28) | Bought units cost actual up to the purchase basis, the rest of the basis costs `price_snapshot` with the quantities split by the plan's own per-venue shares; units bought beyond the basis are stock and cost this run nothing | Buying happens over days and in pieces, so a run is routinely part bought when it is costed. The per-venue fill prices average to `price_snapshot` only when no unit went unsourced, so the snapshot is the honest remainder price |
+| A compressed ore's purchases re-blend the raws it covers (user ruling 2026-09-23) | Realized costing rebuilds the covered raws' `effective_unit_cost` from the ores' realized landed cost at the shares the sourcing pass recorded, the refining tax left at the plan's; ESI lines on the ore feed it like any other | The user buys the ore, so that is where the price is paid; but a compressed row has no pipeline attribution at all, so its cost can only reach a hull through the raws. The tax is a function of the outputs, not of the ore price, so a re-priced ore keeps it. Persisting the pass's own shares and landed totals (schema 12) keeps the re-blend the engine's arithmetic instead of a reconstruction of it |
+| Over-buying an ore is priced per unit (review 2026-09-23) | `costing._apply_purchases.ore_realized_landed` caps the lines' ISK at the plan's quantity (`× plan_qty / bought`) before adding the plan's refining tax, exactly as a direct buy's blended unit cost does | An ore bought in a round lot bigger than the plan asked for charged this cycle for the surplus, so buying 150 of 100 AT THE PLAN'S OWN PRICE raised the covered raws' realized cost ~8% and a genuinely cheaper over-buy read as no saving at all — while the same over-buy on a direct buy was a no-op. The surplus reaches the next plan as on-hand stock, so charging it here counted it twice |
+| A sidecar bid is not a Max Buy Order plan quote (review 2026-09-23) | Under that basis a fallback-eligible type whose `buy` row carries no price is refetched regardless of age | The hub bid sidecar (written for revision 2's Buy tab cells, without a reader since 2026-09-28) shares the source string with the max-buy plan quote (A21) but is station filtered and never re-pulls region-wide: its NULL means "nobody bids at Jita 4-4", not "nobody bids in the region". Counted as fresh, it suppressed the v1.9 region-wide fallback for a raw leaf for the whole cache window after a basis switch, and the run planned it unpriced |
+| Purchasing leaves the jobs page (user ruling 2026-09-24) | The run's first tab keeps jobs and stock only: its Buy section, Multibuy block, "structure components bought" sub-table, Compressed sourcing section and buy-list badges are gone, and the route stops passing them. It keeps the wallet facts (the Buy total stat, "exceeds wallets"), and the deficit-breakdown dialog was factored into `_deficit_dialog.html` so both pages can open it | With a Buy tab that shows what is bought and what is left, the same buy list in two places is two answers to one question — and the older one knows nothing of the purchases. The dialog moved rather than being lost: after the split, a bought-only row (a raw, a PI good, a fuel block, a structure component) would otherwise have had no "why this quantity" anywhere in the app |
+| Run sub-tabs are named for what they are about (user ruling 2026-09-24) | **Industry Jobs · Buy · Stockpile · Profit**. The `?view=` values, routes, template names and `active` keys keep the old words `plan` / `buy` / `chain` / `profit`; the page titles and every piece of prose that pointed at "the Plan tab" or "the Chain tab" follow | "Plan" and "Chain" described the calculation, not the page: the first tab is now purely what to install this cycle, and the third is what is on hand and in flight. Renaming only the labels keeps every bookmark, link and test key working |
+| Minerals, Moon Materials and Gas list the end-result raws, not the ore (user ruling 2026-09-24, supersedes the read-only sub-line of the 2026-09-23 compressed ruling) | In those three groups one row per raw at its whole cycle demand (`recommended_buy_qty + compressed_covered_qty`), no compressed-ore rows. The row set is BUILT, not filtered out of the plan's buy list, which excludes a fully covered raw. The ore is listed in that group's Multibuy instead, under `_buy_group`'s tally and tie rule so it appears in exactly one group **Amended 2026-09-29 (revision 8 R2b):** the ore is a line of Multibuy All only — no group renders it; the tally now only orders that block and says whose Purchased ISK its purchases join | The question the tab answers is "what did this material cost me this cycle", and the answer is one number per material whatever route supplied it. Mixing ore rows into a mineral table asked the user to add two lines together |
+| Each group's Multibuy holds what is still to BUY (user ruling 2026-09-24; bought units since 2026-09-28) | Per group, one read-only textarea per market with each row's remaining units on the plan's own venue split (`web._reduce_shares`: a venue's buys come off its own share, the overflow off the other, then off the unsourced units); unsourced units appear in no block; the "After buying — reprocess" checklist (with the yields and tax it depends on) moved here from the jobs page. A group with nothing left to buy says so. Multibuy All above the groups pastes everything left in one block per market **Superseded 2026-09-28 (revision 6):** the blocks list the plan's own venue split exactly — `_reduce_shares` is gone; the re-plan on every ESI update is what shrinks the list as bought stock lands (see "Purchases are never subtracted from Remaining") **Superseded 2026-09-29 (revision 8 R2):** a group's Multibuy is ONE plain list of its rows' Remaining, the raw itself, not split by market and with no ore line or checklist; the per-market blocks and the checklist are Multibuy All's alone | The paste list is a shopping list, and a shopping list should shrink as you shop. Per group because the buying happens family by family; Multibuy All because pasting a dozen blocks for one Jita trip is a chore. "Keep it simple" (§6 of the revision-3 contract): the venue a purchase was made at decides which share it shrinks, never a re-walk of the ladders |
+| Buying a covered raw direct displaces the ore, which is still bought whole (user ruling 2026-09-24) | `f_r = clamp((bought − direct)/covered, 0, 1)` — lines displace the direct remainder first, then the covered units, then (since 2026-09-28) the stock slice; each ore's shares are scaled by `(1 − f)` and re-normalised onto the raws that stayed on its route, and only when every covered raw leaves does the ore contribute nothing | A raws-only table lets the user buy more units than the plan buys direct, and the only sensible reading is "I bought those myself instead of reprocessing them" — cheapest units first. The ore does not get cheaper because one of its customers left, so its cost falls on the ones that stayed: ISK is deliberately not conserved across an ore's raws. Zero purchases still give `f = 0` and the same floats as before, which is what keeps an untouched run bit-identical |
+| A covered raw names the group its ore was filed under (review 2026-09-24) | The row footnote and the covered badge say which Multibuy block holds the ore, not "this group's" | B36 files an ore by tally, so an ore covering a mineral and a moon material sits in ONE of the two groups. The other group's row sent the reader to a block the ore is not in, and cannot be |
+| A pre-v1.29 covered raw prices its direct remainder from its own plan side (review 2026-09-24) | `covered_cost` builds `plan_direct` with `blend_purchases((), plan)` instead of backing it out of `effective_unit_cost × demand − Σ share × landed`; the identity's slack stays in `residual` | Backing it out buried the ore's refining tax (and the inferred-share error) in the one term a raw purchase replaces, so buying a covered raw at the plan's OWN fill silently moved the row by the tax, on every run in the database |
+| Purchases are recorded from ESI automatically (user ruling 2026-09-28, R1; supersedes the unshipped 2026-09-23 / 2026-09-24 hand-recording designs) | The Ledger pull keeps the wallet BUY transactions (`buy_transaction`) and the item exchanges the pool accepted (`buy_contract` / `buy_contract_item`); `buying.assign_purchases` derives every run's `run_purchase` lines from them. The Buy tab has no forms and records nothing itself | The user reviewed the hand-recording design as "too much": it asked the user to re-enter, row by row, what ESI already knows. The wallet and the contracts are the ledger ("the plan is advisory; ESI is the ledger"); reading them is the whole feature |
+| A purchase belongs to a buying cycle, not a plan (user ruling 2026-09-28, R2; supersedes "purchases belong to the run they were recorded on", 2026-09-23) | An executed run (status `complete`) collects (the previous executed run's `completed_at`, its own `completed_at`]; the newest run while not executed collects from the last `completed_at` on; with no earlier executed run the window opens at the run's own `planned_start`. Superseded plans collect nothing and are CLEARED on every pass, so a purchase is on one run only. Bounds compare as parsed UTC datetimes. A late pull may add a purchase inside a closed window; reopen / re-execute moves the bound and re-matches. Before the first execution a re-plan starts at its own `planned_start`, so purchases under the superseded earlier plan land on no run (applied as ruled; the review's MIN(planned_start) alternative was not adopted) **Amended 2026-09-28 (revision 6):** re-plans are in place, and the first window opens at `COALESCE(index_run.opened_at, planned_start)` — see "One live run per buying cycle" | Re-planning is routine mid-cycle and must not strand what was bought; a cycle is the thing the purchases pay for. SQLite's `YYYY-MM-DD HH:MM:SS` sorts before ESI's `…T…Z` on the same day, so a text comparison would put a purchase on the wrong side of a same-day bound |
+| Over-buying is stock; costing prices against what the cycle consumes (user ruling 2026-09-28, R3 and §5) | The purchase basis is `max(cycle_need_qty or merged_min_qty, recommended_buy_qty + compressed_covered_qty)`: bought units up to it cost actual (pro rata across lines), the rest of it the plan's price; units beyond it cost this run nothing. The Buy tab's Need stays the plan's buy quantity. Lines for types outside the plan are stored and counted, never costed **Amended 2026-09-28 (revision 6):** the Buy tab's "Need" is gone — the page reads Required · On Hand · Remaining · Purchased; Remaining is still the plan's buy quantity | Units bought past what this cycle consumes reach the next plan as on-hand stock through ESI, so charging them here would count them twice. The basis includes the stock the cycle draws, so a re-planned row with no buy is still priced. Need must not include that stock, or Remaining would tell the user to buy what is already in the hangar |
+| Count buys per owner, honoured at read time (user ruling 2026-09-28, R4; review 2026-09-27) | `count_buys` on `pool_character` and `esi_corp`, default on, same toggle routes as `count_sales`. Wallet and contract feeds are read while either toggle is on; sells are written only under Count sales, buys always; `buys_enabled_owners` filters at matching time | The transactions cursor is shared, so a write-time skip would move it past buys that switching the toggle back on could never recover. Known limit: an owner that ran buys-only and is then switched to Count sales on does not recover sells from the id range read in between |
+| No freight toggle; freight by where it was bought (user ruling 2026-09-28, R5 and R6) | Every Buy-tab figure is landed. A purchase's venue comes from its location by the Ledger's rule (`costing.sale_venue`: NPC station → hub rates, Upwell structure → structure rates, none → hub), hauled at the run's persisted rates | One basis on one page cannot mix order and landed figures. The location is the fact ESI gives; the venue rule already decides the Ledger's fees the same way |
+| A bought contract's price is spread by reference price (user ruling 2026-09-28, R7; review 2026-09-27) | P = price − reward; `k = P / Σ p_i q_i` over the received items, p_i the cached Jita sell quote (region-wide rows dropped) else CCP's adjusted price, a blueprint copy never priced; each item `k × p_i`, an unpriced one 0 and badged; no priced item → `no_price`, not costed. Adjusted prices are cached for every type ever received on a bought contract. Frozen on the CONTRACT once every item is priced | A multi-item contract has one price and no per-item breakdown; reference prices are the only neutral split, and the allocation is exact (Σ = P). Without adjusted prices beyond the demand set, a 500M hull plus 1,000 Tritanium would cost the Tritanium ~500k each. A BPC's adjusted price is the original's and would swallow P. Freezing on the contract keeps a reopen from re-pricing history |
+| Internal transfers and swaps are not purchases (review 2026-09-27; corporation rule narrowed 2026-09-28) | A wallet buy whose seller, or a contract whose issuer — or, when issued ON BEHALF of a corporation (`for_corporation`), whose issuer's corporation — is one of ours (`ledger.internal_ids`) is `internal` (ESI names the issuer's corporation on every contract, so a corpmate outside the pool selling personally is a purchase); a contract where the pool also gave items, or price − reward ≤ 0, is a `swap`. Both are listed under Purchases with the reason and write no line | The common "alt buys at Jita, contracts to the main at 0 ISK" gives k = 0 and records the units twice — the wallet buy plus the contract — halving the realized unit cost. Mirrors the Ledger's own `internal` flag |
+| Recover the buys the Ledger used to drop (review 2026-09-27) | The open that creates `buy_transaction` resets every wallet-transactions cursor once, so the next pulls re-walk the wallets | Up to v1.28.1 the cursor already covered history whose buys were thrown away; without a reset the current cycle's pre-upgrade purchases would never arrive and Remaining would overstate, inviting a second purchase |
+| A blueprint copy never holds a contract's price freeze back (review 2026-09-28) | `Allocation.complete` = every received item that CAN be priced is; a BPC (raw_quantity −2) counts as 0 for the freeze and stays flagged in `unpriced_items` | A BPC is never priced (C10.3), so a kit contract (BPC + minerals) never froze and re-split its price by the live quote ratio on every pass — an executed run's lines, its realized cost and the Ledger's cost vintages moved with the market long after it closed |
+| Pre-plan purchases on a covered raw fill its stock slice first (review 2026-09-28) | Lines dated at or before the run's `planned_start` fill the slice (oldest first, capped at `stock_qty`, at their own landed price) and never count toward `f_r`; the rest follow direct → covered → stock **Still valid under revision 6 (2026-09-28):** the cut (`planned_start`) now moves on every ESI update, so after an update nearly every line of the cycle is pre-plan — correct, since the re-plan counted it as stock | A window can open before its plan (the newest plan's opens at the last execution; a superseded plan's purchases move on), and the plan nets on-hand units into the slice. Counting them toward `f_r` pushed the raw off an ore the plan still buys whole, so the ore re-normalised onto its siblings while the slice kept charging its share — the ore counted twice |
+| Matching runs on every window change; a Buy-tab view matches only on changed inputs (review 2026-09-28) | `assign_purchases` also runs after planning a run, discarding one and removing a character (besides the ESI update, complete / reopen and the Count buys toggles); a superseded run's tab reads none of its lines; the view trigger fires only when the pass's inputs differ from the last successful pass | A re-plan left the old run's lines in place, so its tab showed Bought beside "collects no purchases"; a deleted character's buys kept costing runs; and every view of a run whose window holds no costed purchase took the write lock for a full pass |
+| A sales-off owner's feed gaps are worded as purchases (review 2026-09-28) | With Count sales off and Count buys on (the upgrade default), the Ledger's degrade note for a wallet or contracts gap says the Buy tab's purchases may be missing, and how to stop the read | C7 reads those feeds for the buy side; the note blamed missing sales for an owner whose sales do not count |
+| A purchase at neither market hauls at a default inbound rate (user ruling 2026-09-28, revision 4; supersedes the venue rule of the R5/R6 row above and "no location → hub") | `buying.purchase_venue`: Jita 4-4 → hub, the configured structure market → structure, any other station or structure, a contract handed over elsewhere, or no location → `other`, hauled at the new Settings rate `freight_in_default_isk_per_m3` (default 0, not seeded), persisted per run like its two siblings. A new `run_purchase` venue, a fourth `blend_purchases` bucket and a third freight leg "Inbound freight (other locations)"; the Buy and Profit tabs badge it *elsewhere* (the Buy tab names the solar system). The CHECK is widened by a one-time table rebuild at schema 12. A settings save re-runs the matching pass. **Interpretation pending user confirmation (contract A4 / A17, §11), not part of the ruling:** the rate covers every purchase, wallet buys included, not only contracts; and "C-J" is the configured structure market's id, not the C-J6MT system | The Jita and structure rates price two specific courier routes; a contract picked up in some other system, or a buy at another station, is neither. The user asked for contracts; the implementer applied it to every purchase because the rate is about where the goods sit, and read "C-J" as the market's structure id (a location's system is resolved only best-effort) — both to be confirmed. Known cost: while the rate is 0, buys at other stations and structures — which revision 3 charged the Jita / structure rate — carry no freight |
+| Any bought compressed ore covers the raws it yields (user ruling 2026-09-28, revision 4) | The matcher writes a purchase of an ore the plan did not choose as one `delivered` line per raw (`via_type_id` = the ore): whole batches at the asserted yields, the ore's landed ISK (price × converted units + venue freight at the run's rates + the refining tax, ore only) split by landed plan value; the remainder under a batch stays an ore line outside the plan. Plan-chosen ores (surplus included), ice and a zero-yield kind are never converted. Per record, not per hangar stack. Frozen on an executed run once written (a contract's while its k holds). The Purchases section annotates it with units and landed ISK, the tax not shown apart | The user buys whatever ore a seller has, so leaving it "outside the plan" left its minerals on the buy list and priced at the ladder once refined. Doing it in the matcher means every reader — Remaining, Multibuy, Bought, realized cost — takes the ore in unchanged. Ice is out of scope and not refined at the ore yield. The per-record under-conversion is under one batch and keeps the freeze and the annotation per record. The lines keep only a landed price, so the tax is not recoverable for the annotation |
+| A raw refined from an unplanned ore is never pre-plan (2026-09-28, revision 4) | `costing._pre_plan` returns False for a line with `via_type_id`, whatever its date **Superseded 2026-09-28 (revision 6):** hangar compressed ore now counts as its raws, so `_pre_plan` is a pure date test with no via special case (see "Hangar compressed ore counts as the raws it reprocesses into") | The plan ignores hangar compressed stock, so ore bought before `planned_start` was not netted into Need, unlike a pre-plan raw. Accepted over-reduction: ore refined BEFORE the plan had its raws netted, and Remaining drops by them until the next plan |
+| An executed run's ore conversions are kept apart from its lines (review 2026-09-28, revision 4) | `run_purchase_refine` holds every executed run's refined lines per (record, ore); the freeze reads it beside the via lines, keeps a group while its record is not costed, and clears every non-executed run's rows | Reading the freeze only from the lines lost it whenever a pass stopped costing the record: a Count buys off/on round trip (two clicks) re-converted an executed run at the current yield, tax and prices and moved its realized cost and the Ledger's cost vintages. Same principle as the contract price freeze on `buy_contract`, which already outlived the toggle |
+| One compressed tag per Buy-tab row (user ruling 2026-09-28, revision 5) | A covered raw's Item cell carries only the "N via compressed" badge, the ores it is reprocessed out of in its title — the "from … — not a row of its own" footnote is gone; the Bought cell folds every via-ore share into one "via compressed" badge, each ore's units and landed ISK in its title. Venue badges, the strip's count badge and Purchases are unchanged **Kept by revision 6** (the "Bought" cell is now named Purchased) | A raw covered by a dozen ores stretched the tables: the footnote made the Item cell taller than the row, and one `via <ore>` badge per ore widened the Bought cell. The tooltip keeps every fact the text carried (Tooltip Ledger Rule) |
+| An executed run keeps the structure market it was planned against (review 2026-09-28, revision 4) | `index_run.structure_market_id` is persisted at plan time; an executed window classes its purchases against it (NULL: the live setting); the open run follows the live setting | Revision 4 made the venue depend on the live structure market, so switching it reclassed history: an executed run's buys at the old structure became `other`, hauled at the default rate (0 by default) instead of the run's persisted structure rate, and left its Null Sec Market Share, while their frozen via lines kept the old freight. The rates were already vintaged per run for exactly this reason (C2). The hub needs no vintage: every region's hub station is Jita 4-4 |
+| One live run per buying cycle (user ruling 2026-09-28, v1.29 revision 6 R1) | The open run (`buying.collecting_run_id`: the newest run while not executed — the same run the matcher files purchases under) is re-planned IN PLACE on every ⟳ Update from ESI and by ▶ Plan index run: `engine.plan_index_run(…, replace_index_run_id=)` keeps `index_run_id` and `run_number`, moves `planned_start` to the fetched_at of the snapshot the plan read (never later than now — costing's pre-plan cut must not pass purchases that snapshot never saw; review 2026-09-28), rewrites the run's items, pipeline attribution and invention rows in one transaction behind a guarded UPDATE (not complete, still the newest), and keeps its `run_purchase` / `run_purchase_refine` rows. A new run is created only when none is open (after Mark executed); executed runs are never re-planned; Reopen makes the newest executed run open again. `index_run.opened_at` (first planned) keeps the cycle's first buying window where it was. The ESI update's order is snapshot → sales / buys → prices → re-plan → matching; the re-plan is skipped with a flash note when no run is open, the snapshot did not refresh in that request, or there is nothing to plan from; both routes share one input builder (`_plan_inputs`). **Amended 2026-09-29 (revision 7):** the stop rule (review B1's default — skip once any final had a job started after the run was last planned) is gone; see the 2026-09-29 row below | Every tab should read the cycle as it stands now, from the stock, jobs and prices just pulled — a plan made hours ago tells the user to buy what is already in the hangar. One run per cycle keeps purchases, costing and the run number stable across re-plans (~1.6 s each). The guard sits inside the write because a Mark executed can land during the plan. `opened_at` exists because moving `planned_start` would otherwise empty the first window and drop the cycle's purchases from costing on an install with no executed run |
+| Slot pools are always the configured pools (user ruling 2026-09-28, revision 6 R2; supersedes the 2026-08-20 multi-cycle slot netting) | `snapshot_from_state` returns the Settings pools unchanged; `_multi_cycle_overhang` and its horizon read are gone; `index_run.manufacturing_slots_available` / `reaction_slots_available` persist the settings' pools. The install check and the stock-aware backfill work against that pool. `esi_snapshot.job_ends` is still stored; the per-character `include_job_slots` toggle stays but only gates the active-job count (relabelled **Count active jobs**) | Jobs already installed this cycle drop out through stock — their output counts as in progress — so subtracting them from the pool as well counted them twice once the open run is re-planned mid-cycle. Consequence, intended: after part of the cycle is installed a re-plan's "jobs to run now" assumes every configured line is free; the Industry Jobs caption says so |
+| Hangar compressed ore counts as the raws it reprocesses into (user ruling 2026-09-28, revision 6 R3) | At the top of `plan_index_run`, `industry.refined_equivalents` credits each raw with `batch_output(units // portion_size, m, yield)` per hangar compressed ore / moon ore / gas at the asserted yields — the matcher's convertible predicate, so never ice; not gated by the Settings toggles; one floor per material over the hangar total. The plan runs against a copy of the snapshot with the credit in `on_hand` (every reader sees one figure); `index_run_item.on_hand_qty` includes it and `on_hand_from_ore_qty` records it (an ALTER under schema 12). The Buy tab's On Hand and the Stockpile's On hand titles name it. `costing._pre_plan` returns to a pure date test | Ore bought but not yet refined is the minerals it will become; ignoring it told the user to buy those minerals again. Keeping the credit inside `on_hand_qty` leaves the deficit dialog, the install panel and the Stockpile identities valid unchanged. Known limit: an ore bought earlier in the cycle that the re-plan chooses again keeps its ore lines, and its credited raws' stock slice stays at the plan's effective cost |
+| The Buy tab reads Required · On Hand · Remaining · Purchased (user ruling 2026-09-28, revision 6 R4; the user's request "make it Required, On Hand, Remaining, Purchased") | Row columns Item · Required · On Hand · Remaining · Purchased · Ladder · Δ; the strip and every group subtotal carry the same four. Required = `deficit_qty + on_hand_qty + in_progress_qty` while the deficit is positive, else `target_stock_qty` (`web._required_of`); On Hand = `on_hand_qty + in_progress_qty`; Remaining = `recommended_buy_qty + compressed_covered_qty`; Purchased = the cycle's lines, landed, with the units beyond `costing.purchase_basis` named as next cycle's stock. The strip's On Hand ISK is capped at each row's Required; in the strip's and each group's Required ISK a row the plan BUILDS counts only what it holds plus what it buys (review 2026-09-28 — at the ladder the built units would inflate Required by the market value of the build); Purchased stays landed. The raw Required title names the purchase margin as the Settings' current value, which the run does not persist. "Need" and "Bought" appear in no visible label; the ore sub-table reads Ore · Remaining · Purchased · Ladder · Δ (removed 2026-09-29, revision 8 R2b). Ladder · Δ are kept after the four named columns (a rename and reorder, not a removal) | The user reads the tab as a shopping sheet: how much the cycle takes, how much is there, how much is left, how much was bought. Required is derived so that Required − On Hand = Remaining exactly for a raw with a deficit (the sourcing pass splits the deficit into direct + covered); `cycle_need_qty` would have broken that on nearly every raw, since a raw's buy is sized on its target. Where they differ (stock above Required, a buildable's built share / alchemy / unmet units, unsourced units) the plan's figure wins and the title says why. The cap keeps a Tritanium hangar from dwarfing the strip |
+| Purchases are never subtracted from Remaining (user ruling 2026-09-28, revision 6 R4; supersedes revisions 3–4's post-plan netting and revision 5's New stock column) | The page subtracts nothing from the plan: Remaining and every Multibuy block are the plan's buy on its own venue split. `web._reduce_shares`, the pre-plan / post-plan Remaining rule, the via-ore pre-plan exemption and revision 5's half-built New stock column, strip badge and helpers (`_new_stock`, `_new_stock_excluded`, `_units_since`) are removed; `web._plan_snapshot_cut` stays as the On Hand title's "as of". `costing.bought_cell` keeps its arithmetic; the page reads only its purchased figures, Ladder and Δ. **Known limit, the review's default (B2), pending the user's confirmation:** a purchase still in transit (a courier from Jita) is in no tracked system's assets, so every re-plan lists it again in Remaining and the Multibuy until it lands; the caption, the Multibuy text and an `in transit?` badge on the open run's rows with Purchased > 0 and Remaining > 0 say so | Every ESI update pulls the purchases and the stock together and re-plans from that stock, so anything bought that reached a tracked system is already off the plan's buy; subtracting the purchase as well counted it twice. Revision 5's column tried to explain the gap between the plan's on-hand and today's snapshot — with the plan kept live there is no such gap to explain |
+| This cycle's installed finals count; no re-plan stop rule (user ruling 2026-09-29, v1.29 revision 7 — "the real fix"; supersedes revision 6's B1 default) | Final jobs started inside the current buying cycle are this cycle's wave; the plan sizes the rest; every ESI update re-plans the open run. The cut: `web._cycle_cut`, from `buying.buying_windows` (open run → its window's lower bound; none open → the last Mark executed; no run → None, the full wave). `esi.refresh_state` records `job_starts` as `{type_id: [[start_date, units], …]}` per manufacturing / reaction job, delivered jobs of the last 90 days included (`include_completed=true`; recorded there only); `engine._installed_this_cycle` sums the units started strictly after the cut, parsed on both sides; `engine._final_wave` gives Phase 4 and the feedback loop one remainder (`wave_left + max(0, component share or draw − free_stock)`); `installed_qty` is persisted on every row and keeps a consumer "holding jobs" for R7; whole-copy finals count the wave in whole copies and size the rest in exact runs; `costing.hull_cost` adds `installed_qty` to the executed run's hulls; Industry Jobs keeps a final with installs listed with an `installed N/M` badge. Known limits: finals installed after Mark executed (or within PC/CCP clock skew) count toward the new cycle, which under-plans, and the Profit tab counts them on both executed runs; on the first cycle, finals installed before the first ▶ Plan are planned again; with R2's configured pools a re-plan after the installs fill every line lists a slot-limited final's rest as jobs to run now and the executed run counts it as started (pending the user's ruling). Fix pass the same day: `index_run_item.requested_qty` / `wave_qty` persist the wave the engine sized against, so the `installed N/M` badge and the deficit dialog agree with it for whole-copy finals | Revision 6 stopped re-planning once the finals installed because the plan ignored its own final jobs and would have planned the wave twice — which froze the live plan for the rest of every cycle. Counting this cycle's starts makes the re-plan correct instead of suppressed. Delivered jobs must count or an end-of-cycle update (a Hulk runs ~22.9 h of a 24 h cycle) re-plans the whole wave; the `_cycle_need` seed and the R7 predicate must not see the installs as lost demand, or a fully installed wave would drop every stage below it (a scratch plan went from 52,763 runs to 0) |
+| The Purchased cell carries no tags (user ruling 2026-09-29, v1.29 revision 8 R1 — "for the purchased column, remove the tags") | The cell reads `<units> @ <average landed unit>` (or —) and nothing else; every source `web._line_sources` returns — Jita, the structure market, elsewhere (where), a contract (title or id, k, where handed over), the one via-compressed share (each ore's units and landed ISK) — is one ` · <units> <label> (<detail>)` clause of the cell's title, after the landed total, with the over-buy note last. The Item cell's badges (via compressed, unsourced, unpriced, alchemy route, built, not on the buy list, in transit?) and the Purchases section are unchanged | The badges stretched the column and restated what the Purchases section already lists record by record; the cell answers "how many, at what", the tooltip "from where" |
+| A group's Multibuy is one plain list; compressed ore lives in Multibuy All alone (user rulings 2026-09-29, v1.29 revision 8 R2 + R2b — "the straight no compression, just the item list with no jita vs c-j6 differing lists"; "the only place that matters is the multibuy all") | Per group ONE read-only textarea (`web._group_multibuy`): one `name qty` line per row with Remaining > 0 at its Remaining, in the table's order — a covered raw at direct + covered, unsourced units included — no market split, no ore line, no reprocess checklist; "Multibuy — N items to buy". The per-group compressed-ore table (Ore · Remaining · Purchased · Ladder · Δ) and every context key that only fed it are removed; a group names an ore only in tooltips — a covered raw's "N via compressed" tag title (the ores the plan picked) and the Purchased title's via-compressed clause (an ore the pool bought that the plan did not pick, R1). Multibuy All is unchanged (two per-market blocks with the ore lines and the checklist). A plan-chosen ore's purchase stays in the strip's and its group's Purchased ISK exactly as before and is listed under Purchases; realized costing is untouched | The group list is a checklist of what each family still needs, as the materials themselves; the market split and the ore substitution are the plan's buying tactic, which Multibuy All carries once for the whole trip. Known cost: pasting a group's list buys a covered raw direct, at the raw's price — Multibuy All is the plan's cheaper route |
+| The Buy tab's groups collapse under one Input Materials section (user ruling 2026-09-29, v1.29 revision 8 R3 — "the item group shall stay collapse under a main header of Input Materials") | One top-level `details.section` (`data-key="buy:inputs"`, open) headed "Input Materials — N groups · remaining <ISK>" wraps every group; each group is a nested `details.section` with an `h3.subhead` summary (row count + the four subtotals), rendered without `open` and marked `data-default="closed"`, keyed `buy:inputs:<label>`. base.html's section-state script stores "open" or "closed" on every toggle (as before); on load only the value that differs from the section's default takes effect — "closed" for a default-open section (as before), "open" for a `data-default="closed"` one. Page order stays strip → Multibuy All → Input Materials → Purchases | The tab opens on what to paste; the groups are the detail to drill into. New keys under `buy:inputs:` so an "open" stored under the old group keys (the script stored it whenever a user closed and reopened a group) cannot reopen a group that now defaults closed |
 
 ---
 
@@ -3875,8 +4871,10 @@ user's Windows machine against the live database.
   packaged executable).
 - **Compressed sourcing scope** (v1.25) — ice products are not covered; the
   Planning tab's what-if views and the Invention tab stay single-quote (no
-  ladder depth); realized cost of a covered raw is the plan-time blend, not
-  the executed fill.
+  ladder depth); ~~realized cost of a covered raw is the plan-time blend, not
+  the executed fill~~ — resolved for what ESI shows was bought: since v1.29
+  a covered raw is re-blended from the ores' purchase lines (§2 feature
+  20). An ore with no purchase matched still costs the plan-time blend.
 - **Fill pricing edges** (v1.25) — the merged walk takes stored (expensive)
   C-J6 rungs before Jita's unstored 301st order; a remainder whose last rung
   was a C-J6 rung is priced at that rung under the Jita freight rate when
@@ -3897,3 +4895,50 @@ user's Windows machine against the live database.
   ever reports `finished_issuer` / `finished_contractor`, assembled hulls
   as singleton items (`quantity 1`, `raw_quantity −1`), and the corporation
   contracts endpoint's role requirement.
+- **Buy tab follow-ups** (v1.29 revision 3, 2026-09-28) — verify on the
+  first live pull that an item exchange accepted on a corporation's behalf
+  reports the corporation's id as `acceptor_id` (ESI has no acceptor-side
+  `for_corporation`; otherwise it is recorded as the character's); a
+  purchase of an item the plan BUILDS is recorded and shown but moves no
+  hull (realized costing still expands the build — known limit, §7 Phase
+  7.5); the hub
+  best-buy sidecar (`market.HUB_BUY_SOURCE` rows, `cached_hub_best_buy`)
+  lost its only reader and awaits removal with its tests.
+- **Buy tab revision 4 — confirm with the user** (contract A4 / A17,
+  2026-09-28): the relayed request was "contracts that are not Jita or C-J
+  should have their freight default to [the] freight default setting".
+  The build reads it as (a) "C-J" = the configured structure market's
+  structure id, so a contract handed over at another structure in C-J6MT
+  (a corp Sotiyo) hauls at the default rate, not the structure rate; and
+  (b) every purchase, wallet buys at other stations and structures
+  included, not only contracts — which, with the default at 0, makes
+  those buys freight-free where revision 3 charged the Jita / structure
+  rate. Both are one-line changes in `buying.purchase_venue` if the user
+  meant otherwise.
+- **Buy tab revision 6 — confirm with the user** (contract review B1 /
+  B2, 2026-09-28; both built as the review's recommended defaults):
+  (a) ~~**the re-plan stop rule**~~ — resolved 2026-09-29 (v1.29
+  revision 7, user ruling "the real fix"): the stop rule is gone; final
+  jobs started inside the current buying cycle are this cycle's wave,
+  the plan sizes the rest, and every ESI update re-plans the open run
+  (§7 Phase 4, Decision Log). (b) **purchases in
+  transit** — a Jita buy on its way to the structure is in no tracked
+  system's assets, so every re-plan lists it again in Remaining and the
+  Multibuy until it lands; the only mitigation is copy and an
+  `in transit?` badge. The user must accept the regression or ask for a
+  transit model.
+- **Busy lines after the installs — confirm with the user** (review of
+  v1.29 revision 7, 2026-09-29): slot pools are the configured pools
+  (ruling R2, 2026-09-28), so once the cycle's installs fill every line a
+  re-plan still lists a slot-limited final's or reaction's rest as jobs
+  to run now (Hulk ×8 on 6 manufacturing slots, all 6 installed: 2 more
+  listed), its inputs replace the fallback purchases on the Buy tab, and
+  `costing.hull_cost` counts the listed rest as started on the executed
+  run (8 hulls, 6 started). Revision 6's stop rule hid this for finals.
+  The fix the review proposes — net this cycle's still-running jobs, per
+  activity, out of the pool a re-plan with a cycle cut sees (demand
+  leaves through in-progress / `installed_qty`, occupancy through the
+  pool: different resources, so not the double count R2 guarded
+  against) — reopens R2 and is not built;
+  `tests/test_live_run.py::test_a_slot_limited_final_relists_its_rest_against_the_configured_pool`
+  pins today's behaviour so a ruling flips it deliberately.

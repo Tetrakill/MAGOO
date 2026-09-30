@@ -1249,3 +1249,274 @@ def test_snapshot_from_state_carries_hub_prices(conn):
     snap = engine.snapshot_from_state(conn, prices={34: 8.0}, hub_prices={34: 10.0})
     assert snap.hub_prices == {34: 10.0}
     assert engine.snapshot_from_state(conn).hub_prices == {}
+
+
+# --- this cycle's installed wave (v1.29 revision 7) ------------------------
+#
+# User ruling 2026-09-29: final jobs started inside the current buying
+# cycle are this cycle's wave; the plan sizes the rest. Snapshot.job_starts
+# is {type_id: [[ESI start, units], ...]}; plan_index_run(cycle_cut=...)
+# counts the starts strictly after the cut (the persisted path is in
+# tests/test_live_run.py).
+
+CUT = "2026-09-25 10:00:00"  # SQLite's shape, as index_run stores it
+IN_CYCLE = "2026-09-25T10:30:00Z"  # ESI's shape, 30 min after the cut
+
+
+def _installed(snap, type_id, units, start=IN_CYCLE):
+    snap.job_starts = snap.job_starts or {}
+    snap.job_starts.setdefault(type_id, []).append([start, units])
+
+
+def test_job_starts_compare_parsed_never_as_text():
+    """Contract amendment 6: on the same day SQLite's space-separated
+    '2026-09-25 10:00:00' sorts BEFORE ESI's '2026-09-25T09:30:00Z' as
+    text although it is 30 minutes later, so the cut is compared parsed
+    (costing._when), strictly: a start in the cut's own second is the
+    previous wave's, as a buying window's (lo, hi] is. A start that is
+    missing or unparseable, or a malformed pair, counts nothing; no cut
+    or no record counts nothing at all."""
+    from datetime import datetime, timezone
+
+    early = "2026-09-25T09:30:00Z"
+    assert early > CUT  # the text comparison would count it
+    starts = {
+        587: [
+            [early, 1],  # before the cut: the previous wave
+            ["2026-09-25T10:00:00Z", 2],  # the cut's own second
+            [IN_CYCLE, 4],
+            ["2026-09-26 08:00:00", 8],  # SQLite's shape parses too
+            [None, 16],
+            ["not a date", 32],
+            ["2026-09-25T11:00:00Z"],  # malformed pairs
+            "2026-09-25T11:00:00Z",
+            [IN_CYCLE, "x"],
+        ],
+        588: [[early, 3]],  # nothing this cycle: absent, not 0
+        34: [[IN_CYCLE, 0], [IN_CYCLE, -5]],
+    }
+    assert engine._installed_this_cycle(starts, CUT) == {587: 12}
+    aware = datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc)
+    assert engine._installed_this_cycle(starts, aware) == {587: 12}
+    later = datetime(2026, 9, 25, 10, 30, tzinfo=timezone.utc)
+    assert engine._installed_this_cycle(starts, later) == {587: 8}
+    assert engine._installed_this_cycle(starts, None) == {}
+    assert engine._installed_this_cycle(starts, "garbage") == {}
+    assert engine._installed_this_cycle(None, CUT) == {}
+    assert engine._installed_this_cycle({}, CUT) == {}
+
+
+def test_a_hand_built_snapshot_plans_the_full_wave(conn, ref):
+    """No job_starts (None) or no cut: nothing counts as installed —
+    the pre-revision-7 plan, every row stamped 0."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    hulk = ref.type_id("Hulk")
+    snap = rich_snapshot(ref)
+    assert snap.job_starts is None
+    plan = engine.plan_index_run(conn, ref, snap, persist=False, cycle_cut=CUT)
+    assert plan.items[hulk].deficit_qty == 8
+    assert all(i.installed_qty == 0 for i in plan.items.values())
+    _installed(snap, hulk, 8)
+    plan = engine.plan_index_run(conn, ref, snap, persist=False)
+    assert (plan.items[hulk].installed_qty, plan.items[hulk].deficit_qty) == (0, 8)
+
+
+def test_dual_role_final_nets_its_share_against_free_stock(conn, ref):
+    """Contract amendment 2: a final that is also another pipeline's
+    component. Covetor x 5 requested, the Hulk pipeline draws 8 more.
+    All 5 installed this cycle: the wave is done, but the 5 in flight
+    ARE that wave, so the component share still builds in full (8), not
+    8 − 5 in flight = 3 as netting the share against in-flight output
+    would give. Delivered into the hangar they are still the wave's; a
+    hangar beyond the wave covers the share like any stock."""
+    add_pipeline(conn, ref, "Covetor", 5)
+    add_pipeline(conn, ref, "Hulk", 8)  # 1 Covetor per run
+    covetor = ref.type_id("Covetor")
+
+    def covetor_row(on_hand, in_progress):
+        snap = rich_snapshot(ref)
+        snap.on_hand[covetor] = on_hand
+        snap.in_progress[covetor] = in_progress
+        _installed(snap, covetor, 5)
+        return engine.plan_index_run(
+            conn, ref, snap, persist=False, cycle_cut=CUT
+        ).items[covetor]
+
+    row = covetor_row(0, 5)
+    assert (row.cycle_need_qty, row.requested_qty, row.installed_qty) == (13, 5, 5)
+    assert row.deficit_qty == 8 and row.runs_allocated == 8
+    assert covetor_row(5, 0).deficit_qty == 8  # delivered: still the wave
+    assert covetor_row(20, 5).deficit_qty == 0  # 20 free cover the share
+    assert covetor_row(3, 5).deficit_qty == 8 - 3
+
+
+def test_a_whole_copy_wave_builds_its_remainder_in_exact_runs(conn, ref):
+    """Contract amendment 8: 5 Hulks on 8-run copies plan one whole copy
+    (8). With 3 installed this cycle the wave is counted in the copy's
+    units, 8, so 5 are left, sized in EXACT runs: re-rounding the
+    remainder to whole copies would plan 8 more (11 this cycle), and
+    8 − 3 of the literal request (2) would stop short of the copy the
+    plan meant to finish. 6 installed leave 2; the whole copy leaves 0."""
+    conn.execute("UPDATE settings SET max_run_duration_hours = 100")
+    conn.commit()
+    add_pipeline(conn, ref, "Hulk", 5, runs_per_bpc=8)
+    hulk = ref.type_id("Hulk")
+
+    def hulk_row(installed):
+        snap = rich_snapshot(ref)
+        snap.in_progress[hulk] = installed
+        _installed(snap, hulk, installed)
+        return engine.plan_index_run(
+            conn, ref, snap, persist=False, cycle_cut=CUT
+        ).items[hulk]
+
+    row = hulk_row(0)
+    assert row.total_runs_needed == 8
+    # Fix pass 2026-09-29: the wave the badge and dialog read is the
+    # request while nothing is installed, the whole copy once installs
+    # exist — never the literal 5 against which "installed 6/5" read.
+    assert (row.requested_qty, row.wave_qty) == (5, 5)
+    row = hulk_row(3)
+    assert (row.deficit_qty, row.total_runs_needed, row.runs_allocated) == (5, 5, 5)
+    assert row.max_runs_per_job == 3 and row.jobs_allocated == 2
+    assert (row.requested_qty, row.wave_qty) == (5, 8)
+    assert hulk_row(6).total_runs_needed == 2
+    row = hulk_row(8)
+    assert (row.deficit_qty, row.runs_allocated) == (0, 0)
+    assert row.wave_qty == 8
+    # Non-finals carry no wave.
+    plan = engine.plan_index_run(
+        conn, ref, rich_snapshot(ref), persist=False, cycle_cut=CUT
+    )
+    assert all(
+        i.wave_qty is None for t, i in plan.items.items() if t != hulk
+    )
+
+
+def test_an_installed_consumer_keeps_its_suppliers_targets(conn, ref):
+    """Contract amendment 3: a consumer whose jobs this cycle are all
+    installed plans 0 runs, yet it still HOLDS jobs for the R7
+    proration: its suppliers' targets (the next wave's stock) stand.
+    Ion Thruster, installed from a steady hangar: before revision 7 its
+    suppliers' targets were prorated down, as the control shows."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    hulk, ion = ref.type_id("Hulk"), ref.type_id("Ion Thruster")
+    empty = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    steady = {
+        t: i.target_stock_qty
+        for t, i in empty.items.items()
+        if t != hulk and i.target_stock_qty > 0
+    }
+    snap = rich_snapshot(ref)
+    snap.on_hand.update(steady)
+    first = engine.plan_index_run(conn, ref, snap, persist=False)
+    thruster = first.items[ion]
+    assert thruster.runs_allocated > 0
+    out = thruster.runs_allocated * thruster.portion_size
+    draw = engine._draw_calculator(conn, ref)(
+        thruster, thruster.runs_allocated, thruster.jobs_allocated
+    )
+    suppliers = [m for m in draw if first.items[m].buildable]
+    assert suppliers
+
+    def installed_plan(cut):
+        snap = rich_snapshot(ref)
+        snap.on_hand.update({m: q - draw.get(m, 0) for m, q in steady.items()})
+        snap.in_progress[ion] = out
+        _installed(snap, ion, out)
+        return engine.plan_index_run(
+            conn, ref, snap, persist=False, cycle_cut=cut
+        )
+
+    plan = installed_plan(CUT)
+    assert (plan.items[ion].installed_qty, plan.items[ion].runs_allocated) == (out, 0)
+    for m in suppliers:
+        before, after = first.items[m], plan.items[m]
+        assert (after.target_stock_qty, after.deficit_qty, after.runs_allocated) == (
+            before.target_stock_qty, before.deficit_qty, before.runs_allocated
+        ), ref.type_info(m).name
+    control = installed_plan(None)  # the same jobs, not known as this cycle's
+    assert any(
+        control.items[m].target_stock_qty < first.items[m].target_stock_qty
+        for m in suppliers
+    )
+
+
+def test_an_installed_composite_keeps_its_extra_runs_adder(conn, ref):
+    """The composite extra-runs adder follows the same predicate
+    (contract amendment 3, engine.py's second R7 site): a composite with
+    0 runs left but jobs started this cycle still holds jobs."""
+    conn.execute("UPDATE settings SET composite_reaction_extra_runs = 2")
+    conn.commit()
+    add_pipeline(conn, ref, "Hulk", 8)
+    plan = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=False)
+    composite = next(
+        i for i in plan.items.values()
+        if i.activity_id == config.ACTIVITY_REACTION
+        and ref.type_info(i.type_id).group_id in config.COMPOSITE_REACTION_GROUPS
+        and i.runs_allocated > 0
+    )
+    settings = store.get_settings(conn)
+    class_settings = store.get_class_settings(conn)
+
+    def adder():
+        return engine._composite_extra_targets(
+            ref, settings, class_settings, plan.items,
+            consumers_with_jobs_only=True,
+        )
+
+    holding = adder()
+    composite.runs_allocated = 0
+    idle = adder()
+    assert idle != holding
+    composite.installed_qty = 10
+    assert adder() == holding
+
+
+def test_an_installed_wave_is_not_low_stock(conn, ref):
+    """Once a pipeline is primed, a final whose whole wave was installed
+    this cycle — and already delivered and sold — builds 0 and holds 0,
+    yet it is not low: its stock term in the projection is the wave
+    credit plus the free stock (revision 7)."""
+    add_pipeline(conn, ref, "Hulk", 8)
+    hulk = ref.type_id("Hulk")
+    first = engine.plan_index_run(conn, ref, rich_snapshot(ref), persist=True)
+    conn.execute(
+        "UPDATE index_run SET status = 'complete', "
+        "completed_at = datetime('now') WHERE index_run_id = ?",
+        (first.index_run_id,),
+    )
+    conn.commit()
+    snap = rich_snapshot(ref)
+    _installed(snap, hulk, 8)
+    row = engine.plan_index_run(
+        conn, ref, snap, persist=False, cycle_cut=CUT
+    ).items[hulk]
+    assert (row.installed_qty, row.runs_allocated) == (8, 0)
+    assert row.on_hand_qty == row.in_progress_qty == 0
+    assert not row.low_stock
+
+
+def test_phase_4_sizes_a_final_by_the_loops_wave_rule(conn, ref):
+    """Phase 4 and the feedback loop's final branch share one rule
+    (_final_wave). The loop re-derives the deficit, so a plan alone
+    cannot tell Phase 4's figure (the first allocation's) apart: check
+    it directly. Covetor x 5 for sale, 8 more drawn by the Hulk line,
+    3 installed this cycle and in flight, 10 in the hangar: 2 left of
+    the wave, and the 10 free cover all but 0 of the share — where the
+    pre-revision-7 rule said 5 + max(0, 8 − 10 − 3) = 5."""
+    add_pipeline(conn, ref, "Covetor", 5)
+    add_pipeline(conn, ref, "Hulk", 8)
+    covetor = ref.type_id("Covetor")
+    snap = rich_snapshot(ref)
+    snap.on_hand[covetor] = 10
+    snap.in_progress[covetor] = 3
+    merged = engine._expand_and_merge(conn, ref)
+    engine._cycle_need(conn, ref, merged)
+    merged[covetor].installed_qty = 3
+    engine._apply_targets(conn, ref, merged, snap)
+    assert merged[covetor].target_stock_qty == 13
+    assert merged[covetor].deficit_qty == 2
+    del snap.on_hand[covetor]  # an empty hangar: 2 + the whole 8
+    engine._apply_targets(conn, ref, merged, snap)
+    assert merged[covetor].deficit_qty == 2 + 8

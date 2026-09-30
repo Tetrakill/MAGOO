@@ -1,4 +1,5 @@
-"""ME/TE/facility/rig math and job cost (PROJECT.md §5).
+"""ME/TE/facility/rig math and job cost (PROJECT.md §5), plus the
+reprocessing equivalents of compressed stock (v1.29 revision 6).
 
 Bonus model (design change 2026-08-15): the user configures build settings
 globally per ITEM CLASS (capital ships, T1/T2 ships, capital/advanced
@@ -369,3 +370,70 @@ def job_install_cost(
         + setting.tax_rate
         + scc_surcharge
     )
+
+
+# ---------------------------------------------------------------------------
+# Reprocessing (v1.29 revision 6)
+# ---------------------------------------------------------------------------
+
+
+def refined_equivalents(
+    ref, yields: dict[str, float], stock: dict[int, int]
+) -> dict[int, int]:
+    """{raw type_id: units} that the compressed ore / moon ore / gas in
+    `stock` ({type_id: units}) reprocesses into at the asserted yields.
+    Used as a credit, not a purchase (user ruling R3, 2026-09-28): at
+    plan time hangar compressed ore counts as the raws it yields, so ore
+    bought but not yet refined lowers what the plan buys.
+
+    `yields` maps a CompressedSource kind to its yield: {"ore":
+    settings.compressed_ore_yield (ore and moon ore), "gas":
+    settings.compressed_gas_yield}. The caller passes the settings'
+    values in — this module never reads the store (CLAUDE.md), and the
+    Settings group toggles do not gate it (the matcher's "any bought ore"
+    rule, contract review A10).
+
+    A compressed type converts on exactly buying._OrePass.convertible's
+    test: its kind's yield is above 0 and at least one output lies in
+    config.COMPRESSED_SOURCE_GROUPS. That test is what excludes ICE —
+    ref.compressed_sources() returns compressed ice as kind "ore" with
+    only Ice Products out, which ARE fuel-block inputs, so an ice leak
+    would credit isotopes and heavy water; no ice group is hardcoded.
+    Per converting type: batches = units // portion_size (units short of
+    a batch credit nothing) and every output m gains
+    source.batch_output(batches, m, yield) — one floor over the whole
+    stack per material, as buying._RunOres._refine converts a purchase.
+    buying.py keeps its own copy of that arithmetic (it prices the lines
+    too); tests/test_compressed.py pins that the two agree. Over the hangar
+    TOTAL, so it can exceed the sum of the matcher's per-purchase floors
+    by under one batch per purchase."""
+    sources = ref.compressed_sources()
+    credit: dict[int, int] = {}
+    for type_id, units in stock.items():
+        source = sources.get(type_id)
+        if source is None or not units or units <= 0:
+            continue
+        yield_ = float(yields.get(source.kind) or 0.0)
+        if yield_ <= 0:
+            continue
+        if not any(
+            _group_of(ref, m) in config.COMPRESSED_SOURCE_GROUPS
+            for m, _base in source.outputs
+        ):
+            continue
+        batches = int(units) // source.portion_size
+        if batches <= 0:
+            continue
+        for m in sorted({m for m, _base in source.outputs}):
+            out = source.batch_output(batches, m, yield_)
+            if out > 0:
+                credit[m] = credit.get(m, 0) + out
+    return credit
+
+
+def _group_of(ref, type_id: int) -> int | None:
+    """A type's group, None when the reference data does not know it."""
+    try:
+        return ref.type_info(type_id).group_id
+    except KeyError:
+        return None

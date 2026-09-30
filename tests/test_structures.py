@@ -341,16 +341,20 @@ def test_run_detail_template_renders_structure_components_section(ref):
     assert "· 2 in structure comps</span>" in html
     assert "structure components: 1 built in 2 slots · 1 bought" in html
     assert ">Structure comps</span>" not in html
-    assert "Structure components bought" in html
+    # v1.29 (ruling R2, 2026-09-24): the BOUGHT components' sub-table left
+    # with the rest of purchasing — they are rows on the Buy tab now, under
+    # their own group (tests/test_buy_tab.py). The built ones stay here.
+    assert "Structure components bought" not in html
+    assert "cheaper to buy than" not in html
+    assert "region price" not in html
     assert "Upwell Structures" in html
-    assert "region price" in html  # Tritanium priced region-wide at plan time
-    assert "cheaper to buy than" in html
     # Section-header stats: items, slots, Σ build qty × unit price (1,000
     # each): the group (hangar 4 × 1,000) and the h2 over both groups
-    # (+ Astrahus 1 × 1,000); the bought sub-table's twin (parts 12 × 1,000).
+    # (+ Astrahus 1 × 1,000). The bought sub-table's twin (parts 12 ×
+    # 1,000) went with it — m.buy_stats now serves the Stockpile tab only.
     assert "1 item, 2 slots, <span" in html and ">4.00K</span>" in html
     assert "2 items, 3 slots, <span" in html and ">5.00K</span>" in html
-    assert "1 item, <span" in html and ">12.00K</span>" in html
+    assert ">12.00K</span>" not in html
     assert "build qty × unit price at plan time" in html
     # Destructive submits are guarded by the shared in-app dialog, never by
     # window.confirm() (embedded browsers answer it false — 2026-09-01).
@@ -359,7 +363,10 @@ def test_run_detail_template_renders_structure_components_section(ref):
     # Plain-English caption (2026-09-01): the planned variant on a planned
     # run; no stat string. (Whitespace-normalised: the caption wraps.)
     flat = " ".join(html.split())
-    assert "What to buy and which jobs to install this cycle" in flat
+    # v1.29: the caption is about jobs, and points at the Buy tab for the
+    # purchasing half (ruling R2, 2026-09-24).
+    assert "Which jobs to install this cycle" in flat
+    assert "What to buy for them — and where — is on the" in flat
     assert "Mark it executed once the buys and installs are done" in flat
     assert "items in chain" not in flat and "wallet at plan time" not in flat
 

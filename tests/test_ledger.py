@@ -577,7 +577,7 @@ def test_owner_toggle_off_writes_off_keeps_data_and_read_side_excludes(conn, ref
     hulk = next(p for p in view["products"] if p.type_id == HULK)
     assert hulk.units_sold == 1  # the corp's sale (via the character feed) no longer counts
     assert any("sales off" in n for n in view["notes"])
-    conn.execute("UPDATE pool_character SET count_sales = 0")
+    conn.execute("UPDATE pool_character SET count_sales = 0, count_buys = 0")
     conn.commit()
     ledger.pull_sales(conn, ref)
     assert status_of(conn, "character", A, "transactions")["status"] == "off"
@@ -664,6 +664,11 @@ def test_mark_skipped_and_summary_respect_off_owners_and_removed_characters(conn
     add_owner(conn, A, count_sales=0)
     add_owner(conn, B)
     add_corp(conn, count_sales=0)
+    # v1.29 revision 3: the wallet and contracts read for Count buys too,
+    # so an owner is wholly 'off' only with both toggles off (review C7).
+    conn.execute("UPDATE pool_character SET count_buys = 0 WHERE character_id = ?", (A,))
+    conn.execute("UPDATE esi_corp SET count_buys = 0")
+    conn.commit()
     ledger.mark_skipped(conn, "ESI unavailable — sales pull skipped")
     assert all(r["status"] == "off" for r in pull_rows(conn, owner_id=A))
     assert all(r["status"] == "off" for r in pull_rows(conn, owner_id=PLAYER_CORP))
@@ -1496,3 +1501,273 @@ def test_chart_data_reconciles_with_strip(conn, ref, monkeypatch):
     assert line.kind == "line" and line.points[-1].y <= line.points[0].y  # cumulative profit rises (y grows downward)
     assert total_revenue == pytest.approx(800e6)
     assert v["charts"][0].caption.endswith("cost basis only")
+
+
+# --- v1.29 revision 3: the buy side of the pull ----------------------------------
+#
+# User rulings 2026-09-28 (R1/R4) and contract review C7/C9/C12: the pull
+# keeps wallet BUYS (buy_transaction) and the item exchanges the pool
+# ACCEPTED (buy_contract / buy_contract_item); orders stay behind Count
+# sales, the wallet and contracts run for Count sales OR Count buys; sells
+# and sale contracts are written only with Count sales on, buys and bought
+# contracts always (Count buys is a read-time toggle — buying.py); the
+# Ledger's sale tables stay byte-identical.
+
+TRIT = 34
+
+
+def buy_rows(conn):
+    return conn.execute("SELECT * FROM buy_transaction ORDER BY transaction_id").fetchall()
+
+
+def set_toggles(conn, *, sales=None, buys=None, corp_sales=None, corp_buys=None, cid=A):
+    if sales is not None:
+        conn.execute("UPDATE pool_character SET count_sales = ? WHERE character_id = ?", (sales, cid))
+    if buys is not None:
+        conn.execute("UPDATE pool_character SET count_buys = ? WHERE character_id = ?", (buys, cid))
+    if corp_sales is not None:
+        conn.execute("UPDATE esi_corp SET count_sales = ?", (corp_sales,))
+    if corp_buys is not None:
+        conn.execute("UPDATE esi_corp SET count_buys = ?", (corp_buys,))
+    conn.commit()
+
+
+def bought(contract_id, acceptor=A, issuer=BUYER, reward=None, **kw):
+    """An item exchange someone else issued and `acceptor` accepted."""
+    row = contract(contract_id, issuer=issuer, corp=OTHER_CORP, acceptor=acceptor, **kw)
+    row["reward"] = reward
+    return row
+
+
+def test_pull_keeps_buys_with_the_sell_side_owner_rule(conn, ref, monkeypatch):
+    add_owner(conn, A)
+    feed = {A: [tx(5), tx(4, TRIT, 1000, 5.5, is_buy=True),
+                tx(3, TRIT, 200, 5.0, is_buy=True, is_personal=False)]}
+    patch_sales(monkeypatch, conn, char_tx=feed)
+    summary = ledger.pull_sales(conn, ref)
+    assert [r["transaction_id"] for r in tx_rows(conn)] == [5]   # the Ledger never sees a buy
+    rows = {r["transaction_id"]: r for r in buy_rows(conn)}
+    assert (rows[4]["owner_kind"], rows[4]["owner_id"], rows[4]["quantity"], rows[4]["unit_price"]) == (
+        "character", A, 1000, 5.5)
+    assert (rows[3]["owner_kind"], rows[3]["owner_id"], rows[3]["division"], rows[3]["source_feed"]) == (
+        "corporation", PLAYER_CORP, None, "character")
+    assert rows[4]["location_id"] == STATION and rows[4]["client_id"] == BUYER
+    assert rows[4]["date"] == "2026-09-06T10:00:00Z" and rows[4]["fetched_at"] == NOW
+    assert (summary.new_sales, summary.new_buys) == (1, 2)
+    assert "(all products); 2 buys, 0 bought contracts (" in ledger.summary_line(summary)
+    cursor = status_of(conn, "character", A, "transactions")
+    assert (cursor["oldest_id"], cursor["newest_id"], cursor["rows_new"]) == (3, 5, 3)
+    # Idempotent, and the corp feed re-owns a buy exactly like a sell.
+    corp_tx = {(A, d): ([tx(3, TRIT, 200, 5.0, is_buy=True, is_personal=False)] if d == 4 else [])
+               for d in range(1, 8)}
+    patch_sales(monkeypatch, conn, char_tx=feed, corp_tx=corp_tx)
+    summary = ledger.pull_sales(conn, ref)
+    assert summary.new_buys == 0 and "buys" not in ledger.summary_line(summary)
+    row = {r["transaction_id"]: r for r in buy_rows(conn)}[3]
+    assert (row["owner_kind"], row["owner_id"], row["division"], row["source_feed"]) == (
+        "corporation", PLAYER_CORP, 4, "corporation")
+    assert len(buy_rows(conn)) == 2
+
+
+def test_count_sales_off_still_reads_wallet_and_contracts_for_buys(conn, ref, monkeypatch):
+    """C7: an owner with Count sales off and Count buys on has its wallet
+    and contracts read — only the buy side is written; its orders stay
+    unread, and its issued contracts' items are never fetched."""
+    add_owner(conn, A, count_sales=0)
+    calls = patch_sales(
+        monkeypatch, conn,
+        char_orders={A: [order(1)]},
+        char_tx={A: [tx(5), tx(4, TRIT, is_buy=True)]},
+        char_contracts={A: [contract(7), bought(8)]},
+        char_items={(A, 7): [citem(1)], (A, 8): [citem(1, TRIT, 500, singleton=False)]},
+    )
+    ledger.pull_sales(conn, ref)
+    assert status_of(conn, "character", A, "orders")["status"] == "off"
+    assert status_of(conn, "character", A, "transactions")["status"] == "ok"
+    assert status_of(conn, "character", A, "contracts")["status"] == "ok"
+    assert not [c for c in calls if c[0] in ("char_orders", "char_history")]
+    assert tx_rows(conn) == [] and [r["transaction_id"] for r in buy_rows(conn)] == [4]
+    assert conn.execute("SELECT COUNT(*) FROM sale_contract").fetchone()[0] == 0
+    assert [r[0] for r in conn.execute("SELECT contract_id FROM buy_contract")] == [8]
+    assert [c for c in calls if c[0] == "char_items"] == [("char_items", A, 8)]
+
+
+def test_count_buys_off_still_stores_buys(conn, ref, monkeypatch):
+    """The cursor is shared: a buy skipped at write time would sit behind
+    it for good, so the toggle is honoured when purchases are matched."""
+    add_owner(conn, A)
+    set_toggles(conn, buys=0)
+    patch_sales(monkeypatch, conn, char_tx={A: [tx(5), tx(4, TRIT, is_buy=True)]},
+                char_contracts={A: [bought(8)]}, char_items={(A, 8): [citem(1, TRIT, 10)]})
+    ledger.pull_sales(conn, ref)
+    assert [r["transaction_id"] for r in tx_rows(conn)] == [5]
+    assert [r["transaction_id"] for r in buy_rows(conn)] == [4]
+    assert conn.execute("SELECT items_status FROM buy_contract WHERE contract_id = 8").fetchone()[0] == "ok"
+    assert ("character", A) not in store.buys_enabled_owners(conn)
+
+
+def test_both_toggles_off_reads_nothing(conn, ref, monkeypatch):
+    add_owner(conn, A)
+    add_corp(conn)
+    set_toggles(conn, sales=0, buys=0, corp_sales=0, corp_buys=0)
+    calls = patch_sales(monkeypatch, conn, char_tx={A: [tx(4, is_buy=True)]})
+    ledger.pull_sales(conn, ref)
+    assert all(r["status"] == "off" for r in pull_rows(conn))
+    assert calls == [] and buy_rows(conn) == []
+
+
+def test_accepted_item_exchanges_go_to_the_buy_tables(conn, ref, monkeypatch):
+    """C9: acceptor side, item exchanges only. Character feed: accepted by
+    the character, or by its corporation on its behalf; corporation feed:
+    accepted by THIS corporation. A courier we hauled, or a contract
+    someone else accepted, is not a purchase; none of it reaches
+    sale_contract."""
+    add_owner(conn, A)
+    listing = [
+        bought(20, reward=5e6, title="minerals"),         # accepted by A
+        bought(21, acceptor=PLAYER_CORP),                  # accepted for the corporation
+        bought(22, type="courier", price=0),               # a courier A hauled
+        bought(23, acceptor=B),                            # someone else's
+        contract(24, issuer=A),                            # A's own sale
+    ]
+    corp_listing = [bought(25, acceptor=PLAYER_CORP), bought(26, acceptor=A)]
+    items = [citem(1, TRIT, 1000, singleton=False), citem(2, HULK, 1, included=False)]
+    calls = patch_sales(
+        monkeypatch, conn, char_contracts={A: listing}, corp_contracts={A: corp_listing},
+        char_items={(A, 20): items, (A, 21): [citem(1)], (A, 24): [citem(1)]},
+        corp_items={(A, 25): [citem(1)]},
+    )
+    summary = ledger.pull_sales(conn, ref)
+    rows = {r["contract_id"]: r for r in conn.execute("SELECT * FROM buy_contract")}
+    assert set(rows) == {20, 21, 25}
+    assert (rows[20]["owner_kind"], rows[20]["owner_id"]) == ("character", A)
+    assert (rows[21]["owner_kind"], rows[21]["owner_id"]) == ("corporation", PLAYER_CORP)
+    assert (rows[25]["owner_kind"], rows[25]["owner_id"], rows[25]["via_character_id"]) == (
+        "corporation", PLAYER_CORP, A)
+    r = rows[20]
+    assert (r["issuer_id"], r["issuer_corporation_id"], r["acceptor_id"], r["type"], r["status"]) == (
+        BUYER, OTHER_CORP, A, "item_exchange", "finished")
+    assert (r["price"], r["reward"], r["title"], r["date_completed"]) == (
+        350e6, 5e6, "minerals", "2026-09-05T00:00:00Z")
+    assert (r["items_status"], r["items_fetched_at"], r["k"], r["excluded"]) == ("ok", NOW, None, None)
+    got = [tuple(i) for i in conn.execute(
+        "SELECT contract_id, record_id, type_id, quantity, raw_quantity, is_included, is_singleton, "
+        "unit_price FROM buy_contract_item ORDER BY contract_id, record_id")]
+    assert got[:2] == [(20, 1, TRIT, 1000, 1000, 1, 0, None), (20, 2, HULK, 1, -1, 0, 1, None)]
+    assert [s[0] for s in conn.execute("SELECT contract_id FROM sale_contract")] == [24]
+    assert conn.execute("SELECT COUNT(*) FROM sale_contract_item WHERE contract_id != 24").fetchone()[0] == 0
+    assert ("char_items", A, 22) not in calls and ("char_items", A, 23) not in calls
+    assert summary.bought_contracts == 3 and summary.contracts_finished == 1
+    assert "(all products); 0 buys, 3 bought contracts (" in ledger.summary_line(summary)
+    assert status_of(conn, "character", A, "contracts")["rows"] == 3   # 20, 21 bought + 24 sold
+    # Idempotent: the second pull adds nothing and fetches no items again.
+    first = dump(conn, "buy_contract_item")
+    calls = patch_sales(monkeypatch, conn, char_contracts={A: listing}, corp_contracts={A: corp_listing})
+    summary = ledger.pull_sales(conn, ref)
+    assert dump(conn, "buy_contract_item") == first and summary.bought_contracts == 0
+    assert not [c for c in calls if c[0] in ("char_items", "corp_items")]
+
+
+def test_bought_contract_items_backlog_drains_from_the_buy_table(conn, ref, monkeypatch):
+    add_owner(conn, A)
+    monkeypatch.setattr(config, "LEDGER_CONTRACT_ITEMS_PER_REFRESH", 0)
+    patch_sales(monkeypatch, conn, char_contracts={A: [bought(30)]})
+    ledger.pull_sales(conn, ref)
+    row = status_of(conn, "character", A, "contracts")
+    assert row["status"] == "partial" and "1 contracts' items" in row["message"]
+    monkeypatch.setattr(config, "LEDGER_CONTRACT_ITEMS_PER_REFRESH", 200)
+    # Gone from the listing: only the stored backlog can ask for its items.
+    calls = patch_sales(monkeypatch, conn, char_contracts={A: []},
+                        char_items={(A, 30): [citem(1, TRIT, 10)]})
+    ledger.pull_sales(conn, ref)
+    assert ("char_items", A, 30) in calls
+    assert conn.execute("SELECT items_status FROM buy_contract WHERE contract_id = 30").fetchone()[0] == "ok"
+    assert status_of(conn, "character", A, "contracts")["status"] == "ok"
+
+
+def test_sale_tables_are_byte_identical_with_the_buy_side_present(conn, ref, monkeypatch, tmp_path):
+    """§3: the buy side never reaches the Ledger's tables."""
+    other = sqlite3.connect(tmp_path / "other.sqlite")
+    other.row_factory = sqlite3.Row
+    other.execute("PRAGMA foreign_keys = ON")
+    store.ensure_schema(other)
+    sells = dict(
+        char_orders={A: [order(1)]}, char_history={A: [order(2, state="expired", remain=0)]},
+        char_items={(A, 7): [citem(1)], (A, 8): [citem(1, TRIT, 10)]},
+    )
+    for c, with_buys in ((conn, False), (other, True)):
+        add_owner(c, A)
+        tx_page = [tx(5), tx(3, qty=2)] + ([tx(4, TRIT, is_buy=True)] if with_buys else [])
+        listing = [contract(7)] + ([bought(8)] if with_buys else [])
+        patch_sales(monkeypatch, c, char_tx={A: tx_page}, char_contracts={A: listing}, **sells)
+        ledger.pull_sales(c, ref)
+    for table in ("sale_transaction", "sale_order", "sale_contract", "sale_contract_item"):
+        assert dump(conn, table) == dump(other, table), table
+    assert len(buy_rows(other)) == 1 and buy_rows(conn) == []
+    other.close()
+
+
+def test_mark_skipped_reads_both_toggles(conn, ref, monkeypatch):
+    add_owner(conn, A, count_sales=0)
+    add_corp(conn, count_sales=0)
+    ledger.mark_skipped(conn, "ESI unavailable — sales pull skipped")
+    assert status_of(conn, "character", A, "orders")["status"] == "off"
+    assert status_of(conn, "character", A, "transactions")["status"] == "skipped"
+    assert status_of(conn, "character", A, "contracts")["status"] == "skipped"
+    assert status_of(conn, "corporation", PLAYER_CORP, "orders")["status"] == "off"
+    assert status_of(conn, "corporation", PLAYER_CORP, "contracts")["message"].startswith("ESI unavailable")
+    corp_tx = pull_rows(conn, "transactions", PLAYER_CORP)
+    assert len(corp_tx) == 7 and all(r["status"] == "skipped" for r in corp_tx)
+
+
+def test_summary_line_buy_clause_only_when_non_zero():
+    line = ledger.summary_line(ledger.PullSummary(14, 2, 6, 3, False, 4, 1))
+    assert line == ("sales: 14 new sales, 2 contracts finished, 6 open orders (all products); "
+                    "4 buys, 1 bought contracts (3 feeds partial — see Ledger)")
+    assert ledger.summary_line(ledger.PullSummary(14, 2, 6, 3)) == (
+        "sales: 14 new sales, 2 contracts finished, 6 open orders (all products) "
+        "(3 feeds partial — see Ledger)")
+
+
+def test_bought_contracts_keep_esi_for_corporation(conn, ref, monkeypatch):
+    """Review 2026-09-28: buying._exclusion may call a contract internal by
+    its issuer's CORPORATION only when it was issued on that corporation's
+    behalf, so the pull keeps ESI's for_corporation flag. The upsert
+    overwrites it, so a row stored before the column existed heals."""
+    add_owner(conn, A)
+    listing = [bought(40, issuer=91000555, for_corp=False), bought(41, for_corp=True)]
+    patch_sales(monkeypatch, conn, char_contracts={A: listing},
+                char_items={(A, 40): [citem(1)], (A, 41): [citem(1)]})
+    ledger.pull_sales(conn, ref)
+    flags = dict(conn.execute("SELECT contract_id, for_corporation FROM buy_contract"))
+    assert flags == {40: 0, 41: 1}
+    conn.execute("UPDATE buy_contract SET for_corporation = 0")
+    conn.commit()
+    patch_sales(monkeypatch, conn, char_contracts={A: listing})
+    ledger.pull_sales(conn, ref)
+    assert dict(conn.execute("SELECT contract_id, for_corporation FROM buy_contract")) == {
+        40: 0, 41: 1}
+
+
+def test_a_sales_off_owners_feed_gap_is_worded_as_purchases(conn, ref, monkeypatch):
+    """Review 2026-09-28: with Count sales off and Count buys on (the
+    upgrade default), a corporation's wallet and contracts are read for
+    the Buy tab. A gap there costs purchases, not sales — the Ledger must
+    not blame missing sales for an owner whose sales do not count."""
+    add_owner(conn, A)
+    add_corp(conn, count_sales=0)
+    add_pipeline(conn)
+    patch_sales(monkeypatch, conn)            # every corp feed answers 403
+    ledger.pull_sales(conn, ref)
+    fake_basis(monkeypatch, {})
+    notes = [n for n in view(conn, ref)["notes"] if n.startswith("Test Holdings")]
+    assert notes and all("sales may be missing" not in n for n in notes)
+    assert any("no_role" in n and "purchases may be missing from the Buy tab" in n
+               for n in notes)
+    assert any("bought contracts may be missing from the Buy tab" in n for n in notes)
+    # Count sales on: the same gap is worded as sales, as before.
+    conn.execute("UPDATE esi_corp SET count_sales = 1")
+    conn.commit()
+    notes = [n for n in view(conn, ref)["notes"] if n.startswith("Test Holdings")]
+    assert any("some of its sales may be missing" in n for n in notes)
+    assert all("Buy tab" not in n for n in notes)
