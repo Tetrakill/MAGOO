@@ -6,7 +6,9 @@
 <h2>Authed Corporations</h2>
 <p class="muted">What each corporation feeds into planning — and whose
 token pulls it. Count sales (v1.27.0) reads the corporation's sell orders,
-wallet sales and issued contracts for the Ledger.</p>
+wallet sales and issued contracts for the Ledger; Count buys (v1.29) counts
+its wallet buys and the item exchanges it accepted as purchases on each
+run's Buy tab.</p>
 
 {% macro fam_via(via_name, via_id, rows, enabled, unit) -%}
   {%- if via_id -%}{{ via_name or via_id }}{% if rows is not none %} <span class="muted">({{ '{:,}'.format(rows) }} {{ unit }})</span>{% endif %}
@@ -29,12 +31,17 @@ wallet sales and issued contracts for the Ledger.</p>
 {%- endmacro %}
 
 {% set sales_title = "pull this owner's sell orders, sale transactions and contracts on each ESI update and count them on the Ledger; stored sales stay and stop counting while off — a character switched off also stops carrying its corporation's wallet sales that only its own feed reports" %}
+{# v1.29 revision 3 (user ruling R4, 2026-09-28; contract review C7): the
+   wallet and contract feeds are read while either marker is on, and buys
+   are stored whatever this one says — it is honoured when purchases are
+   matched to runs, so switching it back on loses nothing. #}
+{% set buys_title = "count this owner's wallet buys and the item exchanges it accepted as purchases: each ESI update files them under the index run whose buying cycle they fall in (its Buy tab), and realized cost prices those units at what was paid. Off: its purchases stay stored and stop counting — its wallet and contracts are still read while Count sales or Count buys is on" %}
 
 {% if corps %}
 <div class="tablewrap">
 <table>
   <thead><tr><th>Corporation</th><th>Count assets</th><th>Count wallet</th>
-      <th>Count job slots</th><th>Count sales</th><th>Last refresh</th><th>Corp auth</th></tr></thead>
+      <th title="its running jobs' output counts as stock in progress, and its jobs in the ESI update's active-job count — planning always sizes jobs against the Settings slot pools (v1.29)">Count jobs</th><th>Count sales</th><th>Count buys</th><th>Last refresh</th><th>Corp auth</th></tr></thead>
   {% for k in corps %}
   {% set prov = sales_prov.get(('corporation', k.corporation_id), []) %}
   <tr>
@@ -51,6 +58,9 @@ wallet sales and issued contracts for the Ledger.</p>
     <td><form class="inline" method="post"
           action="{{ url_for('corp_toggle', corporation_id=k.corporation_id, flag='count_sales') }}">
           <button title="{{ sales_title }}">{{ '✓ yes' if k.count_sales else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('corp_toggle', corporation_id=k.corporation_id, flag='count_buys') }}">
+          <button title="{{ buys_title }}">{{ '✓ yes' if k.count_buys else '— no' }}</button></form></td>
     <td class="muted">{{ k.refreshed_at }}</td>
     <td>
       {% if k.assets_via and k.assets_via == k.jobs_via and k.jobs_via == k.wallet_via %}
@@ -76,9 +86,11 @@ the next ESI refresh (Dashboard → “⟳ Update from ESI”).</p>{% endif %}
 
 <h2>Authed Characters</h2>
 <p class="muted">What each character adds of their own — personal hangars,
-ISK, job slots, and (Count sales) its own sell orders, wallet sales and
-contracts for the Ledger.<br>If all jobs run from corporation hangars, it is
-recommended to leave the character-level assets, wallet, and job slots
+ISK, active jobs (a count only — planning always uses the Settings slot
+pools), (Count sales) its own sell orders, wallet sales and
+contracts for the Ledger, and (Count buys) its wallet buys and accepted
+item exchanges as purchases on the Buy tab.<br>If all jobs run from corporation hangars, it is
+recommended to leave the character-level assets, wallet, and active jobs
 off — the corporation table above already covers them.</p>
 
 <div class="panel">
@@ -90,7 +102,7 @@ off — the corporation table above already covers them.</p>
 <div class="tablewrap">
 <table>
   <thead><tr><th>Character</th><th>Count assets</th><th>Count wallet</th>
-      <th>Count job slots</th><th>Count sales</th><th>Sales</th><th>Scopes</th>
+      <th title="counts this character's personal running jobs in the ESI update's active-job count (the flash and the dashboard) — planning always sizes jobs against the Settings slot pools and never subtracts running jobs (v1.29)">Count active jobs</th><th>Count sales</th><th>Count buys</th><th>Sales</th><th>Scopes</th>
       <th>Token expires</th>
       <th><span class="vh">Actions</span></th></tr></thead>
   {% for c in characters %}
@@ -110,6 +122,9 @@ off — the corporation table above already covers them.</p>
     <td><form class="inline" method="post"
           action="{{ url_for('character_toggle', character_id=c.character_id, flag='count_sales') }}">
           <button title="{{ sales_title }}">{{ '✓ yes' if c.count_sales else '— no' }}</button></form></td>
+    <td><form class="inline" method="post"
+          action="{{ url_for('character_toggle', character_id=c.character_id, flag='count_buys') }}">
+          <button title="{{ buys_title }}">{{ '✓ yes' if c.count_buys else '— no' }}</button></form></td>
     <td class="small">orders {{ sales_status(prov, 'orders', false) }}
       · wallet {{ sales_status(prov, 'transactions', false) }}
       · contracts {{ sales_status(prov, 'contracts', false) }}</td>

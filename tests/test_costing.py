@@ -1181,3 +1181,53 @@ def test_realized_freight_keeps_the_plan_time_rates(conn, ref):
         settings, ref, [hub_line], rates={HUB: None, STRUCT: 1.0}
     )
     assert {l.name: l.unit_cost for l in live_leg} == {"Inbound freight (Jita)": 900}
+
+
+def test_executed_hulls_count_the_wave_installed_before_the_last_plan(conn, ref):
+    """Contract amendment 5 (v1.29 revision 7): the open run is re-planned
+    on every ESI update, so the last plan before Mark executed usually
+    follows the installs and sizes only the rest of the wave — 0 runs
+    once all 8 Hulks are in. Their installed_qty counts as planned AND
+    started, or the Profit tab's Units and cycle_totals would read 0
+    hulls for a cycle that built them all. A row planned before the
+    column (NULL) counts runs only, as before."""
+    pid = add_pipeline(conn, ref, "Hulk", 8)
+    hulk = ref.type_id("Hulk")
+    settings = store.get_settings(conn)
+    cut = "2026-09-25 10:00:00"
+
+    def executed(installed):
+        snap = uniform_snapshot(10.0)
+        snap.job_starts = {hulk: [["2026-09-25T10:30:00Z", 1]] * installed}
+        snap.in_progress = {hulk: installed}
+        plan = engine.plan_index_run(conn, ref, snap, cycle_cut=cut)
+        conn.execute(
+            "UPDATE index_run SET status = 'complete', "
+            "completed_at = datetime('now') WHERE index_run_id = ?",
+            (plan.index_run_id,),
+        )
+        conn.commit()
+        return plan
+
+    whole = executed(8)
+    row = whole.items[hulk]
+    assert (row.installed_qty, row.runs_allocated, row.install_runs) == (8, 0, None)
+    cost = costing.hull_cost(conn, ref, settings, whole.index_run_id, pid)
+    assert (cost.hulls_planned, cost.hulls_per_cycle) == (8, 8)
+    totals = costing.cycle_totals([{"cost": cost, "net": 1.0, "margin": 0.5}])
+    assert totals.hulls == 8
+
+    half = executed(4)
+    row = half.items[hulk]
+    assert (row.installed_qty, row.runs_allocated, row.install_runs) == (4, 4, 4)
+    cost = costing.hull_cost(conn, ref, settings, half.index_run_id, pid)
+    assert (cost.hulls_planned, cost.hulls_per_cycle) == (8, 8)
+
+    # An executed run planned before the column: runs only.
+    conn.execute(
+        "UPDATE index_run_item SET installed_qty = NULL WHERE index_run_id = ?",
+        (half.index_run_id,),
+    )
+    conn.commit()
+    cost = costing.hull_cost(conn, ref, settings, half.index_run_id, pid)
+    assert (cost.hulls_planned, cost.hulls_per_cycle) == (4, 4)

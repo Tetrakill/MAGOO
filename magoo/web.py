@@ -36,6 +36,7 @@ from magoo import __version__
 
 from . import (
     bom,
+    buying,
     config,
     costing,
     engine,
@@ -116,6 +117,36 @@ STRUCTURES_LABEL = "Upwell Structures"
 STRUCTURE_MODULES_LABEL = "Structure Rigs & Modules"
 STRUCTURE_COMPONENTS_LABEL = "Structure Components"
 _UNRANKED = 20
+
+# Buy tab group headings (v1.29). These are UI labels, NOT SDE group names
+# (contract review A23: group 18 is "Mineral", 711 "Harvestable Cloud",
+# 1136 "Fuel Block", and category 43 is "Planetary Commodities" spread
+# over four tier groups) — the tab files a row under the family the user
+# shops for, in the order they shop. Anything else keeps its EVE group
+# name via _display_category and sorts alphabetically after these five.
+BUY_GROUP_MINERALS = "Minerals"
+BUY_GROUP_MOON = "Moon Materials"
+BUY_GROUP_GAS = "Gas"
+BUY_GROUP_PLANETARY = "Planetary Industry"
+BUY_GROUP_FUEL = "Fuel Blocks"
+# Planetary Commodities. config.py has no constant for it and no agent
+# owns that file (A24), so the id lives here.
+_CATEGORY_PLANETARY = 43
+_BUY_GROUP_BY_GROUP = {
+    config.COMPRESSED_MINERALS_GROUP: BUY_GROUP_MINERALS,
+    config.COMPRESSED_MOON_GROUP: BUY_GROUP_MOON,
+    config.COMPRESSED_GAS_SOURCE_GROUP: BUY_GROUP_GAS,
+    **{g: BUY_GROUP_FUEL for g in config.FUEL_BLOCK_GROUPS},
+}
+# Buy-tab specific: _CATEGORY_RANK ranks the Plan tab's job sections and
+# must not learn these.
+_BUY_GROUP_RANK = {
+    BUY_GROUP_MINERALS: 0,
+    BUY_GROUP_MOON: 1,
+    BUY_GROUP_GAS: 2,
+    BUY_GROUP_PLANETARY: 3,
+    BUY_GROUP_FUEL: 4,
+}
 
 _CATEGORY_RANK = {
     # Manufacturing section ordering
@@ -343,6 +374,35 @@ def _chain_short(x) -> bool:
     return covered < x["deficit"]
 
 
+def _installed_qty(i) -> int:
+    """Units of the row's type installed this cycle (index_run_item.
+    installed_qty, v1.29 revision 7); 0 on a row planned before the column
+    (NULL) and on a _steady_rows dict."""
+    if "installed_qty" not in i.keys():
+        return 0
+    return int(i["installed_qty"] or 0)
+
+
+def _job_rows(items, activity_id, final_ids) -> list:
+    """The Industry Jobs table rows for one activity (1 manufacturing, 11
+    reactions; alchemy rows have their own section): every row that builds,
+    plus — revision 7, contract review amendment 9 — a final whose wave is
+    already installed this cycle (installed_qty > 0) and so builds nothing
+    more. It stays listed with no job to run and its "installed N/M" badge;
+    it adds nothing to the slot counts or the section's build value.
+    Keeps the rows' own order (depth, then name)."""
+    return [
+        i
+        for i in items
+        if i["activity_id"] == activity_id
+        and not i["alchemy_for_type_id"]
+        and (
+            (i["recommended_build_qty"] or 0) > 0
+            or (i["type_id"] in final_ids and _installed_qty(i) > 0)
+        )
+    ]
+
+
 def _group_by_category(ref, rows) -> list:
     """[(display category, rows)] ranked by _CATEGORY_RANK — the grouping
     the Plan-view job tables share (run_detail and the Planning tab)."""
@@ -450,6 +510,15 @@ def _steady_rows(ref, plan) -> list[dict]:
                 "install_return": None,
                 "install_draw_qty": None,
                 "install_short_qty": None,
+                # v1.29 revision 7: the Slot Planner's steady plan passes
+                # no cycle cut, so nothing counts as installed this cycle
+                # (contract review amendment 9: both row shapes match).
+                "installed_qty": 0,
+                # Revision 7 fix pass: the persisted wave columns, for the
+                # same one-shape reason (nothing installed: the wave is
+                # the request).
+                "requested_qty": item.requested_qty,
+                "wave_qty": item.wave_qty,
             }
         )
     return rows
@@ -706,31 +775,1314 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
     return alchemy
 
 
-def _compressed_section(ref, items, compressed: dict) -> list[dict]:
-    """run_detail's Compressed sourcing section rows (v1.25): each
-    compressed buy with its reprocess outcome — what it covers and what
-    is left over — for the manual reprocess checklist."""
-    by_type = {i["type_id"]: i for i in items}
-    section = []
-    for type_id, outputs in compressed.items():
-        row = by_type.get(type_id)
-        if row is None:
-            continue
-        section.append(
-            {
-                "item": row,
-                "outputs": [
-                    {
-                        "name": name,
-                        "out": out,
-                        "used": used,
-                        "leftover": max(0, out - used),
-                    }
-                    for _m, name, out, used in outputs
-                ],
-            }
+# --- Buy tab (v1.29, revision 3) -------------------------------------------
+#
+# What this cycle's inputs cost to BUY, what the plan counted on hand and
+# what the pool purchased — Required · On Hand · Remaining · Purchased ·
+# Ladder · Δ since revision 6 (user ruling R4 2026-09-28; the open run is
+# re-planned in place on every ESI update, so nothing is subtracted from
+# the plan here). Nothing is entered (user rulings 2026-09-28, R1): the
+# ESI update
+# stores the pool's wallet buys and the item exchanges it accepted, and
+# buying.assign_purchases files them as run_purchase lines under the buying
+# cycle they fall in (R2). The plan's own columns are never rewritten; the
+# lines win inside the realized-costing snapshot loader, so a run with no
+# purchases costs exactly what it did before v1.29.
+#
+# Every per-row Purchased / Ladder / Δ figure is costing.bought_cell — the
+# blend_purchases arithmetic and the run's persisted freight rates realized
+# costing lands a purchase with — so the two cannot disagree on what a line
+# cost landed (contract review C14.5). They are R8's per-unit cells, not the
+# realized change: that also depends on the costing basis and, for a covered
+# raw, on the ore's reallocation, and the page never claims otherwise.
+
+
+def _type_name(ref, type_id) -> str:
+    """A type's name, or "type N" for one the local game data does not
+    know (review 2026-09-28, P0). ESI purchases are stored whatever their
+    type, and CCP adds items faster than the SDE import catches up: an
+    unguarded type_info on the Buy tab turned one such purchase into a
+    500 on every view of the run until a re-import. ledger._type_name is
+    the Ledger's twin."""
+    try:
+        return ref.type_info(type_id).name
+    except KeyError:
+        return f"type {type_id}"
+
+
+def _row_value(row, name):
+    """One column of a sqlite3.Row / mapping, None when it has no such
+    key (render tests hand these helpers bare dicts)."""
+    keys = row.keys() if hasattr(row, "keys") else ()
+    return row[name] if name in keys else None
+
+
+def _run_buy_rates(run, settings_) -> dict[str, float]:
+    """The inbound ISK/m³ rates this run's buys are landed at, per venue:
+    the rates the run was PLANNED at, falling back to the live setting
+    where a run persisted before those columns carries NULL — the same
+    resolution costing._run_freight_rates + Settings.freight_in_rate
+    make. A delivered price is already landed and hauls nothing (A14).
+
+    Revision 4 (user ruling 2026-09-28): a purchase anywhere but Jita 4-4
+    and the configured structure market — another station or structure,
+    a contract handed over elsewhere — hauls at the default inbound rate
+    (store.BUY_VENUE_OTHER), persisted per run the same way."""
+
+    def rate(column, venue):
+        value = _row_value(run, column)
+        return value if value is not None else settings_.freight_in_rate(venue)
+
+    return {
+        store.BUY_VENUE_HUB: rate("freight_in_isk_per_m3", store.BUY_VENUE_HUB),
+        store.BUY_VENUE_STRUCTURE: rate(
+            "structure_freight_in_isk_per_m3", store.BUY_VENUE_STRUCTURE
+        ),
+        store.BUY_VENUE_OTHER: rate(
+            "freight_in_default_isk_per_m3", store.BUY_VENUE_OTHER
+        ),
+        store.BUY_VENUE_DELIVERED: 0.0,
+    }
+
+
+def _buy_group(ref, row, covers) -> str:
+    """The Buy tab heading one bought row files under. A compressed ore /
+    gas row joins the group of the RAWS it covers (contract review A25:
+    config.COMPRESSED_* are the raw groups — a compressed ore's own group
+    is its ore group under category 25), the largest covered quantity
+    winning, lowest group id breaking a tie."""
+    tally: dict[int, int] = {}
+    for material_id, _name, _out, used in covers or ():
+        if used > 0:
+            group = ref.type_info(material_id).group_id
+            tally[group] = tally.get(group, 0) + used
+    if tally:
+        group = max(tally.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+        label = _BUY_GROUP_BY_GROUP.get(group)
+        if label:
+            return label
+    label = _BUY_GROUP_BY_GROUP.get(row["group_id"])
+    if label:
+        return label
+    if row["category_id"] == _CATEGORY_PLANETARY:
+        return BUY_GROUP_PLANETARY
+    return _display_category(
+        ref,
+        row["type_id"],
+        row["group_id"],
+        row["category_id"],
+        row["category"],
+    )
+
+
+def _ore_shares_any(ore) -> bool:
+    """Does this compressed row allocate any of its landed cost to a raw?
+
+    True for a pre-v1.29 row (no compressed_alloc at all — the covered
+    raws' effective_unit_cost still carries every ISK of it). False only
+    for the engine's degenerate pick, whose outputs were worth nothing at
+    plan time: it stores share 0.0 for every raw, so its landed ISK
+    belongs to no row of this tab and the strip has to say so (B14)."""
+    blob = _row_value(ore, "compressed_alloc")
+    if not blob:
+        return True
+    try:
+        alloc = json.loads(blob) if isinstance(blob, str) else blob
+        return any(float(v) > 0 for v in alloc.values())
+    except (TypeError, ValueError, AttributeError):
+        return True
+
+
+def _multibuy_text(entries, venue_key) -> str:
+    """One Multibuy paste block: `name qty` per line, a SPACE, exactly as
+    _buy_context builds the plan's own blocks (B34). `venue_key` names the
+    quantity: a market's share for Multibuy All, `remaining` for a group's
+    plain list (revision 8)."""
+    return "\n".join(
+        f"{e['name']} {e[venue_key]}" for e in entries if e[venue_key] > 0
+    )
+
+
+def _group_multibuy(group) -> dict:
+    """One group's Multibuy: ONE plain list of what its rows still need.
+
+    v1.29 revision 8 (user ruling R2 2026-09-29: "the straight no
+    compression, just the item list with no Jita vs C-J6 differing
+    lists"): one line per row whose Remaining > 0, quantity = Remaining,
+    in the table's order, in _multibuy_text's `name qty` format. It is
+    the raw item itself — a compressed-covered raw lists its direct AND
+    covered units, as if bought straight, and no compressed ore is a line
+    — and it is not split by market. Unsourced units are part of
+    Remaining, so they are in it too (the row's `unsourced` badge says
+    they had no market at plan time).
+
+    Multibuy All keeps the plan's sell-ladder buy — the two per-market
+    blocks with the ore lines (revision 6, contract review A15) — so it
+    still reads `multibuy_ores`: every compressed ore the plan picked, in
+    the ONE group _buy_group files it under (B36), so it is pasted once
+    and in the groups' order. That is the ores' only use: revision 8's
+    R2b (user ruling 2026-09-29: "the only place that matters is the
+    multibuy all") removed the group's own ore table, so a group renders
+    no ore as a row, a cell or a Multibuy line — what was paid for one
+    stays in the Purchased totals and the Purchases section. A group
+    names an ore only in tooltips: the covered raw's "N via compressed"
+    tag (the ores the plan picked) and the Purchased title's via-compressed
+    clause (an ore the pool bought that the plan did not pick,
+    _line_sources)."""
+    listed = [r for r in group["rows"] if r["remaining"] > 0]
+    return {
+        "multibuy": _multibuy_text(listed, "remaining"),
+        "multibuy_items": len(listed),
+        "multibuy_ores": list(group["ores"]),
+    }
+
+
+def _owner_names(conn) -> dict[tuple[str, int], str]:
+    """{(owner_kind, owner_id): name} for the Purchases section — the pool's
+    characters and the corporations the ESI refresh recorded."""
+    names: dict[tuple[str, int], str] = {}
+    for r in conn.execute(
+        "SELECT character_id, character_name FROM pool_character"
+    ):
+        names[("character", r["character_id"])] = r["character_name"]
+    for r in conn.execute(
+        "SELECT corporation_id, corporation_name FROM esi_corp"
+    ):
+        if r["corporation_name"]:
+            names[("corporation", r["corporation_id"])] = r["corporation_name"]
+    return names
+
+
+def _bought_contracts(conn, contract_ids) -> dict[int, sqlite3.Row]:
+    """buy_contract rows by id, for the rows' `contract` badges (title,
+    k)."""
+    ids = sorted({int(i) for i in contract_ids})
+    if not ids:
+        return {}
+    marks = ", ".join("?" * len(ids))
+    return {
+        r["contract_id"]: r
+        for r in conn.execute(
+            f"SELECT * FROM buy_contract WHERE contract_id IN ({marks})", ids
         )
-    return section
+    }
+
+
+def _contract_label(contract, contract_id) -> str:
+    """How a bought contract is named on the page: its title, else its id."""
+    title = _row_value(contract, "title") if contract is not None else None
+    return f"“{title}”" if title else f"#{contract_id}"
+
+
+def _location_names(conn, ref, location_ids) -> dict[int, str]:
+    """{location_id: how the page names it} for purchase locations (revision
+    4, user ruling 2026-09-28: a purchase made elsewhere names where).
+
+    The Ledger resolves a station or structure to its SOLAR SYSTEM only —
+    location_system has no name column and the SDE import keeps no
+    station table (contract review A12) — so a location is named by its
+    system, or "location <id>" while the ESI pull has not resolved it
+    (resolution is best-effort: a structure without docking rights never
+    resolves). ledger._system_name is the Ledger's twin."""
+    ids = sorted({int(i) for i in location_ids if i is not None})
+    if not ids:
+        return {}
+    marks = ", ".join("?" * len(ids))
+    systems = {
+        r["location_id"]: r["solar_system_id"]
+        for r in conn.execute(
+            "SELECT location_id, solar_system_id FROM location_system "
+            f"WHERE location_id IN ({marks})",
+            ids,
+        )
+    }
+    out: dict[int, str] = {}
+    for location_id in ids:
+        name = None
+        system_id = systems.get(location_id)
+        if system_id:
+            row = ref.solar_system(int(system_id))
+            name = row["name"] if row is not None else None
+        out[location_id] = name or f"location {location_id}"
+    return out
+
+
+def _line_locations(conn, ref, lines, contracts) -> dict[tuple, str]:
+    """{(esi_kind, esi_id): location name} for a run's wallet-buy lines
+    bought at neither market (venue 'other') and for every bought contract
+    — the badge titles name where those were handed over. run_purchase
+    stores no location, so it is read back by esi_id: buy_transaction's
+    location_id, or the contract's start_location_id on the row
+    _bought_contracts loaded (contract review A12)."""
+    tx_ids = sorted({
+        int(_row_value(line, "esi_id"))
+        for line in lines
+        if _row_value(line, "esi_kind") == store.ESI_KIND_TRANSACTION
+        and line["venue"] == store.BUY_VENUE_OTHER
+    })
+    where: dict[tuple, int | None] = {}
+    if tx_ids:
+        marks = ", ".join("?" * len(tx_ids))
+        for r in conn.execute(
+            "SELECT transaction_id, location_id FROM buy_transaction "
+            f"WHERE transaction_id IN ({marks})",
+            tx_ids,
+        ):
+            where[(store.ESI_KIND_TRANSACTION, r["transaction_id"])] = r["location_id"]
+    for contract_id, contract in contracts.items():
+        where[(store.ESI_KIND_CONTRACT, contract_id)] = _row_value(
+            contract, "start_location_id"
+        )
+    names = _location_names(conn, ref, where.values())
+    return {
+        key: names[int(location_id)]
+        for key, location_id in where.items()
+        if location_id is not None
+    }
+
+
+def _line_sources(lines, contracts, structure_label, where=None,
+                  type_name=None) -> list[dict]:
+    """The sources of one row's Purchased cell (R8): Jita / the structure
+    market / `elsewhere` for wallet buys, `contract` for an accepted item
+    exchange — with the contract's title (or id), its k and where it was
+    handed over — and `via compressed` for the units the unplanned
+    compressed ores refine into. One entry per distinct source, units
+    summed.
+
+    Revision 8 (user ruling R1 2026-09-29: "for the purchased column,
+    remove the tags"): the cell renders no badge any more — each entry is
+    one clause of the cell's title (units, label, title). The entries,
+    and the revision 4/5 rules below, are unchanged.
+
+    Revision 4 (user ruling 2026-09-28):
+    - a line carrying via_type_id is tested FIRST — the matcher copies the
+      ore purchase's esi_kind onto it, so a converted contract item would
+      otherwise fold into that contract's badge (contract review A12). Its
+      title states the units and the landed ISK from that ore, summed
+      from the lines themselves: they are stored landed, so the refining
+      tax is inside and not separable (A13);
+    - venue 'other' is its own `elsewhere` badge, titled with where the
+      purchases were made (`where`: _line_locations) — before revision 4
+      it folded into Jita and claimed the hub rate.
+
+    Revision 5 (user ruling 2026-09-28: the tables were stretched): every
+    via line folds into ONE `via compressed` badge, however many ores fed
+    it; its title names each ore with its units and landed ISK. The venue
+    badges (Jita / the structure market / elsewhere / contract) keep one
+    each.
+
+    `type_name` names the ore (the tab's _type_name over its ref)."""
+    where = where or {}
+    out: dict[tuple, dict] = {}
+    for line in lines:
+        kind = _row_value(line, "esi_kind")
+        esi_id = _row_value(line, "esi_id")
+        units = int(line["quantity"])
+        via = _row_value(line, "via_type_id")
+        if via is not None:
+            entry = out.setdefault(("via",), {
+                "label": "via compressed", "tone": "accent", "units": 0,
+                "title": "", "_ores": {},
+            })
+            ore = entry["_ores"].get(int(via))
+            if ore is None:
+                ore = entry["_ores"][int(via)] = {
+                    "name": (
+                        type_name(int(via)) if type_name else f"type {via}"
+                    ),
+                    "units": 0, "isk": 0.0, "records": set(),
+                }
+            entry["units"] += units
+            ore["units"] += units
+            ore["isk"] += units * float(line["unit_price"])
+            ore["records"].add((kind, esi_id))
+            continue
+        venue = line["venue"]
+        if kind == store.ESI_KIND_CONTRACT:
+            key = ("contract", esi_id)
+            if key not in out:
+                contract = contracts.get(esi_id)
+                k = _row_value(line, "contract_k")
+                if venue == store.BUY_VENUE_STRUCTURE:
+                    handed = (
+                        f"handed over at the {structure_label} structure "
+                        "market — landed at the structure rate"
+                    )
+                elif venue == store.BUY_VENUE_OTHER:
+                    handed = (
+                        "handed over in "
+                        + where.get((kind, esi_id), "an unknown location")
+                        + ", at neither Jita 4-4 nor the structure market — "
+                        "landed at the default inbound rate"
+                    )
+                else:
+                    handed = "handed over at Jita 4-4 — landed at the hub rate"
+                out[key] = {
+                    "label": "contract",
+                    "tone": "accent",
+                    "units": 0,
+                    "title": (
+                        f"item exchange {_contract_label(contract, esi_id)}"
+                        + (
+                            f", k = {k:.4f} — its price spread over the items "
+                            "received at their Jita reference prices"
+                            if k is not None else ""
+                        )
+                        + f"; {handed}"
+                    ),
+                }
+            out[key]["units"] += units
+            continue
+        if venue == store.BUY_VENUE_STRUCTURE:
+            key, label = ("venue", venue), structure_label
+            title = (
+                f"wallet buys at the {structure_label} structure market — "
+                "landed at the structure rate"
+            )
+        elif venue == store.BUY_VENUE_DELIVERED:
+            key, label = ("venue", venue), "delivered"
+            title = "bought delivered — the price is already landed"
+        elif venue == store.BUY_VENUE_OTHER:
+            key, label = ("venue", venue), "elsewhere"
+            title = ""        # set below, once every location is known
+        else:
+            key, label = ("venue", store.BUY_VENUE_HUB), "Jita"
+            title = "wallet buys at Jita 4-4 — landed at the hub rate"
+        entry = out.setdefault(key, {
+            "label": label, "tone": "", "units": 0,
+            "title": (
+                "recorded by hand in a development build, before purchases "
+                "were read from ESI" if kind is None else title
+            ),
+            "_where": set(),
+        })
+        entry["units"] += units
+        if venue == store.BUY_VENUE_OTHER:
+            entry["_where"].add(where.get((kind, esi_id), "an unknown location"))
+    for entry in out.values():
+        if "_ores" in entry:
+            parts = []
+            for ore in sorted(entry["_ores"].values(),
+                              key=lambda o: o["name"]):
+                n = len(ore["records"])
+                parts.append(
+                    f"{ore['units']:,} units refined out of {ore['name']} "
+                    + (f"from {n} purchases " if n > 1 else "")
+                    + f"— {ore['isk']:,.0f} ISK landed"
+                )
+            entry["title"] = (
+                "; ".join(parts)
+                + ". Landed is what the ore cost for the whole batches "
+                "refined, its inbound freight and the refining tax, spread "
+                "over what it yields by value at this run's plan prices. The "
+                "plan did not pick "
+                + ("this ore" if len(parts) == 1 else "these ores")
+                + ", so the purchase counts as what it refines into"
+            )
+        elif entry.get("_where") and not entry["title"]:
+            entry["title"] = (
+                "wallet buys in " + ", ".join(sorted(entry["_where"]))
+                + " — at neither Jita 4-4 nor the structure market, so "
+                "landed at the default inbound rate (Settings)"
+            )
+    return [
+        {k: v for k, v in entry.items() if not k.startswith("_")}
+        for entry in out.values()
+    ]
+
+
+def _venue_label(venue, structure_label) -> str:
+    return (
+        structure_label if venue == store.BUY_VENUE_STRUCTURE
+        else "delivered" if venue == store.BUY_VENUE_DELIVERED
+        else "elsewhere" if venue == store.BUY_VENUE_OTHER
+        else "Jita"
+    )
+
+
+# Why a listed purchase writes no line, keyed by buying's record status:
+# (badge tone, tooltip). Internal transfers and a switched-off owner are
+# bookkeeping, not trouble — neutral; the rest want the user's eye.
+_RECORD_STATUS_NOTE = {
+    "internal": (
+        "", "a transfer from one of your own characters or corporations — "
+        "not a purchase, so it writes no line: the units were costed where "
+        "they were first bought",
+    ),
+    "buys_off": (
+        "", "this owner's Count buys is off (ESI tab) — stored, not counted",
+    ),
+    "swap": (
+        "warn", "items went both ways, or it cost nothing — not a purchase, "
+        "not costed",
+    ),
+    "no_price": (
+        "warn", "none of the items received has a Jita sell or CCP adjusted "
+        "price on record, so its price cannot be spread over them — not "
+        "costed; the next ESI update tries again",
+    ),
+    "no_items": (
+        "warn", "its item list has not been read from ESI yet — the next "
+        "update reads it",
+    ),
+    "pending": (
+        "warn", "not priced yet — the next ESI update prices it",
+    ),
+}
+
+
+def _refined_notes(record, ores, ref, in_plan=frozenset()) -> list[dict]:
+    """The Purchases annotation of one record's refined ores (revision 4,
+    user ruling 2026-09-28; contract review A13): per ore, the units
+    refined of those received, what they refined into and the landed ISK,
+    all summed from the run's STORED via lines (buying.RefinedOre) — never
+    recomputed, which would drift from an executed run's frozen lines.
+    The refining tax is inside the landed figure and not stored apart, so
+    it is not stated on its own. A remainder short of one reprocessing
+    batch stayed an ore line: outside the plan.
+
+    `outside` names the outputs of a type the run does not buy (`in_plan`,
+    the Buy tab's own test): the matcher writes them too (contract review
+    A7), and the strip counts them outside the plan, so the annotation
+    says so rather than reading as if every raw fed the plan (review
+    2026-09-28)."""
+    notes = []
+    for ore in ores:
+        received = record.received_units(ore.ore_type_id)
+        notes.append({
+            "ore": _type_name(ref, ore.ore_type_id),
+            "refined": max(0, received - ore.remainder),
+            "received": received,
+            "outputs": ", ".join(
+                f"{units:,} {_type_name(ref, type_id)}"
+                for type_id, units in ore.outputs
+            ),
+            "outside": ", ".join(
+                f"{units:,} {_type_name(ref, type_id)}"
+                for type_id, units in ore.outputs
+                if type_id not in in_plan
+            ),
+            "landed_isk": float(ore.landed_isk),
+            "remainder": int(ore.remainder),
+        })
+    return notes
+
+
+def _records_from_esi(records, names, ref, in_plan, structure_label,
+                      refined=None, locations=None) -> list[dict]:
+    """The Purchases section (R8) from buying.run_purchase_records: every
+    wallet buy and bought contract dated inside this run's buying window —
+    costed or not, each non-costed one with its reason (C9) — newest
+    first. `in_plan` is the set of types whose lines costing uses; a costed
+    item outside it is marked (R3/R7: it is stock, recorded all the
+    same).
+
+    Revision 4 (user ruling 2026-09-28): `refined` is
+    buying.refined_ores for the run — an unplanned compressed ore the
+    matcher refined is not itself outside the plan (its refined units are
+    the raws' lines now; contract review A12), and the record carries the
+    "→ refined into …" annotation (_refined_notes), which names the raws
+    the run does not buy — those ARE outside the plan, as the strip counts
+    them (review 2026-09-28) — and any remainder that stayed outside. `locations` ({location_id: name}, _location_names) names
+    where a purchase made at neither market was handed over."""
+    refined = refined or {}
+    locations = locations or {}
+    out = []
+    for r in records:
+        costed = bool(r.costed)
+        ores = refined.get((r.kind, r.esi_id), ()) if costed else ()
+        ore_ids = {o.ore_type_id for o in ores}
+        if r.kind == store.ESI_KIND_CONTRACT:
+            items = [
+                {
+                    "name": _type_name(ref, i.type_id),
+                    "qty": int(i.quantity),
+                    "unit_price": i.unit_price,
+                    "outside": (
+                        costed and i.received and i.type_id not in in_plan
+                        and i.type_id not in ore_ids
+                    ),
+                    "refined": bool(i.received and i.type_id in ore_ids),
+                    "given": not i.received,
+                    "bpc": bool(i.blueprint_copy),
+                }
+                for i in r.items
+            ]
+            label = f"“{r.title}”" if r.title else f"#{r.esi_id}"
+        else:
+            items = [{
+                "name": _type_name(ref, r.type_id),
+                "qty": int(r.quantity or 0),
+                "unit_price": r.unit_price,
+                "outside": (
+                    costed and r.type_id not in in_plan
+                    and r.type_id not in ore_ids
+                ),
+                "refined": r.type_id in ore_ids,
+                "given": False,
+                "bpc": False,
+            }]
+            label = None
+        tone, note = _RECORD_STATUS_NOTE.get(r.status, ("warn", r.status_label))
+        location_id = getattr(r, "location_id", None)
+        out.append({
+            "kind": r.kind,
+            "esi_id": r.esi_id,
+            "date": r.date or "",
+            "owner": names.get((r.owner_kind, r.owner_id), str(r.owner_id)),
+            "owner_kind": r.owner_kind,
+            "venue": r.venue,
+            "venue_label": _venue_label(r.venue, structure_label),
+            "location": (
+                locations.get(int(location_id), f"location {location_id}")
+                if location_id is not None else None
+            ),
+            "label": label,
+            "k": r.k,
+            "price": float(r.isk or 0.0),
+            "items": items,
+            "refined": _refined_notes(r, ores, ref, in_plan),
+            "landed_in_price": False,
+            "unpriced_items": int(r.unpriced_items or 0) if costed else 0,
+            "costed": costed,
+            "status_label": None if costed else r.status_label,
+            "status_tone": tone,
+            "status_note": note,
+        })
+    return sorted(out, key=lambda rec: rec["date"], reverse=True)
+
+
+def _records_from_lines(purchases, names, ref, in_plan, structure_label) -> list[dict]:
+    """The Purchases section rebuilt from the run's own derived lines —
+    the fallback when the matcher's reader fails. Costed records
+    only (a non-costed purchase writes no line); a line recorded by hand
+    before revision 3 is listed on its own.
+
+    Revision 4 (contract review A12): the raws an unplanned compressed ore
+    refined into (via_type_id set) are listed under their ore's record,
+    labelled as refined from it — the ore line itself is gone for the
+    batches refined, and their landed unit price (freight and refining
+    tax inside) is what the lines hold. The record's venue is read from
+    its own purchase lines, never from a via line's 'delivered'."""
+    records: dict[tuple, dict] = {}
+    for lines in purchases.values():
+        for line in lines:
+            kind = _row_value(line, "esi_kind")
+            esi_id = _row_value(line, "esi_id")
+            via = _row_value(line, "via_type_id")
+            key = (kind, esi_id) if kind is not None else ("hand", line["purchase_id"])
+            rec = records.get(key)
+            if rec is None:
+                owner_kind = _row_value(line, "owner_kind")
+                owner_id = _row_value(line, "owner_id")
+                rec = records[key] = {
+                    "kind": kind or "hand",
+                    "esi_id": esi_id,
+                    "date": _row_value(line, "date") or "",
+                    "owner": (
+                        names.get((owner_kind, owner_id), str(owner_id))
+                        if owner_id is not None else None
+                    ),
+                    "owner_kind": owner_kind,
+                    "venue": None,
+                    "venue_label": None,
+                    "location": None,
+                    "label": (
+                        f"#{esi_id}" if kind == store.ESI_KIND_CONTRACT else None
+                    ),
+                    "k": _row_value(line, "contract_k"),
+                    "price": 0.0,
+                    "items": [],
+                    "refined": [],
+                    "landed_in_price": False,
+                    "unpriced_items": 0,
+                    "costed": True,
+                    "status_label": None,
+                    "status_tone": "",
+                    "status_note": None,
+                }
+            if via is None and rec["venue"] is None:
+                rec["venue"] = line["venue"]
+                rec["venue_label"] = _venue_label(line["venue"], structure_label)
+            units = int(line["quantity"])
+            rec["items"].append({
+                "name": _type_name(ref, line["type_id"]),
+                "qty": units,
+                "unit_price": float(line["unit_price"]),
+                "outside": line["type_id"] not in in_plan,
+                "via": _type_name(ref, via) if via is not None else None,
+                "refined": False,
+                "given": False,
+                "bpc": False,
+            })
+            # For a contract, Σ k × p_i × q_i is the price paid (R7). A
+            # refined raw holds only its LANDED price (the ore's price,
+            # freight and refining tax spread by value) — the ore's order
+            # price for the refined units is stored nowhere — so it adds
+            # that, and the Price cell's title says so rather than "before
+            # freight" (review 2026-09-28).
+            rec["price"] += units * float(line["unit_price"])
+            if via is not None:
+                rec["landed_in_price"] = True
+    return sorted(records.values(), key=lambda rec: rec["date"], reverse=True)
+
+
+def _cycle_cut(conn) -> datetime | None:
+    """The moment the current buying cycle opened — the cut every plan
+    passes to engine.plan_index_run (v1.29 revision 7, user ruling
+    2026-09-29: final jobs started inside the current buying cycle are
+    this cycle's wave; the plan sizes the rest; every ESI update re-plans
+    the open run). One source: buying.buying_windows, never re-derived
+    here (contract review amendment 6).
+
+    With an open run it is that run's window's lower bound — the greatest
+    completed_at among executed runs, else the run's own opened_at
+    (planned_start on runs planned before the column), which an in-place
+    re-plan never moves. With no open run (▶ Plan is about to create one)
+    it is the greatest executed window's upper bound, i.e. the last Mark
+    executed; with no executed run at all, None — the first cycle plans
+    its full wave. An aware UTC datetime; the engine parses the ESI job
+    starts and compares them strictly after it (a job started in the
+    cut's own second is the previous wave's, like the windows' (lo, hi]).
+
+    Known limits (amendment 7), both on the under-planning side now:
+    finals of the executed cycle installed after Mark executed — or
+    within the PC clock's skew from CCP's, since completed_at is the PC's
+    datetime('now') and start_date the server's — count as the NEW
+    cycle's wave, so the new run plans that many fewer — and the Profit
+    tab counts those hulls on BOTH executed runs (the old run's last plan
+    still holds them as runs; the new run's installed_qty holds them
+    too); and on the first cycle, finals installed before the first
+    ▶ Plan are ignored and planned again. The Industry Jobs badge
+    (installed N/M) makes either visible."""
+    windows = buying.buying_windows(conn)
+    open_window = [w for w in windows if w.hi is None]
+    if open_window:
+        return open_window[0].lo
+    executed = [w.hi for w in windows if w.executed and w.hi is not None]
+    return max(executed) if executed else None
+
+
+def _cut_label(cut: datetime | None) -> str | None:
+    """A cycle cut as the page prints it — 'YYYY-MM-DD HH:MM' UTC."""
+    if cut is None:
+        return None
+    return cut.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def _plan_snapshot_cut(conn, planned_start) -> tuple[str | None, bool]:
+    """(when, exact): the ESI update the plan read — the On Hand title's
+    "as of" (v1.29 revision 6; the helper dates from revision 5's review
+    of 2026-09-28). Planning never pulls ESI: it nets the newest snapshot
+    persisted by planned_start (engine.snapshot_from_state), so its
+    on_hand_qty / in_progress_qty are the hangar and jobs at THAT
+    snapshot's fetched_at. After an update-time re-plan (R1 — the re-plan
+    follows the pull in the same request) that is the pull just made;
+    after a ▶ Plan it can be hours older. Snapshots are pruned to the last
+    five (store.save_esi_snapshot) and index_run stores no snapshot time,
+    so when none that old is left the answer falls back to planned_start
+    and `exact` is False — the title then says "when the plan was made"."""
+    plan_at = costing._when(planned_start)
+    if plan_at is None:
+        return planned_start, True
+    fetched = [
+        (at, text)
+        for (text,) in conn.execute("SELECT fetched_at FROM esi_snapshot")
+        for at in (costing._when(text),)
+        if at is not None and at <= plan_at
+    ]
+    if not fetched:
+        return planned_start, False
+    return max(fetched)[1], True
+
+
+def _required_of(row) -> int:
+    """A Buy-tab row's Required (v1.29 revision 6, user ruling R4
+    2026-09-28; contract review A13): what this cycle's plan needs of the
+    item in total —
+
+        deficit_qty + on_hand_qty + in_progress_qty   when deficit_qty > 0
+        target_stock_qty                              otherwise
+
+    — so Required − On Hand is exactly the deficit the plan sized its buy
+    on. For a just-in-time raw that is target_stock_qty itself (the
+    allocated jobs' consumption plus the purchase margin, engine
+    _finalize — not cycle_need_qty, which would break Required − On Hand
+    = Remaining on nearly every raw); for a buildable it is target stock
+    plus this cycle's draw, the identity the Stockpile's deficit dialog
+    inverts. The Stockpile computes no such figure in Python, so this is
+    the one place it is derived. Every buildable row the tab lists has a
+    positive deficit (a buildable buys only out of one), so the fallback
+    reaches raws with nothing to buy and the alchemy-route edge only.
+    NULLs read as 0 (a hand-built row)."""
+    deficit = int(_row_value(row, "deficit_qty") or 0)
+    if deficit > 0:
+        return (
+            deficit
+            + int(_row_value(row, "on_hand_qty") or 0)
+            + int(_row_value(row, "in_progress_qty") or 0)
+        )
+    return int(_row_value(row, "target_stock_qty") or 0)
+
+
+def _buy_tab_context(
+    run, rows, ref, settings_, conn, bc, esi_records=None, superseded=False
+) -> dict:
+    """The Buy tab's whole context: the strip, Multibuy All, the family
+    groups with Required · On Hand · Remaining · Purchased · Ladder · Δ
+    and each group's Multibuy, and the Purchases ESI delivered for this
+    cycle.
+
+    Revision 6 (user rulings 2026-09-28). R1: one run per buying cycle,
+    kept live — every ⟳ Update from ESI re-plans the open run IN PLACE
+    from the stock, jobs and prices it just pulled, so the plan's buy
+    list already nets everything bought that reached a tracked system.
+    R4: the page therefore subtracts NOTHING from the plan —
+
+    - Required (_required_of) — what the cycle needs of the item in
+      total: target stock plus this cycle's draw, the Stockpile's deficit
+      basis; for a just-in-time raw its planned consumption plus the
+      purchase margin. In the strip's and each group's Required ISK a
+      row the plan builds counts only what it holds plus what it buys —
+      the built units are no purchase (review 2026-09-28).
+    - On Hand = on_hand_qty + in_progress_qty — the stock the fresh plan
+      counted (contract review A12): the hangar, what the hangar's
+      compressed ore reprocesses into (on_hand_from_ore_qty, ruling R3 —
+      inside on_hand_qty), and job output in progress (alchemy's expected
+      credit inside it).
+    - Remaining = recommended_buy_qty + compressed_covered_qty — the
+      plan's buy, the covered part sourced as ore lines in Multibuy All
+      (the group's own list names the raw itself, revision 8). For a raw with a deficit Required − On Hand = Remaining
+      exactly (the sourcing pass splits the deficit into direct +
+      covered); it diverges where stock exceeds Required (Remaining 0),
+      on a buildable row (the plan builds part of the deficit, expects
+      alchemy output or leaves a capacity shortfall no market holds —
+      Remaining is only the bought part), and the unsourced units are in
+      Remaining but in neither Multibuy All block (B35; the group's own
+      list, revision 8, carries them as part of Remaining) — each title
+      says which (contract review A14).
+    - Purchased — the cycle's purchase lines (costing.bought_cell's
+      bought_qty / bought_unit / bought_landed; _line_sources' sources
+      are clauses of its title, no badge — revision 8, R1),
+      with the units past costing.purchase_basis named as stock for the
+      next cycle (R5: realized costing leaves them unpriced).
+    - Ladder and Δ — costing.bought_cell's ladder_unit and delta, as
+      before.
+
+    Multibuy All's blocks (contract review A15) list the plan's venue
+    shares exactly (`bc["venue_qty"]`), unsourced units excluded, and
+    every compressed ore the plan picked at its plan quantity, in ONE
+    group (_buy_group, B36). Revision 8 (user ruling R2 2026-09-29): a
+    group's own Multibuy is ONE plain list — each row's Remaining, the
+    raw itself, no market split and no ore line (_group_multibuy) — and
+    R2b removed the group's ore table: a plan-chosen ore's purchases stay
+    in the Purchased totals and the Purchases section, and a group names
+    an ore only in tooltips — the covered raw's "via compressed" tag and,
+    for an ore the plan did not pick, the Purchased title's via clause.
+    Revisions
+    3–5's post-plan purchase netting, the via-ore pre-plan exemption and
+    revision 5's New stock column are gone.
+
+    Known limit (contract review B2): a purchase still in transit — a
+    Jita buy on its way to the structure — is in no tracked system's
+    assets, so the re-plan cannot net it and it still reads as Remaining;
+    a row with Purchased > 0 and Remaining > 0 carries an "in transit?"
+    cue, and the page caption says so. A live plan older than the newest
+    ESI update (`stale_since`: that update's re-plan was skipped — nothing
+    to plan from — or failed; review 2026-09-28) nets nothing since it
+    was made: the captions say so instead and the transit cue is off.
+    `stale_legacy` marks a stale run no v1.29 build ever planned
+    (opened_at NULL — a v1.28 plan whose updates never re-planned
+    anything); its copy names no skipped re-plan.
+
+    Rows (C14.4) are revision 2's — in Minerals, Moon Materials and Gas
+    the END-RESULT raws at their demand (direct + compressed-covered),
+    with no ore row (R4); elsewhere every row the plan buys — plus every
+    non-built row of the run that carries purchase lines, which includes
+    a re-planned row that no longer buys anything, so the tab shows every
+    line costing uses. "Outside the plan" is exactly two kinds of line: a
+    type with no index_run_item row in the run, and a BUILDABLE row
+    (blueprint_id set, or an alchemy route) — stock, never costed into
+    the Purchased total (§5's known limit: hull_cost prices such a row
+    from its own inputs). Revision 4: a compressed ore the plan did NOT
+    pick is written by the matcher as the raws it refines into (lines
+    carrying via_type_id), so it lands in those raws' Purchased, named
+    `via compressed` (in the cell's title since revision 8); a purchase at
+    neither market is `elsewhere` and landed at the run's default inbound
+    rate.
+
+    `bc` is run_detail's _buy_context dict (venue_split is a closure
+    inside it, A26). `esi_records` is buying.run_purchase_records for the
+    run; None rebuilds the Purchases section from the run's derived
+    lines. A `superseded` run collects no purchases (R2) and reads none
+    of its lines, even ones a matching pass has not cleared yet."""
+    index_run_id = run["index_run_id"]
+    planned_start = _row_value(run, "planned_start")
+    rates = _run_buy_rates(run, settings_)
+    hub_rate = rates[store.BUY_VENUE_HUB]
+    structure_rate = rates[store.BUY_VENUE_STRUCTURE]
+    other_rate = rates[store.BUY_VENUE_OTHER]
+    ore_ids = set(bc["compressed"])
+    raw_groups = {
+        config.COMPRESSED_MINERALS_GROUP,
+        config.COMPRESSED_MOON_GROUP,
+        config.COMPRESSED_GAS_SOURCE_GROUP,
+    }
+    by_type = {i["type_id"]: i for i in rows}
+    purchases = {} if superseded else store.list_purchases(conn, index_run_id)
+    structure_label = settings_.structure_market_label()
+    contracts = _bought_contracts(
+        conn,
+        (
+            _row_value(line, "esi_id")
+            for lines in purchases.values() for line in lines
+            if _row_value(line, "esi_kind") == store.ESI_KIND_CONTRACT
+        ),
+    )
+    # Revision 4: where a purchase made at neither market, or a contract,
+    # was handed over — the badge titles name it (contract review A12).
+    where = _line_locations(
+        conn, ref,
+        [line for lines in purchases.values() for line in lines],
+        contracts,
+    )
+    # The On Hand title's "as of": the ESI update this plan read.
+    stock_at, stock_exact = _plan_snapshot_cut(conn, planned_start)
+    # The open run is the live one (R1): only its plan follows the ESI
+    # updates, so only there can a purchase read as "still in transit".
+    live = not superseded and run["status"] != buying.RUN_EXECUTED
+    # Review 2026-09-28: a live plan is STALE when an ESI update landed
+    # after it was planned — that update's re-plan was skipped (nothing to
+    # plan from: no active pipeline or prices) or failed and rolled back.
+    # Revision 7 (user ruling 2026-09-29) removed the final-installs stop
+    # rule, and a snapshot that did not refresh saves no newer row
+    # (esi.refresh_state saves it last), so neither can make a plan stale
+    # (contract review amendment 11). Its buy list then nets none of
+    # the stock or purchases since, so the page must not claim "what you
+    # bought is off Remaining already", nor blame transit for a purchase
+    # already in the hangar. `stale_since` is that newer update's time.
+    stale_since = None
+    if live:
+        newest = conn.execute("SELECT MAX(fetched_at) FROM esi_snapshot").fetchone()[0]
+        newest_at = costing._when(newest)
+        plan_at = costing._when(planned_start)
+        if newest_at is not None and plan_at is not None and newest_at > plan_at:
+            stale_since = newest
+    # Pre-release review 2026-09-30: a run no v1.29 build has planned or
+    # re-planned (opened_at NULL — the engine's INSERT and the replace's
+    # COALESCE both set it) was planned when an ESI update never
+    # re-planned anything, so its staleness blames no skipped re-plan:
+    # every open run carried over from v1.28 is stale on the first view
+    # after the upgrade. The copy then says so neutrally.
+    stale_legacy = stale_since is not None and _row_value(run, "opened_at") is None
+
+    def sources_of(lines):
+        return _line_sources(
+            lines, contracts, structure_label, where,
+            lambda type_id: _type_name(ref, type_id),
+        )
+
+    def demand_of(item):
+        return (
+            int(item["recommended_buy_qty"] or 0)
+            + int(_row_value(item, "compressed_covered_qty") or 0)
+        )
+
+    def built_of(item):
+        # blueprint_id is the plan's own "this row can be built" marker;
+        # an alchemy route is a reaction row, so it carries one too.
+        return (
+            _row_value(item, "blueprint_id") is not None
+            or bool(_row_value(item, "alchemy_for_type_id"))
+        )
+
+    def shares_of(type_id) -> tuple[int, int]:
+        # The plan's (Jita, structure) units — the Multibuy lines as they
+        # are, nothing taken off (contract review A15).
+        hub, structure = bc["venue_qty"].get(type_id, (0, 0))
+        return int(hub), int(structure)
+
+    # B13: the row set is BUILT, not filtered — bc["buys"] excludes a raw
+    # the compressed pass covered in full (its recommended_buy_qty is 0).
+    table_rows = [
+        i for i in rows
+        if i["type_id"] not in ore_ids
+        and (
+            (
+                demand_of(i) > 0 if i["group_id"] in raw_groups
+                else (i["recommended_buy_qty"] or 0) > 0
+            )
+            or (i["type_id"] in purchases and not built_of(i))
+        )
+    ]
+    # The lines costing uses: every table row but a built one, and the
+    # ores (C14.3: an ore's lines are plan purchases).
+    in_plan = {
+        i["type_id"] for i in table_rows if not built_of(i)
+    } | {o for o in ore_ids if o in by_type}
+
+    # An ore is filed in ONE group — the one covering the most of its
+    # output (_buy_group's tally and tie rule, B36) — but it can cover
+    # raws in two. The filing only orders Multibuy All's ore lines (the
+    # ore is pasted once) and says whose Purchased ISK its purchases join;
+    # since revision 8's R2b no group renders the ore, so a covered raw
+    # names its ores without pointing at a group.
+    ore_group = {
+        ore_id: _buy_group(ref, by_type[ore_id], covers)
+        for ore_id, covers in bc["compressed"].items()
+        if ore_id in by_type
+    }
+    covers_raw: dict[int, list[dict]] = {}
+    for ore_id, covers in bc["compressed"].items():
+        for material_id, _name, _out, used in covers:
+            if used > 0 and ore_id in by_type:
+                covers_raw.setdefault(material_id, []).append(
+                    {
+                        "name": by_type[ore_id]["name"],
+                        "type_id": ore_id,
+                        "used": int(used),
+                    }
+                )
+
+    groups: dict[str, dict] = {}
+
+    def group_for(label):
+        return groups.setdefault(
+            label,
+            {
+                "label": label, "rows": [], "ores": [],
+                "required_total": 0.0, "on_hand_total": 0.0,
+                "remaining_total": 0.0, "purchased_total": 0.0,
+            },
+        )
+
+    totals = {
+        "required_total": 0.0, "on_hand_total": 0.0,
+        "remaining_total": 0.0, "purchased_total": 0.0,
+    }
+    on_hand_beyond = 0          # units on hand past each row's Required
+    for item in table_rows:
+        type_id = item["type_id"]
+        direct_qty = int(item["recommended_buy_qty"] or 0)
+        covered_qty = int(_row_value(item, "compressed_covered_qty") or 0)
+        m3 = ref.type_info(type_id).freight_volume
+        lines = purchases.get(type_id, [])
+        cell = costing.bought_cell(
+            item, lines, hub_rate, structure_rate, m3, other_rate=other_rate,
+        )
+        built = built_of(item)
+        remaining = direct_qty + covered_qty
+        required = _required_of(item)
+        deficit = int(_row_value(item, "deficit_qty") or 0)
+        target = int(_row_value(item, "target_stock_qty") or 0)
+        hangar_and_ore = int(_row_value(item, "on_hand_qty") or 0)
+        from_ore = int(_row_value(item, "on_hand_from_ore_qty") or 0)
+        in_jobs = int(_row_value(item, "in_progress_qty") or 0)
+        on_hand = hangar_and_ore + in_jobs
+        hub_qty, structure_qty = shares_of(type_id)
+        unsourced_qty = (
+            int(_row_value(item, "unfilled_qty") or 0)
+            if type_id in bc["unsourced"] else 0
+        )
+        build_qty = int(_row_value(item, "recommended_build_qty") or 0)
+        alchemy_out = int(_row_value(item, "alchemy_output_qty") or 0)
+        ladder_unit = cell.ladder_unit
+        price = ladder_unit or 0.0
+        group_label = _buy_group(ref, item, None)
+        ore_list = covers_raw.get(type_id, [])
+        row = {
+            "item": item,
+            "type_id": type_id,
+            "name": item["name"],
+            "built": built,
+            "direct_qty": direct_qty,
+            "covered_qty": covered_qty,
+            "cell": cell,
+            "lines": lines,
+            "sources": sources_of(lines),
+            # Required and what it is made of (the title names the basis).
+            "required": required,
+            "target": target,
+            "draw": required - target if deficit > 0 else 0,
+            "cycle_need": int(
+                _row_value(item, "cycle_need_qty")
+                or _row_value(item, "merged_min_qty") or 0
+            ),
+            # On Hand: the stock the plan netted (A12).
+            "on_hand": on_hand,
+            "hangar": hangar_and_ore - from_ore,
+            "from_ore": from_ore,
+            "in_jobs": in_jobs,
+            "alchemy_credit": int(_row_value(item, "alchemy_credit_qty") or 0),
+            # Remaining: the plan's buy (R4) and why it can differ from
+            # Required − On Hand (A14).
+            "remaining": remaining,
+            "gap": max(0, required - on_hand),
+            "build_qty": build_qty,
+            "alchemy_out": alchemy_out,
+            "unmet_qty": max(
+                0, deficit - build_qty - direct_qty - alchemy_out
+            ) if built else 0,
+            "unsourced_qty": unsourced_qty,
+            "hub_qty": hub_qty,
+            "structure_qty": structure_qty,
+            # Purchased: the units past what realized costing prices this
+            # cycle (costing.purchase_basis, R5) are next cycle's stock.
+            "over_bought": (
+                0 if built
+                else max(0, cell.bought_qty - costing.purchase_basis(item))
+            ),
+            # B2: bought, yet the live plan still lists units — some may
+            # be on their way (ESI shows no stock in transit). An executed
+            # run's plan predates its purchases, so it never asks.
+            # A stale plan (review 2026-09-28) netted nothing since it
+            # was made, so transit is not the likely reason: no cue.
+            "in_transit": (
+                live and stale_since is None
+                and cell.bought_qty > 0 and remaining > 0
+            ),
+            "ladder_unit": ladder_unit,
+            # A row the plan BUILDS counts in the strip's and the group's
+            # Required ISK only as what it holds plus what it buys (review
+            # 2026-09-28): the units it builds are no purchase, and at the
+            # ladder they would inflate Required by the market value of
+            # the build, so Required − On Hand ≈ Remaining held for bought
+            # rows only (contract review A16). The column keeps the full
+            # Required; `built_share` is what the ISK leaves out.
+            "required_isk": price * (
+                min(required, min(on_hand, required) + remaining)
+                if built else required
+            ),
+            "built_share": (
+                max(0, required - min(on_hand, required) - remaining)
+                if built else 0
+            ),
+            "on_hand_isk": price * min(on_hand, required),
+            "remaining_isk": price * remaining,
+            # The ores behind the "N via compressed" tag, named in its
+            # title — since revision 8 (user rulings R2/R2b 2026-09-29) a
+            # plan-chosen ore is a line in Multibuy All alone, and this
+            # tag (with the Purchased title's via clause for an ore the
+            # plan did not pick) is the only place a group names one.
+            "ores": [o["name"] for o in ore_list],
+            "unsourced": type_id in bc["unsourced"],
+            "unfilled_qty": int(_row_value(item, "unfilled_qty") or 0),
+            "unfilled_price": _row_value(item, "unfilled_price"),
+            "effective_unit_cost": _row_value(item, "effective_unit_cost"),
+            "missing_price": ladder_unit is None and (required or remaining) > 0,
+            "plan_hub": hub_qty,
+            "plan_structure": structure_qty,
+        }
+        on_hand_beyond += max(0, on_hand - required)
+        group = group_for(group_label)
+        group["rows"].append(row)
+        for key, value in (
+            ("required_total", row["required_isk"]),
+            ("on_hand_total", row["on_hand_isk"]),
+            ("remaining_total", row["remaining_isk"]),
+        ):
+            group[key] += value
+            totals[key] += value
+        if not built:
+            group["purchased_total"] += cell.bought_landed
+            totals["purchased_total"] += cell.bought_landed
+
+    # -- the ores: every plan-chosen ore at its plan quantity (A15) ------
+    # Revision 8's R2b (user ruling 2026-09-29): an ore is a line in
+    # Multibuy All and a step of its reprocess checklist — nothing else on
+    # the page. The entry carries only what those two read; no group
+    # renders an ore, so it keeps no Purchased cell or sources.
+    for ore_id in sorted(ore_ids):
+        ore = by_type.get(ore_id)
+        if ore is None:
+            continue
+        hub_qty, structure_qty = shares_of(ore_id)
+        entry = {
+            "item": ore,
+            "name": ore["name"],
+            "qty": int(ore["recommended_buy_qty"] or 0),
+            "hub_qty": hub_qty,
+            "structure_qty": structure_qty,
+            "outputs": [
+                {
+                    "name": name, "out": out, "used": used,
+                    "leftover": max(0, out - used),
+                }
+                for _m, name, out, used in bc["compressed"][ore_id]
+            ],
+        }
+        group = group_for(ore_group[ore_id])
+        group["ores"].append(entry)
+        # The ore's ISK is plan purchase ISK (C14.3) — in Purchased, the
+        # strip's and its group's, exactly as before R2b removed its table
+        # (the Purchases section still lists the purchase). Its plan
+        # figure is NOT added to Required / Remaining: it already sits
+        # inside the covered raws' effective cost, which is why it has no
+        # row. No planned_start: bought_cell's pre-/post-plan split is
+        # unused here (only the landed ISK is read).
+        bought_landed = costing.bought_cell(
+            ore, purchases.get(ore_id, []), hub_rate, structure_rate,
+            ref.type_info(ore_id).freight_volume, other_rate=other_rate,
+        ).bought_landed
+        group["purchased_total"] += bought_landed
+        totals["purchased_total"] += bought_landed
+
+    ordered = sorted(
+        groups.values(),
+        key=lambda g: (_BUY_GROUP_RANK.get(g["label"], _UNRANKED), g["label"]),
+    )
+    for group in ordered:
+        group["rows"].sort(key=lambda r: r["name"])
+        group["ores"].sort(key=lambda o: o["name"])
+        group.update(_group_multibuy(group))
+
+    # Multibuy All (R8): every group's rows and filed ores, in the groups'
+    # order, one block per venue — the plan's sell-ladder buy. Revision 8
+    # (user ruling R2 2026-09-29) left it unchanged; the group lists are
+    # the same rows' Remaining, unsplit and with covered units as the raw.
+    all_entries = [
+        e for g in ordered
+        for e in list(g["rows"]) + g["multibuy_ores"]
+    ]
+    all_ores = [o for g in ordered for o in g["multibuy_ores"]]
+
+    # "Outside the plan" (C14.4): a type the run does not hold, and a row
+    # the plan builds — recorded, and stock for the next plan (R3).
+    # Revision 4 (user ruling 2026-09-28): the batches of an unplanned
+    # compressed ore the matcher refined are no ore line any more — they
+    # are the raws' via lines, so they drop out of this count by type
+    # (a raw the run does not hold is still outside: stock, A7). What an
+    # ore keeps as its own line is the remainder short of one whole
+    # reprocessing batch; the badge's title names it.
+    refined_ores = {
+        int(_row_value(line, "via_type_id"))
+        for lines in purchases.values() for line in lines
+        if _row_value(line, "via_type_id") is not None
+    }
+    outside_units = 0
+    outside_names: list[str] = []
+    outside_remainders: list[str] = []
+    for type_id, lines in purchases.items():
+        if type_id in in_plan:
+            continue
+        units = sum(int(line["quantity"]) for line in lines)
+        outside_units += units
+        outside_names.append(_type_name(ref, type_id))
+        if type_id in refined_ores:
+            outside_remainders.append(f"{units:,} {_type_name(ref, type_id)}")
+
+    # B14: an ore whose outputs were worth nothing at plan time allocates
+    # share 0.0 to every raw it covers, so its landed ISK sits in NO row
+    # here. Name the amount rather than let it vanish from the total.
+    orphan_ore_isk = sum(
+        float(by_type[ore_id]["compressed_landed_isk"] or 0.0)
+        for ore_id in ore_ids
+        if by_type.get(ore_id) is not None
+        and _row_value(by_type[ore_id], "compressed_landed_isk") is not None
+        and not _ore_shares_any(by_type[ore_id])
+    )
+    rendered = [r for g in ordered for r in g["rows"]]
+    names = _owner_names(conn)
+    if esi_records is not None:
+        # The refined-ore annotation reads the run's stored via lines — a
+        # superseded run reads none (its figures are the plan alone).
+        try:
+            refined = (
+                {} if superseded else buying.refined_ores(conn, index_run_id)
+            )
+        except Exception:  # noqa: BLE001 — the annotation is optional
+            log.exception("reading the run's refined ores failed")
+            refined = {}
+        records = _records_from_esi(
+            esi_records, names, ref, in_plan, structure_label,
+            refined=refined,
+            locations=_location_names(
+                conn, ref,
+                (getattr(r, "location_id", None) for r in esi_records),
+            ),
+        )
+    else:
+        records = _records_from_lines(
+            purchases, names, ref, in_plan, structure_label
+        )
+    return dict(
+        buy_groups=ordered,
+        buy_summary={
+            **totals,
+            "rows": len(rendered),
+            "rows_purchased": sum(1 for r in rendered if r["cell"].bought_qty),
+            "units_required": sum(r["required"] for r in rendered),
+            # Units of built rows' Required left out of the Required ISK.
+            "units_built": sum(r["built_share"] for r in rendered),
+            "rows_built": sum(1 for r in rendered if r["built_share"]),
+            "units_on_hand": sum(r["on_hand"] for r in rendered),
+            "units_remaining": sum(r["remaining"] for r in rendered),
+            "on_hand_beyond": on_hand_beyond,
+            "in_transit": sum(1 for r in rendered if r["in_transit"]),
+            # An unpriced row's units count as 0 ISK in Required, On Hand
+            # and Remaining, exactly as the Industry Jobs tab's buy total
+            # treats them — the strip says so rather than reading low.
+            "unpriced": sum(1 for r in rendered if r["missing_price"]),
+            # B39: these count the rows this tab RENDERS, not the plan's
+            # whole buy list — the ore rows are not in it.
+            "split": sum(
+                1 for r in rendered
+                if r["plan_hub"] > 0 and r["plan_structure"] > 0
+            ),
+            "structure_only": sum(
+                1 for r in rendered
+                if r["plan_structure"] > 0 and r["plan_hub"] == 0
+            ),
+            "unsourced": sum(1 for r in rendered if r["unsourced"]),
+            "compressed": len(ore_ids),
+            "compressed_covered": len(bc["compressed_covered"]),
+            "outside_units": outside_units,
+            "outside_names": sorted(outside_names),
+            "outside_remainders": sorted(outside_remainders),
+            "unpriced_contract_items": sum(
+                r["unpriced_items"] for r in records
+            ),
+            "not_costed": sum(1 for r in records if not r["costed"]),
+            "orphan_ore_isk": orphan_ore_isk,
+        },
+        # The ESI update this plan read (the On Hand titles); `exact` is
+        # False when it has been pruned and the plan's start stands in.
+        stock_at=stock_at,
+        stock_exact=stock_exact,
+        multibuy_all={
+            "hub": _multibuy_text(all_entries, "hub_qty"),
+            "structure": _multibuy_text(all_entries, "structure_qty"),
+            "items": sum(
+                1 for e in all_entries
+                if e["hub_qty"] > 0 or e["structure_qty"] > 0
+            ),
+            "ores": all_ores,
+        },
+        purchase_records=records,
+        # A late ESI pull that adds a purchase to an executed run reprices
+        # later runs' lagged inputs on the next read — the lag walk
+        # computes on read.
+        history_note=run["status"] == "complete",
+        structure_label=structure_label,
+        live=live,
+        stale_since=stale_since,
+        stale_legacy=stale_legacy,
+        # The margin the Settings read NOW: it is not persisted on the run,
+        # so the Required title names it as today's setting, never as the
+        # one this plan used (review 2026-09-28).
+        purchase_margin=settings_.input_purchase_margin,
+        # m.item_button opens the shared deficit dialog from this tab too
+        # (review B5: a bought-only row has no other "why this quantity"
+        # anywhere in the app).
+        final_ids=_final_ids(conn, rows),
+        compressed=bc["compressed"],
+        compressed_covered=bc["compressed_covered"],
+        compressed_saving=(
+            run["compressed_saving_isk"]
+            if "compressed_saving_isk" in run.keys() else None
+        ),
+    )
 
 
 def _chain_context(ref, items) -> dict:
@@ -764,6 +2116,15 @@ def _chain_context(ref, items) -> dict:
             ),
             "target": i["target_stock_qty"],
             "on_hand": i["on_hand_qty"],
+            # v1.29 revision 6 (ruling R3): the part of on_hand that is
+            # the hangar's compressed ore reprocessed at the asserted
+            # yields (inside on_hand — contract review A12); NULL on runs
+            # planned before, and absent on a hand-built row.
+            "on_hand_from_ore": (
+                (i["on_hand_from_ore_qty"] or 0)
+                if "on_hand_from_ore_qty" in i.keys()
+                else 0
+            ),
             "in_jobs": i["in_progress_qty"],
             "deficit": i["deficit_qty"],
             "buildable": i["blueprint_id"] is not None,
@@ -842,6 +2203,22 @@ def _chain_context(ref, items) -> dict:
     )
 
 
+def _final_ids(c, items) -> set:
+    """The type ids the run pages treat as pipeline finals — the run's own
+    depth-0 rows (a single-role final is never consumed, so its merged
+    depth stays 0; deactivating the pipeline later must not demote its
+    history) unioned with the live ACTIVE finals, which covers a dual-role
+    final whose merged depth is >= 1 because another chain consumes it.
+    m.item_button reads it for the deficit dialog's wording, so the Buy
+    tab needs it as much as the Industry Jobs tab does (v1.29)."""
+    return {i["type_id"] for i in items if i["depth"] == 0} | {
+        row["final_product_type_id"]
+        for row in c.execute(
+            "SELECT final_product_type_id FROM pipeline WHERE is_active = 1"
+        )
+    }
+
+
 def _final_margin_badges(c, ref, settings_, items) -> tuple[set, dict]:
     """(final_ids, final_net_margin) for run_detail. Finals badge
     (decision 2026-08-21): net proceeds after sell-side fees minus the
@@ -856,13 +2233,7 @@ def _final_margin_badges(c, ref, settings_, items) -> tuple[set, dict]:
     # ACTIVE finals (covers dual-role finals, whose merged depth is >= 1
     # because another chain consumes them; matching the engine's rule
     # for current runs).
-    final_ids = {i["type_id"] for i in items if i["depth"] == 0}
-    final_ids |= {
-        row["final_product_type_id"]
-        for row in c.execute(
-            "SELECT final_product_type_id FROM pipeline WHERE is_active = 1"
-        )
-    }
+    final_ids = _final_ids(c, items)
     final_net_margin = {}
     for i in items:
         if (
@@ -962,6 +2333,7 @@ def _settings_save(c, form):
         "skill_outpost_construction = ?, "
         "count_fitted_stock = ?, "
         "structure_freight_in_isk_per_m3 = ?, structure_buy_enabled = ?, "
+        "freight_in_default_isk_per_m3 = ?, "
         "skill_encryption = ?, "
         "t1_bpc_overbuild = ?, t2_bpc_overbuild = ?, "
         "compressed_minerals_enabled = ?, compressed_moon_enabled = ?, "
@@ -1020,6 +2392,15 @@ def _settings_save(c, form):
                 else 0.0
             ),
             1 if form.get("structure_buy_enabled") else 0,
+            # Revision 4 (user ruling 2026-09-28): the inbound rate of a
+            # purchase at neither Jita 4-4 nor the structure market —
+            # parsed like its structure sibling (blank → 0, never
+            # negative).
+            (
+                max(0.0, _form_number(form, "freight_in_default"))
+                if (form.get("freight_in_default") or "").strip()
+                else 0.0
+            ),
             min(5, max(0, int_field("skill_encryption"))),
             min(10.0, max(1.0, pct_field("t1_overbuild_pct"))),
             min(10.0, max(1.0, pct_field("t2_overbuild_pct"))),
@@ -1362,6 +2743,14 @@ def create_app() -> Flask:
     @app.template_filter("qty")
     def qty(value):
         return f"{value:,}" if value is not None else "—"
+
+    @app.template_filter("isk_unit")
+    def isk_unit(value):
+        """A UNIT price at full precision (v1.29 Buy tab): `isk` rounds to
+        whole ISK, which renders a mineral at 4.87 and one at 5.02 alike —
+        and telling those apart is what that tab is for. Tooltips only:
+        the visible cell stays abbreviated (the Full-Figure Rule)."""
+        return f"{value:,.2f}" if value is not None else "—"
 
     @app.template_filter("isk_short")
     def isk_short(value):
@@ -2262,13 +3651,25 @@ def create_app() -> Flask:
         c = conn()
         if request.method == "POST":
             try:
-                return _settings_save(c, request.form)
+                response = _settings_save(c, request.form)
             except ValueError as exc:
                 # One bad field ("1,5b", an emptied autofill) must not
                 # 500 and discard the whole ~40-field save — flash which
                 # input was bad, like the pipeline-paste path does.
                 flash(f"invalid number in {exc} — nothing was saved")
                 return redirect(url_for("settings"))
+            # Revision 4 (contract review A12): the matcher's lines read
+            # settings — the purchase venues (price region, structure
+            # market), the unplanned-ore conversion (yields, refining tax)
+            # and, on runs planned before their columns, the live inbound
+            # rates — so re-derive them now rather than leave the Buy tab
+            # stale until the next ESI update. Executed runs keep their
+            # frozen conversions (buying's A9 freeze). A failure is
+            # flashed; the save itself has already committed.
+            message, ok = _assign_purchases(c)
+            if not ok and message:
+                flash(message)
+            return response
         settings_obj = store.get_settings(c)
         return render_template(
             "settings.html",
@@ -2414,7 +3815,8 @@ def create_app() -> Flask:
     @app.post("/characters/<int:character_id>/toggle/<flag>")
     def character_toggle(character_id, flag):
         if flag not in (
-            "include_assets", "include_job_slots", "count_assets", "count_sales"
+            "include_assets", "include_job_slots", "count_assets",
+            "count_sales", "count_buys",
         ):
             abort(400)
         c = conn()
@@ -2424,6 +3826,8 @@ def create_app() -> Flask:
             (character_id,),
         )
         c.commit()
+        if flag == "count_buys":
+            _rematch_after_buys_toggle(c)
         return redirect(url_for("characters"))
 
     @app.post("/characters/<int:character_id>/delete")
@@ -2493,7 +3897,18 @@ def create_app() -> Flask:
             "UPDATE sale_contract SET via_character_id = NULL WHERE via_character_id = ?",
             (character_id,),
         )
+        # v1.29 revision 3 (C9): the bought side keeps the same column.
+        c.execute(
+            "UPDATE buy_contract SET via_character_id = NULL WHERE via_character_id = ?",
+            (character_id,),
+        )
         c.commit()
+        # A character that left the pool no longer counts its buys
+        # (store.buys_enabled_owners) and no longer makes a contract
+        # internal, exactly like a Count buys toggle: re-match now, or its
+        # lines keep costing runs until the next ESI update (review
+        # 2026-09-28).
+        _rematch_after_buys_toggle(c)
 
         message = f"removed {row['character_name']}"
         if stranded:
@@ -2514,7 +3929,10 @@ def create_app() -> Flask:
 
     @app.post("/corps/<int:corporation_id>/toggle/<flag>")
     def corp_toggle(corporation_id, flag):
-        if flag not in ("count_assets", "count_wallet", "count_jobs", "count_sales"):
+        if flag not in (
+            "count_assets", "count_wallet", "count_jobs", "count_sales",
+            "count_buys",
+        ):
             abort(400)
         c = conn()
         c.execute(
@@ -2523,7 +3941,20 @@ def create_app() -> Flask:
             (corporation_id,),
         )
         c.commit()
+        if flag == "count_buys":
+            _rematch_after_buys_toggle(c)
         return redirect(url_for("characters"))
+
+    def _rematch_after_buys_toggle(c) -> None:
+        """Count buys is honoured when purchases are matched (contract
+        review C7: buys are always stored), so the runs' purchase lines —
+        and the realized cost they feed — only follow the toggle on a
+        matching pass. Matching reads local rows only, so run it now rather
+        than leave the Buy tab stale until the next ESI update. A failure
+        is flashed; the toggle itself has already committed."""
+        message, ok = _assign_purchases(c)
+        if not ok and message:
+            flash(message)
 
     @app.route("/sso/login")
     def sso_login():
@@ -2590,15 +4021,29 @@ def create_app() -> Flask:
 
     @app.post("/esi/refresh")
     def esi_refresh():
-        """Three independently guarded steps: the slow snapshot pull
-        (assets, jobs, wallets), the Ledger's sales pull (v1.27.0), then
-        the price refresh (user request 2026-09-08 — one button keeps the
-        Ledger's quotes, undercut verdicts and contract splits current).
+        """Five independently guarded steps: the slow snapshot pull
+        (assets, jobs, wallets), the Ledger's sales pull (v1.27.0 — since
+        v1.29 revision 3 it also stores the pool's wallet BUYS and the item
+        exchanges it accepted), the price refresh (user request 2026-09-08
+        — one button keeps the Ledger's quotes, undercut verdicts and
+        contract splits current), the re-plan of the open run in place
+        (v1.29 revision 6, user ruling R1 2026-09-28 — _replan_open_run:
+        one run per buying cycle, kept live; skipped with a note when no
+        run is open, the snapshot did not refresh or there is nothing to
+        plan from — since revision 7 (user ruling 2026-09-29) never
+        because the cycle's final jobs are installing: the plan counts
+        them as this cycle's wave and sizes the rest), then purchase
+        matching
+        (buying.assign_purchases, contract review C1): it runs AFTER the
+        prices so a bought contract's reference prices (R7) come from this
+        refresh, and even when ESI is down, since it reads local rows only.
         The snapshot has committed before the sales step starts, the sales
         step never raises for scope, role, token, rate-limit or network
-        trouble (each owner × family records its own status), and a price
-        failure only leaves the cache unchanged, so no step can lose
-        another's data. One flash carries all three outcomes;
+        trouble (each owner × family records its own status), a price
+        failure only leaves the cache unchanged, a re-plan failure rolls
+        back and leaves the run's previous plan, and a matching failure
+        leaves every run's purchases as they were, so no step can lose
+        another's data. One flash carries all five outcomes;
         `next=ledger` returns to the Ledger tab instead of the dashboard."""
         import time as _time
 
@@ -2614,9 +4059,11 @@ def create_app() -> Flask:
             return redirect(target)
         parts = []
         esi_down = False
+        snapshot_fresh = False
         t0 = _time.monotonic()
         try:
             state = esi.refresh_state(conn(), ref())
+            snapshot_fresh = True
             parts.append(
                 f"ESI refreshed in {_time.monotonic() - t0:.0f}s: "
                 f"{len(state['on_hand'])} types on hand, "
@@ -2661,6 +4108,14 @@ def create_app() -> Flask:
                 log.exception("price refresh failed")
                 price_message = f"price refresh failed ({exc}) — cached prices are unchanged"
             parts.append(price_message)
+        # v1.29 revision 6 (ruling R1): the open run follows the update —
+        # re-planned in place from what was just pulled, BEFORE matching,
+        # so contract k and the unplanned-ore conversion see the fresh
+        # plan. Guarded inside; its clause says when and why it skipped.
+        parts.append(_replan_open_run(conn(), snapshot_fresh))
+        match_message, _ok = _assign_purchases(conn())
+        if match_message:
+            parts.append(match_message)
         flash(" — ".join(parts))
         return redirect(target)
 
@@ -2681,6 +4136,18 @@ def create_app() -> Flask:
         # an empty market set means there is nothing at all to price.
         type_ids = engine.demand_type_ids(c, r)
         market_ids = engine.market_type_ids(c, r)
+        # v1.29 revision 3 (contract review C10.1): a bought contract's
+        # items are priced by reference (R7) — Jita's best sell, else CCP's
+        # adjusted price. Only the demand set has sell rows, so every item
+        # outside the plan leans on the adjusted fallback; without its
+        # adjusted price it would be unpriced and the contract's whole ISK
+        # would land on the plan's items. CCP's bulk feed already carries
+        # every type: widening the stored set costs no extra call.
+        adjusted_ids = set(type_ids) | {
+            row[0] for row in c.execute(
+                "SELECT DISTINCT type_id FROM buy_contract_item"
+            )
+        }
         if not market_ids:
             return "nothing to price — add or activate a pipeline first", False
         settings_ = store.get_settings(c)
@@ -2695,11 +4162,33 @@ def create_app() -> Flask:
         # candidates included) also persists its hub SELL ladder — the
         # depth the sourcing pass walks. Same paged pull, rows only.
         ladder_ids = set(market_ids)
+        # v1.29 revision 4 (contract §5, review A14): the contract items
+        # still waiting to be priced get a Jita order-book pull too, so k
+        # spreads a contract of ore the plan never considered over a real
+        # Jita sell quote rather than CCP's adjusted price. Order books
+        # only: NOT raw_leaves (R7 drops region-wide rows anyway, C10.2)
+        # and NOT ladder_ids (a kit's items need no stored ladder). Bounded
+        # to unfrozen contracts' received non-BPC items — each id is one
+        # more pull, and a priced contract never re-prices. The ESI update
+        # pulls the ledger, then prices, then matches, so a contract
+        # pulled in an update is quoted before it is priced and frozen.
+        # Known limit: under the Max Buy Order hub basis the pull is the
+        # 'buy' side only, so there is no sell row and R7 keeps the
+        # adjusted fallback.
+        contract_ids = {
+            row[0] for row in c.execute(
+                "SELECT DISTINCT i.type_id FROM buy_contract_item i "
+                "JOIN buy_contract bc USING (contract_id) "
+                "WHERE bc.priced_at IS NULL AND bc.items_status = 'ok' "
+                "AND i.is_included = 1 "
+                "AND COALESCE(i.raw_quantity, 0) != -2"
+            )
+        }
         try:
             fetched, skipped, fresh = market.refresh_prices(
                 c,
                 settings_.price_region_id,
-                market_ids,
+                sorted(set(market_ids) | contract_ids),
                 settings_.price_source,
                 fallback_type_ids=raw_leaves,
                 fallback_region_id=settings_.price_region_id,
@@ -2712,7 +4201,7 @@ def create_app() -> Flask:
             ), False
         try:
             n_adjusted = market.store_adjusted_prices(
-                c, type_ids, market.fetch_adjusted_prices()
+                c, adjusted_ids, market.fetch_adjusted_prices()
             )
         except httpx.HTTPError as exc:
             return (
@@ -3013,8 +4502,9 @@ def create_app() -> Flask:
                 settings=settings_,
                 reason="no price data yet — run a price refresh first",
             )
-        # Raw settings pools, not snapshot_from_state's overhang-netted
-        # ones: steady state assumes the pools are free each cycle.
+        # The settings' pools — what snapshot_from_state also hands the
+        # index run since v1.29 revision 6 (ruling R2): steady state
+        # assumes the pools are free each cycle.
         snapshot = engine.Snapshot(
             slots_available={
                 config.ACTIVITY_MANUFACTURING: settings_.manufacturing_slots,
@@ -3031,35 +4521,33 @@ def create_app() -> Flask:
             "planning_slots.html", **_planning_context(r, plan, settings_)
         )
 
-    @app.post("/run")
-    def run_plan():
-        """Plan from the last stored ESI snapshot and the price cache —
-        fast, no network at all."""
-        c = conn()
-        if not sde_ready():
-            flash(
-            "download the game data first — the dashboard checklist "
-            "has the button"
-        )
-            return redirect(url_for("dashboard"))
-        r = ref()
+    def _plan_inputs(c, r, settings_):
+        """(snapshot, skip, notes): everything plan_index_run reads, built
+        ONE way for the ▶ Plan button and the ESI update's re-plan (v1.29
+        revision 6, contract review A4), so the two can never plan
+        differently. `skip` is None, or (kind, message) — kind
+        'pipelines' / 'prices' / 'esi' — when there is nothing to plan
+        from; `notes` are warnings to flash beside the plan (the Max Buy
+        structure basis with no cached buy orders). Local rows only: no
+        network."""
         # Explicit active check: demand_type_ids is no longer a proxy for
         # it — a capable INACTIVE pipeline contributes invention price ids,
         # and planning a run against zero active pipelines would persist an
         # empty run.
         type_ids = engine.demand_type_ids(c, r)
-        if not store.active_pipelines(c):
-            flash("no active pipelines — add one first")
-            return redirect(url_for("pipelines"))
-        settings_ = store.get_settings(c)
+        active = store.active_pipelines(c)
+        if not active:
+            return None, ("pipelines", "no active pipelines — add one first"), []
         # v1.10: per type, the cheaper LANDED of the hub quote and the
         # structure market's sell ladder (finals always keep the hub quote).
         prices, buy_venue, structure_units_cheaper, region_wide, adjusted = (
             _price_maps(c, r, settings_, type_ids)
         )
         if not prices:
-            flash("no price data yet — run a price refresh first")
-            return redirect(url_for("dashboard"))
+            return None, (
+                "prices", "no price data yet — run a price refresh first"
+            ), []
+        notes = []
         # v1.25: every demanded type's sell ladders, per venue, for the
         # sourcing pass (fill pricing + compressed substitution).
         sell_ladders = market.sell_ladders(c, settings_, type_ids)
@@ -3093,7 +4581,7 @@ def create_app() -> Flask:
             # The buy side of the structure book is cached only by a
             # structure refresh made since the basis existed: say so
             # rather than let the venue vanish from the plan silently.
-            flash(
+            notes.append(
                 f"{settings_.structure_market_label()} has no cached buy "
                 "orders yet — refresh the structure market for the Max Buy "
                 "Order basis; this plan priced nothing there"
@@ -3114,22 +4602,21 @@ def create_app() -> Flask:
             # capital-class hulls, which `prices` never carries).
             sell_quotes={
                 t: price
-                for t in {
-                    p["final_product_type_id"]
-                    for p in store.active_pipelines(c)
-                }
-                for price in (ledger.final_quote(c, ref(), settings_, t)[0],)
+                for t in {p["final_product_type_id"] for p in active}
+                for price in (ledger.final_quote(c, r, settings_, t)[0],)
                 if price is not None
             },
         )
         if snapshot is None:
-            flash("no ESI data yet — run an ESI update first")
-            return redirect(url_for("dashboard"))
-        plan = engine.plan_index_run(c, r, snapshot)
+            return None, ("esi", "no ESI data yet — run an ESI update first"), notes
+        return snapshot, None, notes
+
+    def _plan_stamps(c, settings_) -> list[str]:
+        """How old each cache that drove a plan's buy quotes is — the
+        prices, and the structure market when the comparison is on."""
         _n, latest = market.price_cache_state(
             c, settings_.price_region_id, settings_.price_source
         )
-        # Both caches drove this plan's buy quotes: say how old each is.
         stamps = []
         if latest:
             stamps.append(f"prices as of {latest[:16].replace('T', ' ')} UTC")
@@ -3143,11 +4630,297 @@ def create_app() -> Flask:
                 if latest_structure
                 else f"{label} market never pulled"
             )
+        return stamps
+
+    def _plan_summary(plan) -> str:
+        """"N buys, M jobs" — the re-plan's flash clause."""
+        items = plan.items.values()
+        buys = sum(
+            1 for i in items
+            if (i.recommended_buy_qty or 0) > 0
+            or (getattr(i, "compressed_covered_qty", 0) or 0) > 0
+        )
+        jobs = sum(int(i.jobs_allocated or 0) for i in items)
+        return (
+            f"{buys} buy{'s' if buys != 1 else ''}, "
+            f"{jobs} job{'s' if jobs != 1 else ''}"
+        )
+
+    def _replan_open_run(c, snapshot_fresh: bool) -> str:
+        """The ESI update's re-plan step (v1.29 revision 6, user ruling R1
+        2026-09-28): re-plan the open run IN PLACE from the stock, jobs and
+        prices this update just pulled, so every tab reads the cycle as it
+        stands now. Returns the flash clause; never raises.
+
+        The open run is buying.collecting_run_id — the newest run while it
+        is not executed (contract review A1), the same run the matcher
+        files purchases under and a superseded run's Buy tab points at.
+        Skipped, with a clause saying why (A4): no open run (after Mark
+        executed — ▶ Plan opens the next cycle); the snapshot step did not
+        succeed in THIS request (re-planning from the previous snapshot
+        would move planned_start past purchases the plan never saw);
+        nothing to plan from (no active pipelines, prices or snapshot).
+        A failure rolls back — the engine already rolled its own write
+        back — and leaves the run's previous plan in place; a ValueError
+        (the run was executed or a newer one made meanwhile) is a skip.
+
+        Revision 7 (user ruling 2026-09-29, "the real fix"): no stop rule
+        any more. Revision 6 skipped this re-plan once the cycle's final
+        jobs were installing (review B1), because a final was planned at
+        its full requested quantity whatever its own jobs in flight. Now
+        the plan passes _cycle_cut: final jobs started after it are THIS
+        cycle's wave (engine Phase 4 sizes only the rest, and the
+        intermediates below keep their targets), so a re-plan after the
+        installs plans the remainder, not the wave again."""
+        try:
+            open_id = buying.collecting_run_id(c)
+        except Exception as exc:  # noqa: BLE001 — the sales-step precedent
+            log.exception("finding the open run failed")
+            return f"re-plan skipped ({exc})"
+        if open_id is None:
+            if c.execute("SELECT 1 FROM index_run LIMIT 1").fetchone() is None:
+                return (
+                    "no open run to re-plan — ▶ Plan index run plans the "
+                    "first cycle"
+                )
+            return (
+                "no open run to re-plan — the newest run is executed; "
+                "▶ Plan index run opens the next cycle"
+            )
+        number = c.execute(
+            "SELECT run_number FROM index_run WHERE index_run_id = ?",
+            (open_id,),
+        ).fetchone()[0]
+        if not snapshot_fresh:
+            return (
+                f"run {number} not re-planned — the ESI snapshot did not "
+                "refresh, so it keeps its previous plan"
+            )
+        try:
+            r = ref()
+            settings_ = store.get_settings(c)
+            snapshot, skip, notes = _plan_inputs(c, r, settings_)
+            if skip is not None:
+                return f"run {number} not re-planned — {skip[1]}"
+            plan = engine.plan_index_run(
+                c, r, snapshot, replace_index_run_id=open_id,
+                cycle_cut=_cycle_cut(c),
+            )
+        except ValueError as exc:
+            return f"run {number} not re-planned — {exc}"
+        except Exception as exc:  # noqa: BLE001 — the sales-step precedent
+            log.exception("re-plan failed")
+            try:
+                c.rollback()
+            except sqlite3.Error:
+                pass
+            return (
+                f"re-plan failed ({exc}) — run {number} keeps its previous "
+                "plan"
+            )
+        message = f"run {plan.run_number} re-planned: {_plan_summary(plan)}"
+        if notes:
+            message += " — " + "; ".join(notes)
+        return message
+
+    @app.post("/run")
+    def run_plan():
+        """▶ Plan index run — from the last stored ESI snapshot and the
+        price cache: fast, no network at all.
+
+        v1.29 revision 6 (user ruling R1 2026-09-28: one run per buying
+        cycle, kept live): while a run is open (buying.collecting_run_id —
+        the newest run, not executed) the button re-plans it IN PLACE
+        (engine.plan_index_run's replace_index_run_id: same id and run
+        number, planned_start moved to the stored snapshot's fetched_at —
+        costing's pre-plan cut, so purchases made since that snapshot stay
+        post-plan (review 2026-09-28) — purchases kept); a NEW run is
+        created only when none is open, i.e. after Mark executed.
+
+        Revision 7 (user ruling 2026-09-29): it passes the same
+        _cycle_cut as the ESI update's re-plan, so final jobs started
+        inside the current buying cycle count as this cycle's wave and
+        the plan sizes only the rest."""
+        c = conn()
+        if not sde_ready():
+            flash(
+            "download the game data first — the dashboard checklist "
+            "has the button"
+        )
+            return redirect(url_for("dashboard"))
+        r = ref()
+        settings_ = store.get_settings(c)
+        snapshot, skip, notes = _plan_inputs(c, r, settings_)
+        for note in notes:
+            flash(note)
+        if skip is not None:
+            kind, message = skip
+            flash(message)
+            return redirect(
+                url_for("pipelines") if kind == "pipelines"
+                else url_for("dashboard")
+            )
+        open_id = buying.collecting_run_id(c)
+        try:
+            plan = engine.plan_index_run(
+                c, r, snapshot, replace_index_run_id=open_id,
+                cycle_cut=_cycle_cut(c),
+            )
+        except ValueError as exc:
+            # The open run was executed (or a newer one made) while this
+            # plan ran: nothing changed — say so and show the runs.
+            flash(f"run not re-planned — {exc}; nothing changed")
+            return redirect(url_for("runs"))
+        # A plan moves the buying windows (a new run opens its own, R2; a
+        # re-plan moves planned_start, which the windows no longer read
+        # but the pre-plan cut does): re-file the purchases now, before
+        # either tab is viewed (review 2026-09-28).
+        match_message, match_ok = _assign_purchases(c, settings_)
+        # Both caches drove this plan's buy quotes: say how old each is.
+        stamps = _plan_stamps(c, settings_)
         flash(
-            f"index run {plan.run_number} planned"
+            f"index run {plan.run_number} "
+            + ("re-planned in place" if open_id is not None else "planned")
             + (f" ({'; '.join(stamps)})" if stamps else "")
+            + (f" — {match_message}" if not match_ok and match_message else "")
         )
         return redirect(url_for("run_detail", index_run_id=plan.index_run_id))
+
+    # -- purchases from ESI (v1.29 revision 3, user rulings 2026-09-28) ------
+    #
+    # buying.assign_purchases derives every run's run_purchase lines from
+    # the stored wallet buys and accepted item exchanges (R1/R2). It runs
+    # from web.py only — never from ledger.pull_sales, which has no
+    # settings and which buying imports (contract review C1):
+    #   * as the fourth step of the ESI update;
+    #   * after every call that moves a cycle window or changes who counts
+    #     — planning a run, discarding one, run_complete / run_reopen, a
+    #     Count buys toggle, removing a character (review 2026-09-28);
+    #   * on a Buy tab view of a run with no derived lines, but only when
+    #     the pass's inputs changed since the last successful pass (the
+    #     stamp below) — a safety net for a pass that failed or a process
+    #     restart, never a write on every view.
+    # Every call is guarded: matching reads local rows only, and a fault in
+    # it must never cost the refresh, the completion or the page that
+    # triggered it. buying is imported with the other modules: an import
+    # error is a packaging bug that must fail at start-up, not hide as a
+    # silently skipped step.
+    purchase_pass = {"stamp": None}
+
+    def _purchase_inputs_stamp(c) -> tuple:
+        """Everything a matching pass reads, bar what the pass itself
+        writes (a contract's k / priced_at / excluded, the run_purchase
+        lines): the ingest tables' extent, the runs and their windows,
+        who counts, who is internal and the price cache's age. Equal
+        stamps mean a new pass would change nothing.
+
+        Revision 4 (contract review A12): plus the settings the pass reads
+        — the price region and source and the structure market (purchase
+        venues, reference prices), the compressed yields and refining tax
+        (the unplanned-ore conversion) and the three live inbound rates
+        (runs planned before their columns fall back to them)."""
+        return (
+            tuple(c.execute(
+                "SELECT price_region_id, price_source, capital_market_mode, "
+                "capital_structure_id, compressed_ore_yield, "
+                "compressed_gas_yield, compressed_reprocess_tax, "
+                "freight_in_isk_per_m3, structure_freight_in_isk_per_m3, "
+                "freight_in_default_isk_per_m3 FROM settings WHERE id = 1"
+            ).fetchone() or ()),
+            tuple(c.execute(
+                "SELECT COUNT(*), MAX(transaction_id), MAX(fetched_at) "
+                "FROM buy_transaction").fetchone()),
+            tuple(c.execute(
+                "SELECT COUNT(*), MAX(last_seen_at), MAX(items_fetched_at), "
+                "SUM(items_status = 'ok') FROM buy_contract").fetchone()),
+            tuple(c.execute("SELECT COUNT(*) FROM buy_contract_item").fetchone()),
+            tuple(
+                tuple(r) for r in c.execute(
+                    "SELECT index_run_id, run_number, status, planned_start, "
+                    "completed_at FROM index_run ORDER BY index_run_id")
+            ),
+            tuple(sorted(store.buys_enabled_owners(c))),
+            tuple(sorted(ledger.internal_ids(c))),
+            tuple(c.execute("SELECT MAX(fetched_at) FROM market_price").fetchone()),
+        )
+
+    def _assign_purchases(c, settings_=None) -> tuple[str | None, bool]:
+        """Run buying.assign_purchases once; (flash text, ok). The text is
+        None when there is nothing worth saying (no game data yet to
+        resolve venues against)."""
+        if not sde_ready():
+            return None, True
+        try:
+            summary = buying.assign_purchases(
+                c, ref(), settings_ or store.get_settings(c)
+            )
+        except Exception as exc:  # noqa: BLE001 — the sales-step precedent
+            log.exception("purchase matching failed")
+            try:
+                c.rollback()
+            except sqlite3.Error:
+                pass
+            return (
+                f"purchase matching failed ({exc}) — each run keeps the "
+                "purchases it had"
+            ), False
+        try:
+            purchase_pass["stamp"] = _purchase_inputs_stamp(c)
+        except sqlite3.Error:  # the stamp only saves a later view a pass
+            purchase_pass["stamp"] = None
+        return buying.summary_line(summary), True
+
+    def _assign_on_first_view(c, index_run_id, settings_) -> None:
+        """§4: match purchases when a Buy tab opens on a run that has no
+        derived lines yet, provided ESI has delivered any purchase at all
+        — so an empty pool never writes on a page view — and provided the
+        pass's inputs changed since the last successful pass (review
+        2026-09-28). Without that last test every view of a run whose
+        window simply holds no costed purchase (an executed run older than
+        ESI's wallet history, the newest plan before anything is bought)
+        re-ran a BEGIN IMMEDIATE pass over every run."""
+        if c.execute(
+            "SELECT 1 FROM run_purchase WHERE index_run_id = ? "
+            "AND esi_kind IS NOT NULL LIMIT 1",
+            (index_run_id,),
+        ).fetchone() is not None:
+            return
+        if (
+            c.execute("SELECT 1 FROM buy_transaction LIMIT 1").fetchone() is None
+            and c.execute("SELECT 1 FROM buy_contract LIMIT 1").fetchone() is None
+        ):
+            return
+        if (
+            purchase_pass["stamp"] is not None
+            and purchase_pass["stamp"] == _purchase_inputs_stamp(c)
+        ):
+            return
+        _assign_purchases(c, settings_)
+
+    def _run_purchase_records(c, index_run_id):
+        """buying.run_purchase_records for the Buy tab's Purchases section,
+        or None when the reader fails — the tab then lists the run's
+        derived lines instead of failing."""
+        try:
+            return buying.run_purchase_records(c, index_run_id)
+        except Exception:  # noqa: BLE001 — the page still renders
+            log.exception("reading the run's purchase records failed")
+            return None
+
+    def _purchases_owner(c, index_run_id):
+        """The run a SUPERSEDED run's buying cycle went to (C4): the newest
+        run while it is still a plan, else None — purchases after the last
+        executed run wait for the next plan. The run comes from
+        buying.collecting_run_id, so the pointer and the matcher can never
+        disagree about where the purchases went."""
+        owner_id = buying.collecting_run_id(c)
+        if owner_id is None or owner_id == index_run_id:
+            return None
+        return c.execute(
+            "SELECT index_run_id, run_number, status FROM index_run "
+            "WHERE index_run_id = ?",
+            (owner_id,),
+        ).fetchone()
 
     def _mark_superseded(rows):
         """Derived, never stored: a non-complete run is superseded when any
@@ -3200,6 +4973,10 @@ def create_app() -> Flask:
         # Executed runs are cost history — never deletable, from any path.
         if run["status"] == "complete":
             abort(400)
+        # v1.29: the run's purchase lines go first — connections open with
+        # PRAGMA foreign_keys = ON, and run_purchase references index_run
+        # (A29; only planned/active runs ever reach here).
+        store.delete_run_purchases(c, index_run_id)
         c.execute(
             "DELETE FROM index_run_item_pipeline WHERE index_run_item_id IN "
             "(SELECT index_run_item_id FROM index_run_item "
@@ -3218,7 +4995,14 @@ def create_app() -> Flask:
             "DELETE FROM index_run WHERE index_run_id = ?", (index_run_id,)
         )
         c.commit()
-        flash(f"run {run['run_number']} discarded")
+        # Discarding the newest plan makes the previous run the newest
+        # again, which moves its window (R2): re-file now (review
+        # 2026-09-28), as run_complete / run_reopen do.
+        message = f"run {run['run_number']} discarded"
+        match_message, ok = _assign_purchases(c)
+        if not ok and match_message:
+            message += f" — {match_message}"
+        flash(message)
         return redirect(url_for("runs"))
 
     def _run_profit_context(run, index_run_id) -> dict:
@@ -3310,22 +5094,39 @@ def create_app() -> Flask:
         ).fetchall()
         settings_ = store.get_settings(c)
         bc = _buy_context(items, ref())
+        if request.args.get("view") == "buy":
+            # §4 / C1: a run with no derived lines is matched on view —
+            # only when there is anything to match and the inputs moved
+            # since the last pass (_assign_on_first_view).
+            if not superseded:
+                _assign_on_first_view(c, index_run_id, settings_)
+            return render_template(
+                "run_buy.html",
+                run=run,
+                superseded=superseded,
+                purchases_owner=(
+                    _purchases_owner(c, index_run_id) if superseded else None
+                ),
+                settings=settings_,
+                **_buy_tab_context(
+                    run, items, ref(), settings_, c, bc,
+                    esi_records=_run_purchase_records(c, index_run_id),
+                    superseded=superseded,
+                ),
+            )
         unmet = [i for i in items if _unmet_row(i)]
         unmet_qty = {i["type_id"]: _unmet_qty(i) for i in unmet}
-        builds_reaction = [
-            i
-            for i in items
-            if (i["recommended_build_qty"] or 0) > 0
-            and i["activity_id"] == 11
-            and not i["alchemy_for_type_id"]
-        ]
         alchemy = _alchemy_section(ref(), settings_, items)
-        compressed_section = _compressed_section(
-            ref(), items, bc["compressed"]
-        )
         final_ids, final_net_margin = _final_margin_badges(
             c, ref(), settings_, items
         )
+        # Revision 7 (contract review amendment 9): a final whose whole
+        # wave is installed this cycle builds nothing, so it would drop
+        # out of both job tables — exactly when its "installed N/M" cue
+        # matters. _job_rows keeps it, with no job to run.
+        builds_mfg = _job_rows(items, 1, final_ids)
+        builds_reaction = _job_rows(items, 11, final_ids)
+        window = buying.run_window(c, index_run_id)
         template = (
             "run_chain.html" if request.args.get("view") == "chain"
             else "run_detail.html"
@@ -3335,39 +5136,31 @@ def create_app() -> Flask:
             run=run,
             superseded=superseded,
             final_ids=final_ids,
-            region_wide=bc["region_wide"],
             items=items,
             final_net_margin=final_net_margin,
+            # v1.29 (ruling 2026-09-24): purchasing lives on the Buy tab.
+            # `buys` survives here for the wallet stat alone (its count and
+            # the "exceeds wallets" badge); every other buy-side key —
+            # venue_qty, the Multibuy blocks, the compressed section, the
+            # unpriced / split / unsourced / via-compressed counts — is
+            # passed to run_buy.html instead and nothing on this page or
+            # the Stockpile tab reads it any more.
             buys=bc["buys"],
-            builds=bc["builds_mfg_all"],
+            builds=builds_mfg,
             reactions=builds_reaction,
-            builds_grouped=_group_by_category(ref(), bc["builds_mfg_all"]),
+            builds_grouped=_group_by_category(ref(), builds_mfg),
             reactions_grouped=_group_by_category(ref(), builds_reaction),
+            cycle_cut_label=_cut_label(window.lo) if window else None,
             struct_builds=bc["struct_builds"],
             struct_buys=bc["struct_buys"],
             struct_slots=bc["struct_slots"],
             alchemy=alchemy,
             alchemy_yield=settings_.alchemy_reprocess_yield,
-            compressed=bc["compressed"],
-            compressed_section=compressed_section,
-            compressed_covered=bc["compressed_covered"],
-            compressed_saving=(
-                run["compressed_saving_isk"]
-                if "compressed_saving_isk" in run.keys()
-                else None
-            ),
             **_chain_context(ref(), items),
             **_install_context(ref(), settings_, items),
             unmet=unmet,
             low_stock=[i for i in items if i["low_stock"]],
             buy_total=bc["buy_total"],
-            buys_unpriced=bc["buys_unpriced"],
-            multibuy_hub=bc["multibuy_hub"],
-            multibuy_structure=bc["multibuy_structure"],
-            structure_buys=bc["structure_buys"],
-            split_buys=bc["split_buys"],
-            venue_qty=bc["venue_qty"],
-            unsourced=bc["unsourced"],
             settings=settings_,
             # v1.27.1: the strip counts the jobs to RUN NOW, the plan's
             # allocation beside it where stock feeds fewer — against the
@@ -3375,9 +5168,9 @@ def create_app() -> Flask:
             # figure on runs planned before it was persisted).
             mfg_pool=_run_pool(run, "manufacturing_slots_available", settings_.manufacturing_slots),
             reaction_pool=_run_pool(run, "reaction_slots_available", settings_.reaction_slots),
-            mfg_slots_used=sum(_jobs_to_run(i) for i in bc["builds_mfg_all"]),
+            mfg_slots_used=sum(_jobs_to_run(i) for i in builds_mfg),
             mfg_slots_planned=sum(
-                i["jobs_allocated"] or 0 for i in bc["builds_mfg_all"]
+                i["jobs_allocated"] or 0 for i in builds_mfg
             ),
             reaction_slots_used=sum(_jobs_to_run(i) for i in builds_reaction),
             reaction_slots_planned=sum(
@@ -3473,7 +5266,16 @@ def create_app() -> Flask:
             (index_run_id,),
         )
         c.commit()
-        flash("run marked executed — it now feeds cost history")
+        # Executing closes this run's buying cycle at completed_at (R2):
+        # re-file the purchases now, not at the next ESI update (C1).
+        message = (
+            "run marked executed — it now feeds cost history; "
+            "▶ Plan index run opens the next cycle"
+        )
+        match_message, ok = _assign_purchases(c)
+        if not ok:
+            message += f" — {match_message}"
+        flash(message)
         return redirect(url_for("run_detail", index_run_id=index_run_id))
 
     @app.post("/runs/<int:index_run_id>/reopen")
@@ -3510,7 +5312,20 @@ def create_app() -> Flask:
             (index_run_id,),
         )
         c.commit()
-        flash("run reopened — excluded from cost history")
+        # Reopening moves the window bound back (R2): re-file now (C1).
+        message = "run reopened — excluded from cost history"
+        # v1.29 revision 6 (contract review A6): reopening the newest run
+        # makes it the OPEN run again, and the next ESI update re-plans it
+        # in place — its executed plan is not kept. Say so.
+        if buying.collecting_run_id(c) == index_run_id:
+            message += (
+                "; it is the open run again — the next ESI update re-plans "
+                "it from current stock"
+            )
+        match_message, ok = _assign_purchases(c)
+        if not ok:
+            message += f" — {match_message}"
+        flash(message)
         return redirect(url_for("run_detail", index_run_id=index_run_id))
 
     return app

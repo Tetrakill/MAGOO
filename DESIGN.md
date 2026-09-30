@@ -386,7 +386,7 @@ and hover with the teal Hover Wash.
 - **Grouping:** stacked in `span.tags` inside the trailing table column.
 - **Fill-aware build-vs-buy (v1.26):** an accent `+buy N` badge on a job
   row means N units of that item are cheaper on the market than building
-  them and sit on the Buy list; the jobs build the rest. The Chain tab's
+  them and sit on the Buy list; the jobs build the rest. The Stockpile tab's
   `+buy` badge is accent for that case and warn for a capacity buy, its
   tooltip naming each part; `+unmet` (bad) means the jobs and the orders
   the market holds still fall short of the deficit. A price cell whose
@@ -437,7 +437,30 @@ and hover with the teal Hover Wash.
   needed` (missing scopes) and the sales feed statuses (`no scope`, `no
   role`, `partial`, `error`, `skipped`). Every one states its rule in
   `title`.
-- **Install check (v1.27.1, user ruling 2026-09-09):** the Plan tab's job
+- **Buy tab (v1.29):** row badges sit in the Item cell, beside the name —
+  a ruled exception to the trailing-column grouping above (user rulings
+  2026-09-28 / 2026-09-29) — and the Purchased cell carries none (it
+  reads `<units> @ <average landed unit>` or —). Item-cell badges:
+  neutral `in transit?` (Purchased and Remaining both above zero on the
+  live plan), neutral `not on the buy list`, `built` and `alchemy route`
+  (purchases the run records but does not cost), accent `N via
+  compressed` (a covered raw; the title names the ores and points at
+  Multibuy All), warn `N unsourced` and `unpriced`. The Purchases
+  section's source and status badges: accent `contract`, neutral
+  `recorded` (a line entered by hand before purchases were read from
+  ESI), neutral `given` / `copy` on a contract's items, accent `refined`
+  and `refined from <ore>`, neutral `outside the plan`, and each record's
+  status badge ("internal — not costed", "swap — not costed", "Count buys
+  off — not costed", …; neutral for bookkeeping, warn otherwise) stating
+  why it wrote no line. The strip adds `N
+  via <structure>`, `N split`, `N via compressed` (accent), warn `N
+  unpriced` / `N unsourced` / `N unpriced contract items` / `unallocated`,
+  and neutral `N units outside the plan`. The Profit breakdown's material
+  lines add good `bought` (priced from the ESI purchases of the run it
+  lags to), accent `delivered`, neutral `elsewhere` (bought at neither
+  market, landed at the default inbound rate) and warn `approx.` (a
+  pre-v1.29 compressed re-blend).
+- **Install check (v1.27.1, user ruling 2026-09-09):** the Industry Jobs tab's job
   tables show the jobs to RUN NOW. A row whose planned runs outrun the
   stock there to feed them reads the installable figures — Runs/job (an
   intermediate's uniform rounded-up count; for a ship or a saturating
@@ -537,9 +560,10 @@ cloned from an inline template, so the page never carries it.
 ### Disclosures
 `<details>` does triple duty: `details.muted`/`details.help` tuck methodology
 prose ("How this is computed") under a dim summary; a details block gates
-destructive bulk actions behind one extra click; `details#multibuy` holds
-read-only `textarea.multibuy` copy-paste blocks (10rem, mono) that
-select-all on click.
+destructive bulk actions behind one extra click; `details#multibuy`
+(Invention) and `details.multibuy-block` (Buy tab) hold read-only
+`textarea.multibuy` copy-paste blocks (10rem, mono) that select-all on
+click.
 
 ### Confirmation Dialog
 `dialog#confirm` (2026-09-01): every destructive or irreversible submit —
@@ -556,9 +580,13 @@ the pipeline delete.
 
 ### Collapsible Sections
 `details.section` (2026-09-01): every h2 section and h3 category group on
-the data tabs — Planning, Index Runs (Plan / Chain), Invention, Ledger
-(v1.27.0: products, open orders, sales ledger, order history) — is a
-native `<details>` that is **open by default**; the heading itself is the
+the data tabs — Planning, Index Runs (Industry Jobs / Buy / Stockpile),
+Invention, Ledger (v1.27.0: products, open orders, sales ledger, order
+history) — is a native `<details>`, **open by default** — except a
+section marked `data-default="closed"` (the Buy tab's groups nested
+under Input Materials, v1.29), which starts closed; the stored state is
+"open" or "closed", and on load only a value that differs from the
+section's default applies. The heading itself is the
 `<summary>` (native marker hidden), and its glyph shows the state: the
 subhead's accent ▸ turns ▾ when open, the h2 gains a dim one. A section the
 user closes stays closed for that page family (`data-key` + a
@@ -587,11 +615,11 @@ dismisses. Content cloned into dialogs is re-converted on open.
 
 ### Item Link
 `button.itemlink` — an item name that opens the shared deficit dialog on
-the run Plan tab. Text stays Frost with a dotted Slate Dim underline as
+the run Industry Jobs and Buy tabs. Text stays Frost with a dotted Slate Dim underline as
 the quiet affordance; teal arrives only on hover (the Signal Rule).
 
 ### Deficit Dialog
-One shared `dialog.breakdown` on the run Plan tab, filled from the clicked
+One shared `dialog.breakdown` on the run Industry Jobs and Buy tabs, filled from the clicked
 row's data attributes: the engine's three deficit rules rendered as an
 equation that actually sums (intermediates: target + planned draw − stock
 − jobs; raws: consumption + margin − stock; finals: always the full
@@ -601,7 +629,7 @@ cycle), the plan's answer line, and a "view in chain →" link to the
 ### Profit Breakdown Templates
 The profit pages render each pipeline's cost breakdown into an inert
 `<template>` and clone it into one shared `dialog.breakdown` on open —
-detail on demand never weighs the live DOM (the run Plan tab's shared
+detail on demand never weighs the live DOM (the run Industry Jobs and Buy tabs' shared
 deficit dialog proved the pattern). Cloned content is re-run through
 `initSortable()` and `convertTips()`.
 

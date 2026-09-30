@@ -3,7 +3,9 @@ reprocess it when cheaper landed than the raw minerals, moon materials and
 gas, Jita ladder depth walked. Reference data (candidates, portion sizes),
 the ladder fill helper, the hub ladder pull and cache, the engine's Phase
 7.5 pass, persistence and the realized costing, the templates and the
-settings save.
+settings save. Since v1.29 revision 6 (user ruling R3, 2026-09-28) also
+HANGAR compressed ore: it counts as the raws it reprocesses into
+(industry.refined_equivalents), on hand and off the buy.
 
 Same fixture pattern as test_alchemy: real reference data (the production
 SDE, read-only), temp state DB, FairValuePrices (every raw costs 10.0).
@@ -20,7 +22,7 @@ import threading
 import httpx
 import pytest
 
-from magoo import config, costing, engine, market, store
+from magoo import buying, config, costing, engine, industry, market, store
 from magoo.engine import Snapshot
 
 from conftest import FairValuePrices, template_app
@@ -206,14 +208,16 @@ def test_hub_ladder_quote_keeps_hub_station_rungs_in_price_order():
         {"price": 8.5, "location_id": config.JITA_44_STATION_ID, "volume_remain": 10},
         {"price": 8.0, "location_id": config.JITA_44_STATION_ID, "volume_remain": 0},
     ]
-    price, hub, ladder = market._hub_ladder_quote(
+    # v1.29: the seam also answers the hub's best BUY order from the same
+    # pull — a book of sell orders alone bids nothing.
+    price, hub, ladder, best_buy = market._hub_ladder_quote(
         _FakeClient(orders), config.THE_FORGE_REGION_ID, COMPRESSED_VELDSPAR,
         "sell", threading.Event(), None,
     )
     # The quote keeps the ordinary single-price contract (min over every
     # hub order — ESI never lists a zero-volume order in practice); the
     # ladder drops the empty rung.
-    assert (price, hub) == (8.0, 1)
+    assert (price, hub, best_buy) == (8.0, 1, None)
     assert ladder == [(8.5, 10, 1), (9.0, 40, 1)]
     assert market._order_prices(
         _FakeClient(orders), config.THE_FORGE_REGION_ID, COMPRESSED_VELDSPAR,
@@ -694,7 +698,7 @@ def test_persistence_and_realized_costing(conn, ref):
 
 
 def test_buy_context_decodes_compressed_rows(ref):
-    from magoo.web import _buy_context, _compressed_section
+    from magoo.web import _buy_context
 
     ore = {
         "type_id": COMPRESSED_VELDSPAR, "name": "Compressed Veldspar",
@@ -723,13 +727,9 @@ def test_buy_context_decodes_compressed_rows(ref):
     }
     assert bc["compressed_covered"] == {TRITANIUM: 1200}
     assert "Compressed Veldspar 500" in bc["multibuy_hub"]
-    section = _compressed_section(ref, [ore, trit], bc["compressed"])
-    assert section[0]["outputs"] == [
-        {"name": "Tritanium", "out": 1500, "used": 1200, "leftover": 300}
-    ]
 
 
-def test_run_detail_renders_compressed_section_and_badges(ref):
+def test_compressed_sourcing_left_the_industry_jobs_page(ref):
     from flask import render_template
 
     from test_buy_venue import _buy_row, settings_with
@@ -769,32 +769,26 @@ def test_run_detail_renders_compressed_section_and_badges(ref):
         alchemy_slots_used=0, region_wide=set(),
         compressed={COMPRESSED_VELDSPAR: [(TRITANIUM, "Tritanium", 1500, 1200)]},
         compressed_covered={TRITANIUM: 1200},
-        compressed_section=[{
-            "item": ore,
-            "outputs": [{"name": "Tritanium", "out": 1500, "used": 1200, "leftover": 300}],
-        }],
         compressed_saving=1500.0,
     )
     app = template_app()
     with app.test_request_context("/runs/1"):
         html = render_template("run_detail.html", **ctx)
-    assert "1 via compressed" in html
-    assert ">compressed</span>" in html
-    assert "covers 1,200 Tritanium; leftover 300 Tritanium" in html
-    assert "1,200 via compressed" in html
-    # No badge for a shrunk buy any more (v1.26.1); the figure stays in the
-    # compressed badge's tooltip for rows planned before the re-solve.
-    assert "cut short" not in html
-    assert "the plan wanted 600 but the market could fill only 500 in whole batches" in html
-    assert "Compressed sourcing" in html
-    assert "Reprocess <b>500 Compressed Veldspar</b>" in html
-    assert "~1,200 Tritanium" in html and "leftover +300 Tritanium" in html
-    # The v1.25.1 defaults, rendered exactly (the pct filter — 90.63, not
-    # a whole-percent rounding): 90.63% ore, 95% gas, 4% tax on refined
-    # ore only.
-    assert "90.63% for ore" in html and "95% for gas" in html
-    assert "4% reprocessing tax on every refined-ore output" in html
-    assert ">Compressed Veldspar 500\nTritanium 10</textarea>" in html
+    # v1.29 (ruling R2, 2026-09-24): compressed sourcing left the Industry
+    # Jobs page entirely — the badges are in the Buy tab's header, the ore
+    # is a line in that tab's per-group Multibuy, and the reprocess
+    # checklist (with the yields) moved under it. See
+    # tests/test_buy_tab.py::test_the_ore_is_listed_while_a_raw_it_covers_is_unlocked
+    # and ::test_the_ore_line_carries_the_compressed_badges_tooltip.
+    for gone in (
+        "1 via compressed", ">compressed</span>",
+        "covers 1,200 Tritanium; leftover 300 Tritanium",
+        "1,200 via compressed", "cut short", "the plan wanted 600",
+        "Compressed sourcing", "Reprocess <b>500 Compressed Veldspar</b>",
+        "90.63% for ore", "4% reprocessing tax on every refined-ore output",
+        "<textarea",
+    ):
+        assert gone not in html, gone
 
 
 def test_settings_save_and_render(seeded_client, ref):
@@ -856,7 +850,8 @@ def test_run_route_sources_compressed_end_to_end(seeded_client, ref):
         (run_id, COMPRESSED_VELDSPAR),
     ).fetchone()
     assert ore is not None and ore["recommended_buy_qty"] % 100 == 0
-    page = seeded_client.get(f"/runs/{run_id}").get_data(as_text=True)
+    # v1.29: the compressed story lives on the Buy tab (ruling R2).
+    page = seeded_client.get(f"/runs/{run_id}?view=buy").get_data(as_text=True)
     assert "via compressed" in page
     assert "Reprocess <b>" in page and "Compressed Veldspar" in page
     chain = seeded_client.get(f"/runs/{run_id}?view=chain").get_data(as_text=True)
@@ -958,3 +953,176 @@ def test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct(conn, ref):
     assert 0 < left < a_spod * 100
     assert trit.recommended_buy_qty == left
     assert plan.compressed_saving_isk > 0
+
+
+# --- hangar compressed ore counts as its raws (v1.29 revision 6, R3) --------
+
+
+YIELDS = {"ore": 0.75, "gas": 0.60}
+
+
+def _yields_only(conn, ore=0.75, gas=0.60):
+    """The asserted yields with every group toggle left OFF: the toggles
+    pick what the plan may BUY, they do not gate the hangar credit
+    (contract review A10)."""
+    conn.execute(
+        "UPDATE settings SET compressed_ore_yield = ?, compressed_gas_yield = ?",
+        (ore, gas),
+    )
+    conn.commit()
+    assert not store.get_settings(conn).compressed_groups()
+
+
+def test_refined_equivalents_are_whole_batches_floored_once(ref):
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    eq = industry.refined_equivalents
+    # 1,050 Compressed Veldspar = 10 whole batches of 100 — the 50 left
+    # over credit nothing: 10 × 400 × 0.75 = 3,000 Tritanium.
+    assert eq(ref, YIELDS, {COMPRESSED_VELDSPAR: 1050}) == {TRITANIUM: 3000}
+    assert eq(ref, YIELDS, {COMPRESSED_VELDSPAR: 99}) == {}
+    # Gas: a batch is one unit, and the floor is taken ONCE over the
+    # stack (5 × 0.6 = 3), never per unit (which would be 0).
+    assert eq(ref, YIELDS, {COMPRESSED_C50: 5}) == {FULLERITE_C50: 3}
+    # Moon ore: every output of the batch, minerals and goo alike.
+    bitumens = ref.compressed_sources()[COMPRESSED_BITUMENS]
+    assert bitumens.portion_size == 100
+    moon = eq(ref, YIELDS, {COMPRESSED_BITUMENS: 250})  # two whole batches
+    assert moon[PYERITE] == 9000  # 2 × 6,000 × 0.75
+    assert moon[HYDROCARBONS] == 97  # 2 × 65 × 0.75 = 97.5, floored once
+    assert moon == {
+        m: bitumens.batch_output(2, m, 0.75)
+        for m, _base in bitumens.outputs
+        if bitumens.batch_output(2, m, 0.75) > 0
+    }
+    # Several stacks add up per raw.
+    both = eq(ref, YIELDS, {COMPRESSED_VELDSPAR: 1050, COMPRESSED_BITUMENS: 250})
+    assert both[TRITANIUM] == 3000 + moon.get(TRITANIUM, 0)
+    assert both[PYERITE] == moon[PYERITE]
+    # Ice converts to nothing: ref.compressed_sources() lists it as kind
+    # 'ore' with only Ice Products out, and no output of it is in a raw
+    # group compressed sourcing covers.
+    assert COMPRESSED_GLACIAL_MASS in ref.compressed_sources()
+    assert eq(ref, YIELDS, {COMPRESSED_GLACIAL_MASS: 100_000}) == {}
+    # A zero yield switches its kind off; raws, empty stacks and unknown
+    # types are ignored.
+    assert eq(ref, {"ore": 0.0, "gas": 0.6}, {COMPRESSED_VELDSPAR: 1050}) == {}
+    assert eq(ref, {"ore": 0.75, "gas": 0.0}, {COMPRESSED_C50: 5}) == {}
+    assert eq(ref, YIELDS, {TRITANIUM: 5000, COMPRESSED_VELDSPAR: 0}) == {}
+
+
+def test_refined_equivalents_agree_with_the_purchase_matcher(conn, ref):
+    """The engine's credit and the matcher's conversion of an unplanned
+    ore purchase (buying._RunOres._refine, revision 4) are two copies of
+    one arithmetic — buying.py keeps its own because it prices the lines
+    too (contract review A10). Same stack, same yields → same units per
+    raw, ice and short stacks included."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    from datetime import datetime, timezone
+
+    _yields_only(conn)
+    settings = store.get_settings(conn)
+    ores = buying._OrePass(conn, ref, settings)
+    window = buying.BuyWindow(
+        index_run_id=1, run_number=1, executed=False,
+        lo=datetime(2026, 9, 1, tzinfo=timezone.utc), hi=None,
+    )
+    matcher = buying._RunOres(ores, window)
+    yields = {
+        "ore": settings.compressed_ore_yield,
+        "gas": settings.compressed_gas_yield,
+    }
+    stacks = (
+        (COMPRESSED_VELDSPAR, 1050),
+        (COMPRESSED_VELDSPAR, 99),
+        (COMPRESSED_BITUMENS, 250),
+        (COMPRESSED_C50, 7),
+        (COMPRESSED_GLACIAL_MASS, 5_000),
+    )
+    for ore_id, units in stacks:
+        source = ref.compressed_sources()[ore_id]
+        lines = matcher._refine(
+            ore_id, units // source.portion_size, 1.0, store.BUY_VENUE_DELIVERED
+        )
+        assert industry.refined_equivalents(ref, yields, {ore_id: units}) == {
+            t: q for t, q, _unit in lines
+        }, (ore_id, units)
+
+
+def test_hangar_compressed_ore_counts_as_its_raws(conn, ref):
+    """R3 end to end, every group toggle OFF: 1,050 Compressed Veldspar in
+    the hangar is 3,000 Tritanium at the 0.75 yield — on hand beside the
+    500 ESI shows, off the buy, persisted as on_hand_from_ore_qty (A12:
+    on_hand_qty is the stock the plan NETTED, the ore part inside it).
+    Compressed ice beside it credits nothing: the fuel-block inputs it
+    reprocesses into (the Hulk's reactions burn fuel blocks) stay at
+    zero stock. The caller's Snapshot is not mutated (A11)."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    _hulk(conn, ref)
+    _yields_only(conn)
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref), persist=False)
+    heavy_water = ref.type_id("Heavy Water")
+    assert baseline.items[heavy_water].recommended_buy_qty > 0
+    stock = {
+        TRITANIUM: 500,
+        COMPRESSED_VELDSPAR: 1050,
+        COMPRESSED_GLACIAL_MASS: 100_000,
+    }
+    snap = snapshot(ref)
+    snap.on_hand = dict(stock)
+    plan = engine.plan_index_run(conn, ref, snap, persist=True)
+    assert snap.on_hand == stock
+    trit, base = plan.items[TRITANIUM], baseline.items[TRITANIUM]
+    assert (trit.on_hand_qty, trit.on_hand_from_ore_qty) == (3500, 3000)
+    assert trit.target_stock_qty == base.target_stock_qty
+    assert trit.recommended_buy_qty == base.recommended_buy_qty - 3500
+    assert COMPRESSED_VELDSPAR not in plan.items
+    for type_id, item in plan.items.items():
+        if type_id == TRITANIUM:
+            continue
+        assert item.on_hand_from_ore_qty == 0, item.name
+        if not item.buildable:
+            # Nothing else moved — ice included.
+            assert item.on_hand_qty == 0, item.name
+            assert item.recommended_buy_qty == baseline.items[type_id].recommended_buy_qty
+    rows = {
+        r["type_id"]: r
+        for r in conn.execute(
+            "SELECT type_id, on_hand_qty, on_hand_from_ore_qty "
+            "FROM index_run_item WHERE index_run_id = ?",
+            (plan.index_run_id,),
+        )
+    }
+    assert (rows[TRITANIUM]["on_hand_qty"], rows[TRITANIUM]["on_hand_from_ore_qty"]) == (3500, 3000)
+    assert {
+        r["on_hand_from_ore_qty"] for t, r in rows.items() if t != TRITANIUM
+    } == {0}
+
+
+def test_hangar_ore_nets_before_the_compressed_pass(conn, ref):
+    """With the pass on and a cheap Veldspar ladder, hangar ore still
+    only lowers the demand the pass sources — the covered plus direct
+    Tritanium drop by exactly the credit, and the ore row the pass adds
+    nets no hangar ore (on_hand 0, nothing from ore): nothing counts
+    twice."""
+    if not ref.compressed_sources():
+        pytest.skip("reference data imported before v1.25")
+    _hulk(conn, ref)
+    enable_compressed(conn)
+    ladders = {HUB: {COMPRESSED_VELDSPAR: [(20.0, 100_000_000)]}}
+    baseline = engine.plan_index_run(conn, ref, snapshot(ref, ladders), persist=False)
+    snap = snapshot(ref, ladders)
+    snap.on_hand = {COMPRESSED_VELDSPAR: 1050}
+    plan = engine.plan_index_run(conn, ref, snap, persist=False)
+    trit, base = plan.items[TRITANIUM], baseline.items[TRITANIUM]
+    assert trit.on_hand_from_ore_qty == 3000
+    assert trit.deficit_qty == base.deficit_qty - 3000
+    assert (
+        trit.compressed_covered_qty + trit.recommended_buy_qty
+        == base.compressed_covered_qty + base.recommended_buy_qty - 3000
+    )
+    ore = plan.items[COMPRESSED_VELDSPAR]
+    assert ore.compressed_outputs
+    assert (ore.on_hand_qty, ore.on_hand_from_ore_qty) == (0, 0)

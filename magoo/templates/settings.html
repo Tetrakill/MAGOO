@@ -34,7 +34,7 @@
     <label for="duration">Max Run Duration <small>Hours in one planning cycle. A longer job spans more than one cycle.</small></label>
     <input id="duration" name="duration" type="number" step="0.5" min="1"
            value="{{ settings.max_run_duration_hours }}">
-    <label for="mfg_slots">Manufacturing Slots <small>Jobs you can run at once, all characters combined. Jobs still running from earlier cycles are subtracted.</small></label>
+    <label for="mfg_slots">Manufacturing Slots <small>Jobs you can run at once, all characters combined. Every plan sizes jobs against the whole pool — jobs already running count through their output in progress.</small></label>
     <input id="mfg_slots" name="mfg_slots" type="number" min="0" value="{{ settings.manufacturing_slots }}">
     <label for="reaction_slots">Reaction Slots <small>Reaction jobs you can run at once.</small></label>
     <input id="reaction_slots" name="reaction_slots" type="number" min="0" value="{{ settings.reaction_slots }}">
@@ -243,6 +243,8 @@
            value="{{ settings.standing_broker_corp }}">
     <label for="freight_in">Courier Highsec Market → Industry Hub <small>ISK per m³ to haul bought materials from Jita to where you build.</small></label>
     <input id="freight_in" name="freight_in" type="number" step="1" min="0" value="{{ settings.freight_in_isk_per_m3 }}">
+    <label for="freight_in_default">Default Inbound Freight <small>ISK per m³ to haul materials bought anywhere but Jita 4-4 and the null-sec market below: another station or structure, or a contract handed over elsewhere. At 0 those purchases carry no freight.</small></label>
+    <input id="freight_in_default" name="freight_in_default" type="number" step="1" min="0" value="{{ settings.freight_in_default_isk_per_m3 }}">
     <label for="freight_out">Courier Industry Hub → High Sec Market <small>ISK per packaged m³ to haul finished products to Jita. Keepstars, Palatine Keepstars and Sotiyos are exempt.</small></label>
     <input id="freight_out" name="freight_out" type="number" step="1" min="0" value="{{ settings.freight_out_isk_per_m3 }}">
   </div>

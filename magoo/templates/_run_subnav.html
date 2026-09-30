@@ -1,10 +1,15 @@
-{# The run pages' tab bar. Set `active` to 'plan' | 'chain' | 'profit'
-   before including. #}
+{# The run pages' tab bar. Set `active` to 'plan' | 'buy' | 'chain' |
+   'profit' before including. The KEYS keep the old words (they are the
+   ?view= values and every route/test reads them); the LABELS say what
+   each page is about since v1.29 moved purchasing off the first tab
+   (user ruling 2026-09-24): Industry Jobs | Buy | Stockpile | Profit. #}
 <div class="subnav">
   <a href="{{ url_for('run_detail', index_run_id=run.index_run_id) }}"
-     {% if active == 'plan' %}aria-current="page" class="active"{% endif %}>Plan</a>
+     {% if active == 'plan' %}aria-current="page" class="active"{% endif %}>Industry Jobs</a>
+  <a href="{{ url_for('run_detail', index_run_id=run.index_run_id, view='buy') }}"
+     {% if active == 'buy' %}aria-current="page" class="active"{% endif %}>Buy</a>
   <a href="{{ url_for('run_detail', index_run_id=run.index_run_id, view='chain') }}"
-     {% if active == 'chain' %}aria-current="page" class="active"{% endif %}>Chain</a>
+     {% if active == 'chain' %}aria-current="page" class="active"{% endif %}>Stockpile</a>
   <a href="{{ url_for('run_detail', index_run_id=run.index_run_id, view='profit') }}"
      {% if active == 'profit' %}aria-current="page" class="active"{% endif %}>Profit</a>
 </div>

@@ -78,7 +78,11 @@ h3.subhead .muted { font-weight: 400; }
    group on the data tabs is a native <details class="section">, open by
    default; the heading IS the summary and its marker shows the state
    (▾ open / ▸ closed — the subhead's accent marker turns, the h2 gets a
-   dim one). Closed state persists per page + data-key (localStorage). */
+   dim one). The state is stored per page + data-key (localStorage) on
+   every toggle; on load a stored "closed" closes a default-open section.
+   A section marked data-default="closed" (the Buy tab's groups under
+   Input Materials, revision 8, 2026-09-29) starts closed, and a stored
+   "open" reopens it instead. */
 details.section > summary { list-style: none; cursor: pointer; }
 details.section > summary::-webkit-details-marker { display: none; }
 details.section > summary > h2, details.section > summary > h3.subhead { display: block; }
@@ -149,7 +153,7 @@ td input { background: transparent; border-color: transparent; border-bottom-col
 td input:hover { border-bottom-color: var(--dim); }
 td input.saved { border-bottom-color: var(--good); border-bottom-width: 2px; }
 td input.save-error { border-bottom-color: var(--bad); border-bottom-width: 2px; }
-/* Item names on the run Plan tab: open the deficit dialog. Dotted underline
+/* Item names on the run Industry Jobs and Buy tabs: open the deficit dialog. Dotted underline
    as the quiet affordance; teal only on hover (the Signal Rule). */
 button.itemlink { background: none; border: none; padding: 0; margin: 0;
   font: inherit; color: inherit; cursor: pointer; text-align: left;
@@ -323,6 +327,16 @@ table.pipelines td.actions > button.mini { margin-right: .3rem; }
    side by side they would widen the Invention column for every row and
    push the table past the page */
 table.pipelines td form.inline:has(select + select) { display: inline-grid; gap: .2rem; }
+
+/* Buy tab (v1.29): the same content-packing — the columns of figures
+   shrink to their digits and the item column absorbs the slack. Since
+   revision 3 (2026-09-28) nothing on the tab is a control (purchases come
+   from ESI), so the table stripes and hovers like every other one. */
+table.buy td, table.buy th { width: 1%; white-space: nowrap; }
+table.buy td.item, table.buy th.item { width: auto; white-space: normal; }
+table.buy td.num, table.buy th.num { padding-left: 1rem; }
+/* the per-group Multibuy block sits under each group's table */
+details.multibuy-block { margin: .4rem 0 .2rem; }
 
 /* ---- settings page: side-nav + field grid + sticky save bar ---- */
 .settings { display: grid; grid-template-columns: 11rem minmax(0, 1fr); gap: 1.4rem; align-items: start; }
@@ -515,12 +529,20 @@ function inlineSave(input) {
 // re-measures aligned tables, which are skipped while hidden. Runs on
 // DOMContentLoaded (this script is in <head>) and is registered before
 // layoutAligned's listener so closed sections are hidden before measuring.
+// A section marked data-default="closed" (the Buy tab's groups, v1.29
+// revision 8, user ruling 2026-09-29) is the mirror image: it renders
+// closed, and one the user opened stays open — only the stored value
+// that differs from the section's default changes it on load.
 document.addEventListener("DOMContentLoaded", () => {
   const view = new URLSearchParams(location.search).get("view");
   const page = location.pathname.replace(/\d+/g, "#") + (view ? "?view=" + view : "");
   const keyOf = d => "section:" + page + ":" + d.dataset.key;
   document.querySelectorAll("details.section[data-key]").forEach(d => {
-    try { if (localStorage.getItem(keyOf(d)) === "closed") d.open = false; } catch {}
+    try {
+      const stored = localStorage.getItem(keyOf(d));
+      if (d.dataset.default === "closed") { if (stored === "open") d.open = true; }
+      else if (stored === "closed") d.open = false;
+    } catch {}
     d.addEventListener("toggle", () => {
       try { localStorage.setItem(keyOf(d), d.open ? "open" : "closed"); } catch {}
       if (d.open && typeof layoutAligned === "function") layoutAligned();

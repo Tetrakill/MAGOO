@@ -22,7 +22,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
@@ -50,11 +50,14 @@ class Snapshot:
 
     in_progress counts output of active jobs as stock, preventing duplicate
     recommendations for work already underway. slots_available is the
-    user-entered pool total per activity (manufacturing / reaction), net
-    only of MULTI-CYCLE jobs still running past the next index run —
-    single-cycle jobs deliver before planning by design (v1.1, revised
-    2026-08-20). adjusted_prices are CCP adjusted prices for EIV; market
-    prices are used where an adjusted price is missing.
+    user-entered pool total per activity (manufacturing / reaction),
+    never net of running jobs (v1.29 revision 6, user ruling R2
+    2026-09-28, dropping the 2026-08-20 multi-cycle subtraction): jobs
+    already installed drop out through stock instead — their output is
+    in_progress. adjusted_prices are CCP adjusted prices for EIV; market
+    prices are used where an adjusted price is missing. on_hand is the
+    ESI hangar as pulled; plan_index_run adds the hangar compressed
+    ore's refined equivalents to it on a copy (ruling R3), never here.
     """
 
     on_hand: dict[int, int] = field(default_factory=dict)
@@ -100,6 +103,24 @@ class Snapshot:
     # itself does not budget ISK.
     character_isk: float = 0.0
     corporation_isk: float = 0.0
+    # Review 2026-09-28: the fetched_at of the esi_snapshot row this was
+    # built from (snapshot_from_state; SQLite 'YYYY-MM-DD HH:MM:SS' UTC),
+    # None for a hand-built Snapshot. A plan — a new run or an in-place
+    # re-plan (pre-release review 2026-09-30) — dates the run's
+    # planned_start — costing's pre-plan cut — at it, not at now: a ▶ Plan
+    # from a stored snapshot hours old never saw the purchases made since.
+    fetched_at: str | None = None
+    # v1.29 revision 7 (user ruling 2026-09-29): per product type, one
+    # [start_date, units] pair per manufacturing / reaction job ESI
+    # reports — active, paused, ready AND delivered, units = runs ×
+    # portion (esi.refresh_state, read back by store.latest_esi_snapshot;
+    # start_date is ESI's ISO text, verbatim). plan_index_run counts the
+    # units started after its cycle_cut as THIS cycle's wave
+    # (_installed_this_cycle). None = not recorded — a hand-built
+    # Snapshot, a snapshot saved before the column, or the pre-2026-09-29
+    # scalar format, which store normalises to None: nothing counts as
+    # installed and the plan sizes the full wave.
+    job_starts: dict[int, list] | None = None
 
     def price(self, type_id: int) -> float | None:
         return self.prices.get(type_id)
@@ -122,7 +143,16 @@ class PlanItem:
     name: str
     item_class: str
     depth: int
+    # The stock the plan NETTED: the ESI hangar plus, on a raw, what the
+    # hangar's compressed ore / moon ore / gas reprocesses into at the
+    # asserted yields (v1.29 revision 6, user ruling R3 2026-09-28) —
+    # on_hand_from_ore_qty is that ore-derived part (0 on every row the
+    # credit does not reach, compressed ore rows included), so the
+    # hangar-only figure is on_hand_qty − on_hand_from_ore_qty (contract
+    # review A12: every identity over on_hand_qty — the deficit dialog,
+    # the install-short panel — holds unchanged).
     on_hand_qty: int = 0
+    on_hand_from_ore_qty: int = 0
     in_progress_qty: int = 0
     merged_min_qty: int = 0
     # One cycle's consumption AT THE JOBS' OWN ROUNDING (Phase 3.5, user
@@ -140,6 +170,27 @@ class PlanItem:
     # demand is another pipeline's component draw, which nets against
     # stock like any other stage (ruling 2026-08-27).
     requested_qty: int = 0
+    # v1.29 revision 7 (user ruling 2026-09-29; contract amendments 1, 3):
+    # the units of this type whose jobs STARTED inside the current buying
+    # cycle — Snapshot.job_starts after plan_index_run's cycle_cut,
+    # delivered jobs included — stamped on EVERY row before Phase 4.
+    # On a pipeline final it is the part of this cycle's wave already
+    # installed: the plan sizes only the rest (_final_wave). On any row
+    # it keeps the R7 "holds jobs this cycle" predicate true for a
+    # consumer whose jobs are all installed (runs_allocated 0), so its
+    # suppliers keep their targets — the stages built this cycle are the
+    # NEXT wave's stock. A non-final's own deficit keeps netting its
+    # in-flight output as before; this is no credit there. Persisted as
+    # index_run_item.installed_qty (0 = none this cycle; NULL only on
+    # rows planned before the column).
+    installed_qty: int = 0
+    # Revision 7 fix pass (2026-09-29): a pipeline final's wave as
+    # _final_wave counted it — requested_qty, or once part of it is
+    # installed the whole blueprint copies it was planned at (amendment
+    # 8). Stamped before persisting (index_run_item.wave_qty, beside
+    # requested_qty) so the Industry Jobs badge and the deficit dialog
+    # read the engine's own figure. None on every non-final row.
+    wave_qty: int | None = None
     target_stock_qty: int = 0
     deficit_qty: int = 0
     recommended_action: str | None = None  # buy / build / both
@@ -238,6 +289,24 @@ class PlanItem:
     structure_fill_orders: int | None = None
     unfilled_qty: int = 0
     unfilled_price: float | None = None
+    # Buy tab (v1.29): what the realized costing needs to re-blend a
+    # covered raw once the user records what the ore (or the raw itself)
+    # actually cost. On a compressed ore row: the share of this pick's
+    # landed cost each covered raw carries ({raw_type_id: share}, JSON at
+    # rest), that landed cost, and its reprocessing-tax term — a function
+    # of the OUTPUTS, not of the ore price, so a re-priced ore keeps the
+    # tax standing (0.0 on a gas row: decompressing is untaxed). The
+    # shares are the ones the pass actually used — they sum to 1.0
+    # whenever the displaced value was positive and are all 0.0 when it
+    # was not (contract review A5, 2026-09-23); never normalised after
+    # the fact. On a covered raw row: the landed ISK of its direct
+    # remainder at plan time, so
+    # `effective_unit_cost * demand == direct_landed_isk +
+    # Σ_c compressed_landed_isk_c * compressed_alloc_c[raw]`.
+    compressed_alloc: dict[int, float] | None = None
+    compressed_landed_isk: float | None = None
+    compressed_tax_isk: float | None = None
+    direct_landed_isk: float | None = None
     # Install check (v1.27.1, Phase 7.6): can this cycle's planned jobs
     # actually be installed from stock? On a row holding jobs: the runs
     # (and the jobs they occupy) that stock on hand, in-flight output and
@@ -383,9 +452,11 @@ def _expand_and_merge(conn, ref, output_qty=None) -> dict[int, PlanItem]:
             plan_item.pipeline_depth[pipeline["pipeline_id"]] = item.depth
             if type_id == pipeline["final_product_type_id"]:
                 # The (possibly steady-state-overridden) requested output —
-                # the share of a final's demand that keeps the exact
-                # ignore-stock rule when the final is also consumed as
-                # another pipeline's intermediate.
+                # the cycle's WAVE of this final: the share of its demand
+                # that ignores stock (less what this cycle already
+                # installed, revision 7 — _final_wave) when the final is
+                # also consumed as another pipeline's intermediate. The
+                # cycle-need seed keeps it whole.
                 plan_item.requested_qty += quantity
                 if pipeline["runs_per_bpc"]:
                     plan_item.bpc_runs_limit = (
@@ -456,18 +527,23 @@ def _apply_targets(
 
     for item in merged.values():
         if item.type_id in final_products:
-            # Final ships always build their requested quantities — the
-            # line advances every cycle regardless of stock or in-flight
-            # jobs (those are the previous wave, bound for sale). But a
-            # final consumed as ANOTHER pipeline's intermediate nets that
-            # component share against stock like any other stage (ruling
-            # 2026-08-27); single-role finals have no component share and
-            # keep the exact rule unchanged.
+            # Final ships build this cycle's WAVE — the requested
+            # quantity — whatever stock or in-flight jobs hold: the line
+            # advances every cycle. Stock and jobs from EARLIER cycles
+            # are the previous wave, bound for sale; the final jobs
+            # started inside the current buying cycle ARE this wave
+            # (user ruling 2026-09-29, revision 7), so the plan sizes
+            # only the part not yet installed — the open run is
+            # re-planned on every ESI update, before and after the
+            # installs. A final consumed as ANOTHER pipeline's
+            # intermediate nets that component share against stock like
+            # any other stage (ruling 2026-08-27) — against the FREE
+            # stock, net of the wave's own installed units, which
+            # in-flight output already holds (contract amendment 2).
+            # Single-role finals have no component share.
             component_share = item.cycle_need_qty - item.requested_qty
-            item.deficit_qty = item.requested_qty + max(
-                0,
-                component_share - item.on_hand_qty - item.in_progress_qty,
-            )
+            _credit, wave_left, free_stock = _final_wave(ref, item)
+            item.deficit_qty = wave_left + max(0, component_share - free_stock)
         else:
             # A stage must END the cycle back at target, so the deficit
             # includes what this cycle's downstream jobs will consume
@@ -495,7 +571,10 @@ def _composite_extra_targets(
     their targets. Phase 4 applies it for every composite (the BOM
     demand); the feedback loop (review 2026-09-05, finding A3) only for
     composites that actually HOLD jobs this cycle, so an input whose
-    consumers all flipped to buy carries no adder either."""
+    consumers all flipped to buy carries no adder either. A composite
+    holds jobs when it has runs left to plan OR jobs already started
+    this cycle (installed_qty > 0 — revision 7, contract amendment 3:
+    a fully installed composite plans 0 runs yet consumes)."""
     extra_runs = settings.composite_reaction_extra_runs
     extra: dict[int, int] = {}
     if extra_runs <= 0:
@@ -507,7 +586,13 @@ def _composite_extra_targets(
             not in config.COMPOSITE_REACTION_GROUPS
         ):
             continue
-        if consumers_with_jobs_only and item.runs_allocated <= 0:
+        # A composite whose jobs this cycle are all installed holds 0
+        # runs but still consumes (revision 7, contract amendment 3).
+        if (
+            consumers_with_jobs_only
+            and item.runs_allocated <= 0
+            and item.installed_qty <= 0
+        ):
             continue
         mat_mult = industry.build_multiplier(
             ref,
@@ -599,6 +684,11 @@ def _cycle_need(conn, ref, merged: dict[int, PlanItem]) -> dict[int, dict[int, i
         p["final_product_type_id"] for p in store.active_pipelines(conn)
     }
     need: dict[int, int] = {t: 0 for t in merged}
+    # The FULL wave, never the part left after this cycle's installs
+    # (revision 7, contract amendment 1): cycle_need_qty is every stage's
+    # stockpile target, the R7 proration basis, costing.purchase_basis
+    # and hull_cost's attribution whole — seeding it with the remainder
+    # would shrink them all as the wave installs.
     for item in merged.values():
         need[item.type_id] += item.requested_qty
     shares: dict[int, dict[int, int]] = {}
@@ -693,7 +783,21 @@ def _skill_levels(settings) -> industry.SkillLevels:
     return settings.skill_levels()
 
 
-def _runs_for_units(ref, item: PlanItem, units: int) -> int:
+def _whole_copy_batch(ref, item: PlanItem) -> bool:
+    """Does the item build in whole blueprint copies — a sub-capital ship
+    with runs-per-BPC above 1 (_runs_for_units' batch rule)?"""
+    info = ref.type_info(item.type_id)
+    return bool(
+        info.category_id == config.CATEGORY_SHIP
+        and info.group_id not in config.EXACT_QTY_SHIP_GROUPS
+        and item.bpc_runs_limit
+        and item.bpc_runs_limit > 1
+    )
+
+
+def _runs_for_units(
+    ref, item: PlanItem, units: int, whole_copies: bool = True
+) -> int:
     """Whole runs for `units` of an item. Sub-capital ships build whole
     blueprint copies: when runs-per-BPC is set (pasted, or materialised
     from the invention choice) it is the batch unit — never a partial
@@ -711,18 +815,68 @@ def _runs_for_units(ref, item: PlanItem, units: int) -> int:
     never installs more runs than its copy holds). The T3 whole-copies
     contract (a 20-run Intact-relic hull builds in whole 20-hull batches)
     depends on this. v1.26: the fill-aware build-vs-buy split re-sizes
-    the built part through the same rule."""
+    the built part through the same rule.
+
+    whole_copies=False (revision 7, contract amendment 8) sizes exact
+    runs: the rest of a final's wave once part of it is installed this
+    cycle. That wave was already counted in whole copies (_final_wave),
+    and the copy in use keeps its unused runs (the A8 premise), so
+    rounding the remainder up to another whole copy would overbuild."""
     runs = math.ceil(max(0, units) / item.portion_size)
-    info = ref.type_info(item.type_id)
-    if (
-        info.category_id == config.CATEGORY_SHIP
-        and info.group_id not in config.EXACT_QTY_SHIP_GROUPS
-        and item.bpc_runs_limit
-        and item.bpc_runs_limit > 1
-    ):
+    if whole_copies and _whole_copy_batch(ref, item):
         multiple = item.bpc_runs_limit
         runs = math.ceil(runs / multiple) * multiple
     return runs
+
+
+def _wave_units(ref, item: PlanItem) -> int:
+    """A pipeline final's wave this cycle (revision 7, contract amendment
+    8): the requested quantity, or — once part of it is installed
+    (installed_qty > 0) and it builds in whole copies — the whole-copy
+    units it was planned at, _runs_for_units(requested) × portion. The
+    one figure _final_wave sizes by and plan_index_run persists as
+    wave_qty for the Industry Jobs badge and the deficit dialog."""
+    wave = item.requested_qty
+    if item.installed_qty > 0 and _whole_copy_batch(ref, item):
+        wave = _runs_for_units(ref, item, wave) * item.portion_size
+    return wave
+
+
+def _final_wave(ref, item: PlanItem) -> tuple[int, int, int]:
+    """(wave_credit, wave_left, free_stock) of a pipeline final (v1.29
+    revision 7, user ruling 2026-09-29; contract amendments 1, 2 and 8)
+    — the ONE rule Phase 4 and the feedback loop's final branch both
+    size by:
+
+        wave_credit = min(wave, installed_qty)
+        wave_left   = wave − wave_credit
+        free_stock  = max(0, on_hand + in_progress − wave_credit)
+        deficit     = wave_left + max(0, component share (Phase 4) or
+                      realized draw (the loop) − free_stock)
+
+    `wave` is the requested quantity; once part of it is installed
+    (installed_qty > 0) a whole-copy final counts it in the whole-copy
+    units it was planned at — _runs_for_units(requested) × portion — so
+    8 requested on 10-run copies is a wave of 10 and 5 installed leave
+    5, not 8 − 5 = 3 re-rounded to a fresh copy (_size_jobs then sizes
+    that remainder in exact runs). With nothing installed the wave is the
+    request itself, the pre-revision-7 figure, whose job sizing rounds
+    it to whole copies as it always did.
+
+    free_stock nets the wave's installed units out of the stock a
+    dual-role final's component share draws on: in-flight output
+    already holds them (and, delivered, the hangar), so netting the
+    share against on_hand + in_progress too would credit them twice
+    (amendment 2 — requested 8, another pipeline drawing 4, 8 installed:
+    the share still builds 4). A wave delivered AND sold since is still
+    netted out, so the share errs toward building. Single-role finals
+    have no component share; for them free_stock only matters to the
+    low-stock projection, whose stock term is wave_credit + free_stock
+    (a wave installed and delivered, or sold, still counts as made)."""
+    wave = _wave_units(ref, item)
+    credit = min(wave, max(0, item.installed_qty))
+    free_stock = max(0, item.on_hand_qty + item.in_progress_qty - credit)
+    return credit, wave - credit, free_stock
 
 
 def _job_windower(conn, ref):
@@ -792,7 +946,14 @@ def _size_jobs(conn, ref, merged: dict[int, PlanItem]):
             continue
 
         item.time_per_run, item.max_runs_per_job = window(item)
-        item.total_runs_needed = _runs_for_units(ref, item, item.deficit_qty)
+        # A final with part of its wave installed this cycle sizes the
+        # rest in exact runs: _final_wave already counted the wave in
+        # whole copies (revision 7, contract amendment 8). Only finals
+        # carry a requested share.
+        remainder = item.requested_qty > 0 and item.installed_qty > 0
+        item.total_runs_needed = _runs_for_units(
+            ref, item, item.deficit_qty, whole_copies=not remainder
+        )
         item.jobs_needed_unconstrained = math.ceil(
             item.total_runs_needed / item.max_runs_per_job
         )
@@ -2648,7 +2809,15 @@ def _install_check(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
     job tables, section stats and slot stats show THESE as the jobs to
     run; the plan's own sizing and buys stand underneath (tooltips and
     the Chain tab). Since the stock-aware backfill (Phase 6), the plan's
-    job count may exceed a pool — the startable jobs never do."""
+    job count may exceed a pool — the startable jobs never do.
+
+    "On hand" here includes a raw's hangar-ore credit (v1.29 revision 6,
+    ruling R3: plan_index_run plans against the ESI hangar plus what the
+    hangar's compressed ore reprocesses into), so this check — and the
+    stock-aware backfill, which reads the same snapshot — treats that
+    ore as startable input. True once it is reprocessed; the manual
+    reprocess stands between the two, as it does for alchemy's
+    unrefined credit."""
     for item in merged.values():
         item.install_runs = None
         item.install_jobs = None
@@ -2881,9 +3050,17 @@ def _finalize(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
             continue
         if not any(p in primed for p in item.pipeline_share):
             continue
+        stock = item.on_hand_qty + item.in_progress_qty
+        if item.type_id in final_products:
+            # Revision 7: a final's wave installed this cycle counts as
+            # made even once delivered and sold — wave_credit +
+            # free_stock, i.e. max(stock, wave_credit) — or a wave
+            # installed, delivered and sold before the next ESI update
+            # would read as low stock (it builds 0 more, holds 0).
+            credit, _left, free_stock = _final_wave(ref, item)
+            stock = credit + free_stock
         projected = (
-            item.on_hand_qty
-            + item.in_progress_qty
+            stock
             + item.recommended_build_qty
             + item.recommended_buy_qty
             + item.alchemy_output_qty
@@ -2968,8 +3145,13 @@ def _sourcing_pass(
     merged walk (a tie goes to the raw). Covered raws keep their demand
     figures, drop their direct buy to the remainder, and carry a blended
     landed `effective_unit_cost` the realized costing prices them at.
-    Hangar compressed stock is ignored. Returns the landed ISK the
-    compressed buys saved, None when none stood."""
+    Hangar compressed stock never enters this pass: since v1.29 revision
+    6 (ruling R3) plan_index_run has already credited it to the raws it
+    reprocesses into, so it lowered `bought` before the pass ran, and
+    the ore rows the pass adds never net hangar ore (their on_hand_qty
+    stays 0 — nothing counts twice). The pass prices only the ore the
+    plan BUYS. Returns the landed ISK the compressed buys saved, None
+    when none stood."""
     settings = store.get_settings(conn)
     # v1.26: per-venue ladders through the shared lookup — a 'min_sell'
     # / 'max_buy' venue is one unbounded synthetic rung at its quote, so
@@ -3343,23 +3525,28 @@ def _sourcing_pass(
                         wanted_qty = batches * portion
                 qty = batches * portion
                 y = yields[source.kind]
+                batch_outputs = {
+                    m: source.batch_output(batches, m, y)
+                    for m, _q in source.outputs
+                }
+                # The reprocessing tax this pick pays: EVERY output of the
+                # source at its landed value, taxed (`tax_of` returns 0.0
+                # for gas — decompressing is untaxed in the client). Kept
+                # as its own term so the v1.29 Buy tab can re-price the ore
+                # from what the user actually paid and leave the tax
+                # standing: it is a function of the outputs, not the price.
+                tax_isk = tax_of(source) * sum(
+                    out * output_price(m) for m, out in batch_outputs.items()
+                )
                 chosen[c] = {
                     "source": source,
                     "venue": venue,
                     "qty": qty,
                     "wanted_qty": wanted_qty,
                     "fill": fill,
-                    "landed_cost": fill.cost
-                    + rates[venue] * m3 * qty
-                    + tax_of(source)
-                    * sum(
-                        source.batch_output(batches, m, y) * output_price(m)
-                        for m, _q in source.outputs
-                    ),
-                    "outputs": {
-                        m: source.batch_output(batches, m, y)
-                        for m, _q in source.outputs
-                    },
+                    "landed_cost": fill.cost + rates[venue] * m3 * qty + tax_isk,
+                    "tax_isk": tax_isk,
+                    "outputs": batch_outputs,
                     # The true ladder depth (rows may carry a third
                     # min_volume element since contract C3).
                     # None for a synthetic rung (v1.26 'min_sell' /
@@ -3435,10 +3622,17 @@ def _sourcing_pass(
                 m: displaced_value(m, q, covered[m] - q) for m, q in used[c].items()
             }
             total_value = sum(per_m.values())
-            for m, v in per_m.items():
-                alloc[m] = alloc.get(m, 0.0) + pick["landed_cost"] * (
-                    v / total_value if total_value > 0 else 0.0
-                )
+            # v1.29: the shares travel with the pick so the ore's PlanItem
+            # (built in the second loop below, where `per_m` is out of
+            # scope — contract review A6) can persist exactly what was
+            # used. All zeros when nothing was displaced; never normalised.
+            shares = {
+                m: (v / total_value if total_value > 0 else 0.0)
+                for m, v in per_m.items()
+            }
+            pick["alloc"] = shares
+            for m, share in shares.items():
+                alloc[m] = alloc.get(m, 0.0) + pick["landed_cost"] * share
             saving -= pick["landed_cost"]
         for r in demand:
             item = merged[r]
@@ -3446,8 +3640,13 @@ def _sourcing_pass(
                 continue
             direct = demand[r] - covered[r]
             saving += direct_cost(r, demand[r]) - direct_cost(r, direct)
+            # v1.29: the direct remainder's landed ISK is persisted beside
+            # the blend so the Buy tab's re-blend can swap either half out
+            # (the raw's own purchase lines replace this term, an ore's
+            # replace the allocated one) without re-deriving plan prices.
+            item.direct_landed_isk = direct_cost(r, direct)
             item.effective_unit_cost = (
-                direct_cost(r, direct) + alloc.get(r, 0.0)
+                item.direct_landed_isk + alloc.get(r, 0.0)
             ) / demand[r]
             item.compressed_covered_qty = covered[r]
             item.recommended_buy_qty = direct
@@ -3477,6 +3676,9 @@ def _sourcing_pass(
                     None if ladders.synthetic(pick["venue"], c)
                     else pick["fill"].orders
                 ),
+                compressed_alloc=dict(pick["alloc"]),
+                compressed_landed_isk=pick["landed_cost"],
+                compressed_tax_isk=pick["tax_isk"],
             )
 
     # --- fill-price every direct buy ---------------------------------------
@@ -3956,22 +4158,6 @@ def invention_type_ids(conn, ref) -> set[int]:
     return market | adjusted
 
 
-def _multi_cycle_overhang(job_ends: list, horizon: datetime) -> int:
-    """Count active jobs whose end date lies beyond the next index run —
-    they occupy a real production line across the cycle boundary."""
-    overhang = 0
-    for end in job_ends:
-        try:
-            ends_at = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if ends_at.tzinfo is None:
-            ends_at = ends_at.replace(tzinfo=timezone.utc)
-        if ends_at > horizon:
-            overhang += 1
-    return overhang
-
-
 def snapshot_from_state(
     conn, prices=None, adjusted=None, region_wide=None,
     buy_venue=None, structure_units_cheaper=None, sell_ladders=None,
@@ -3987,33 +4173,25 @@ def snapshot_from_state(
     market.cached_hub_quotes — kept beside `prices` so the sourcing pass
     can weigh a structure-only ladder against Jita.
 
-    Slot pools are the user-entered totals net of MULTI-CYCLE jobs (still
-    running past the next index run, e.g. a weeks-long capital hull —
-    decision 2026-08-20). Single-cycle jobs do NOT reduce capacity: an
-    index run is planned for a moment when the previous cycle's jobs have
-    all delivered, and their output already counts as in-progress stock.
+    Slot pools are the Settings' pools, unchanged (v1.29 revision 6,
+    user ruling R2 2026-09-28). This drops the 2026-08-20 rule that
+    netted the pools of MULTI-CYCLE jobs still running past the next
+    index run (persisted on the run since v1.27.1): the open run is now
+    re-planned in place on every ESI update, mid-cycle, so jobs already
+    installed this cycle drop out through stock — their output counts as
+    in-progress — and subtracting them from the pool as well would count
+    them twice. ESI still stores job_ends; planning no longer reads them.
     """
     state = store.latest_esi_snapshot(conn)
     if state is None:
         return None
     settings = store.get_settings(conn)
-    horizon = datetime.now(timezone.utc) + timedelta(
-        hours=settings.max_run_duration_hours
-    )
-    job_ends = state.get("job_ends", {})
     return Snapshot(
         on_hand=state["on_hand"],
         in_progress=state["in_progress"],
         slots_available={
-            activity: max(
-                0,
-                total
-                - _multi_cycle_overhang(job_ends.get(activity, []), horizon),
-            )
-            for activity, total in (
-                (config.ACTIVITY_MANUFACTURING, settings.manufacturing_slots),
-                (config.ACTIVITY_REACTION, settings.reaction_slots),
-            )
+            config.ACTIVITY_MANUFACTURING: max(0, settings.manufacturing_slots),
+            config.ACTIVITY_REACTION: max(0, settings.reaction_slots),
         },
         # `is not None`, not truthiness: a price *model* may be an empty
         # mapping subclass whose .get() computes prices (test fixtures).
@@ -4032,7 +4210,236 @@ def snapshot_from_state(
         sell_quotes=dict(sell_quotes or {}),
         character_isk=state["character_isk"],
         corporation_isk=state["corporation_isk"],
+        fetched_at=state.get("fetched_at"),
+        # Revision 7: copied as store read it — store.latest_esi_snapshot
+        # is the one reader that normalises (the old scalar format and a
+        # missing column both arrive as None: the full wave).
+        job_starts=state.get("job_starts"),
     )
+
+
+def _installed_this_cycle(job_starts, cycle_cut) -> dict[int, int]:
+    """{type_id: units} of the jobs STARTED inside the current buying
+    cycle (v1.29 revision 7, user ruling 2026-09-29; contract amendment
+    6): the units of every Snapshot.job_starts pair whose start_date
+    falls strictly after `cycle_cut`.
+
+    `cycle_cut` is the moment the cycle opened — web takes it from
+    buying.buying_windows: the open run's BuyWindow.lo (the greatest
+    executed completed_at, else the run's opened_at / planned_start),
+    or, with no open run, the newest executed window's hi — as an aware
+    datetime or either text shape. Both sides are parsed with
+    costing._when and compared as datetimes, NEVER as text: on the same
+    day SQLite's '2026-09-25 10:00:00' sorts before ESI's
+    '2026-09-25T09:30:00Z' although it is 30 minutes later. Strict `>`:
+    a job started in the cut's own second belongs to the previous wave,
+    as the windows' (lo, hi] do. A start that is missing or does not
+    parse, or a malformed pair, counts nothing.
+
+    {} when there is no cut (a brand-new run with no executed
+    predecessor, steady state) or no record (job_starts None): the plan
+    sizes the full wave. Known limits, both from the cut being a
+    PC-clock click (SQLite datetime('now')) against CCP's server-clock
+    start dates (amendment 7): finals of the executed cycle installed
+    after Mark executed — or within the PC's clock skew of it — count as
+    the NEW cycle's wave, which then plans that many fewer (the Industry
+    Jobs page shows the installed count); and on the first cycle, finals
+    installed before the run was first planned (opened_at) are ignored
+    and planned again. Unlikely, not impossible. The late install also
+    counts TWICE on the Profit tab: the executed run's last plan (made
+    before the installs) still holds those finals as runs, and the new
+    run stamps them as installed_qty, so costing.hull_cost counts the
+    same hulls on both executed runs (review 2026-09-29)."""
+    cut = costing._when(cycle_cut)
+    if cut is None:
+        if cycle_cut is not None:
+            log.warning(
+                "cycle cut %r does not parse — sizing every final's "
+                "full wave",
+                cycle_cut,
+            )
+        return {}
+    if not job_starts:
+        return {}
+    installed: dict[int, int] = {}
+    for type_id, starts in job_starts.items():
+        total = 0
+        for pair in starts or ():
+            try:
+                start, units = pair
+                units = int(units)
+            except (TypeError, ValueError):
+                continue
+            when = costing._when(start)
+            if when is None or when <= cut or units <= 0:
+                continue
+            total += units
+        if total > 0:
+            installed[int(type_id)] = total
+    return installed
+
+
+def _with_hangar_ore(conn, ref, snapshot: Snapshot) -> tuple[Snapshot, dict[int, int]]:
+    """(the snapshot to plan against, {raw type_id: units credited}) —
+    user ruling R3 (2026-09-28): hangar compressed ore / moon ore / gas
+    counts as the raws it reprocesses into at the asserted yields
+    (industry.refined_equivalents: whole batches, one floor per material,
+    never ice), so ore bought but not yet refined lowers what the plan
+    buys. The credit lands on a COPY's on_hand (the caller's Snapshot is
+    not mutated) and the compressed units themselves stay listed: no
+    reader nets a compressed type (the sourcing pass's ore rows keep
+    on_hand_qty 0), so nothing counts twice. The Settings group toggles
+    do not gate it — they pick what the plan may BUY."""
+    settings = store.get_settings(conn)
+    credit = industry.refined_equivalents(
+        ref,
+        {
+            "ore": settings.compressed_ore_yield,
+            "gas": settings.compressed_gas_yield,
+        },
+        snapshot.on_hand,
+    )
+    if not credit:
+        return snapshot, {}
+    on_hand = dict(snapshot.on_hand)
+    for type_id, units in credit.items():
+        on_hand[type_id] = on_hand.get(type_id, 0) + units
+    return replace(snapshot, on_hand=on_hand), credit
+
+
+def _replaceable_run(conn, index_run_id: int) -> int:
+    """The run_number of `index_run_id` when it may be re-planned in
+    place — it exists, it is the NEWEST run (buying.collecting_run_id's
+    open run, contract review A1) and it is not executed; ValueError
+    naming the reason otherwise. Reads only, so it is the fail-fast and
+    the error message, never the guard: _replace_run_row re-tests the
+    same conditions inside its write."""
+    row = conn.execute(
+        "SELECT run_number, status, "
+        "(SELECT MAX(index_run_id) FROM index_run) AS newest "
+        "FROM index_run WHERE index_run_id = ?",
+        (index_run_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"index run {index_run_id} does not exist")
+    if row["status"] == "complete":
+        raise ValueError(
+            f"run {row['run_number']} is executed — an executed run is "
+            "never re-planned"
+        )
+    if row["newest"] != index_run_id:
+        raise ValueError(
+            f"run {row['run_number']} is not the newest run — only the "
+            "open run is re-planned in place"
+        )
+    return int(row["run_number"])
+
+
+def _insert_run_row(
+    conn, run_values: dict, stock_at: str | None = None
+) -> tuple[int, int]:
+    """INSERT a new index_run with the per-run columns in `run_values`;
+    (index_run_id, run_number). The run number is assigned inside the
+    INSERT itself: a separate MAX+1 read raced concurrent /run requests
+    into duplicate numbers (the UNIQUE index on run_number is the
+    backstop). opened_at — when the cycle's run was FIRST planned, what
+    buying.buying_windows opens its first window at (contract review
+    A3) — is datetime('now'): the click that created the run.
+
+    planned_start is the snapshot's fetched_at (`stock_at`), or now when
+    there is none or it reads later than now — the SAME expression as
+    _replace_run_row's (pre-release review 2026-09-30). It is
+    costing._pre_plan's cut, and the usual cycle turn (Update from ESI,
+    Mark executed, buy, then Plan) creates a run from a snapshot that
+    predates the purchases made after Mark executed: stamping now classed
+    them as stock the plan had netted. With the snapshot's time a second
+    Plan from the same snapshot also leaves planned_start where it was.
+    It can therefore sit before opened_at (and before the previous run's
+    completed_at); the buying windows read opened_at, never it."""
+    columns = list(run_values)
+    cur = conn.execute(
+        "INSERT INTO index_run (run_number, planned_start, opened_at, "
+        f"status, {', '.join(columns)}) "
+        "SELECT COALESCE(MAX(run_number), 0) + 1, "
+        "CASE WHEN ? IS NOT NULL AND ? < datetime('now') "
+        "THEN ? ELSE datetime('now') END, "
+        f"datetime('now'), 'planned', {', '.join('?' for _ in columns)} "
+        "FROM index_run",
+        [stock_at, stock_at, stock_at, *(run_values[c] for c in columns)],
+    )
+    index_run_id = cur.lastrowid
+    run_number = conn.execute(
+        "SELECT run_number FROM index_run WHERE index_run_id = ?",
+        (index_run_id,),
+    ).fetchone()["run_number"]
+    return index_run_id, run_number
+
+
+def _replace_run_row(
+    conn, index_run_id: int, run_values: dict, stock_at: str | None = None
+) -> tuple[int, int]:
+    """Steps 1-3 of an in-place re-plan (v1.29 revision 6, ruling R1;
+    contract review A2), opening the caller's write transaction:
+
+    1. the GUARDED UPDATE — planned_start := the snapshot's fetched_at
+       (`stock_at`), or now when there is none or it reads later than now
+       (review 2026-09-28: planned_start is costing._pre_plan's cut — a
+       purchase dated at or before it counts as stock the plan netted —
+       so a ▶ Plan from a stored snapshot hours old must not move the cut
+       past purchases that snapshot never saw; an ESI update's re-plan
+       reads the snapshot it just pulled, so its cut is that pull) — plus
+       every per-run column the INSERT writes, only WHERE the run is still not
+       executed AND still the newest. The test sits inside the write
+       because a plan takes ~1.6 s and a Mark executed or a discard can
+       land meanwhile; a check made before planning races. No row
+       updated → rollback + ValueError (the reason re-read after the
+       rollback). opened_at = COALESCE(opened_at, planned_start) in the
+       SAME statement: SQLite evaluates every SET expression against the
+       old row, so a legacy open run (NULL opened_at) keeps its original
+       opening and the cycle's first buying window never moves (A3).
+       run_number, status, actual_start, planned_end and completed_at
+       are never written.
+    2. the pipeline attribution rows, BEFORE the items they reference
+       (foreign_keys = ON — web.run_delete's order);
+    3. the items, then the invention vintage.
+
+    The index_run row is UPDATEd, never deleted, so run_purchase,
+    run_purchase_refine, job_link, cost_lot and finished_batch keep
+    pointing at it; nothing but index_run_item_pipeline references
+    index_run_item_id. Written inline here (the engine owns this persist
+    SQL), not as a store helper. The caller inserts the new rows under
+    the same id and commits — or rolls everything back."""
+    columns = list(run_values)
+    cur = conn.execute(
+        "UPDATE index_run SET opened_at = COALESCE(opened_at, planned_start), "
+        "planned_start = CASE WHEN ? IS NOT NULL AND ? < datetime('now') "
+        "THEN ? ELSE datetime('now') END, "
+        f"{', '.join(f'{c} = ?' for c in columns)} "
+        "WHERE index_run_id = ? AND status != 'complete' "
+        "AND index_run_id = (SELECT MAX(index_run_id) FROM index_run)",
+        [
+            stock_at, stock_at, stock_at,
+            *(run_values[c] for c in columns), index_run_id,
+        ],
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        _replaceable_run(conn, index_run_id)  # raises with the reason
+        raise ValueError(f"index run {index_run_id} could not be re-planned")
+    conn.execute(
+        "DELETE FROM index_run_item_pipeline WHERE index_run_item_id IN "
+        "(SELECT index_run_item_id FROM index_run_item WHERE index_run_id = ?)",
+        (index_run_id,),
+    )
+    conn.execute("DELETE FROM index_run_item WHERE index_run_id = ?", (index_run_id,))
+    conn.execute(
+        "DELETE FROM index_run_invention WHERE index_run_id = ?", (index_run_id,)
+    )
+    run_number = conn.execute(
+        "SELECT run_number FROM index_run WHERE index_run_id = ?",
+        (index_run_id,),
+    ).fetchone()["run_number"]
+    return index_run_id, run_number
 
 
 def plan_index_run(
@@ -4044,6 +4451,8 @@ def plan_index_run(
     alchemy: bool = True,
     sourcing: bool = True,
     backfill: bool = True,
+    replace_index_run_id: int | None = None,
+    cycle_cut: datetime | str | None = None,
 ) -> Plan:
     """Run planning phases 2-7 (with the consumption feedback loop) and
     (optionally) persist the index run. output_qty (built-scale expansion
@@ -4052,12 +4461,68 @@ def plan_index_run(
     (skip the v1.25 sourcing pass — fill pricing and compressed
     substitution — likewise) and backfill=False (skip the v1.27.1
     stock-aware slot backfill) are the steady-state path's seams; the
-    real /run path never passes any."""
+    real /run path never passes any.
+
+    replace_index_run_id (v1.29 revision 6, user ruling R1 2026-09-28:
+    one run per buying cycle, kept live) re-plans that OPEN run in place
+    instead of creating a new one: same index_run_id and run_number,
+    planned_start moved to the snapshot's fetched_at (now when the
+    Snapshot carries none — review 2026-09-28), every per-run column the
+    INSERT writes rewritten, its items / pipeline attribution / invention rows
+    replaced — all in one transaction (_replace_run_row). Its status,
+    opened_at (beyond a legacy run's first COALESCE), and its
+    run_purchase / run_purchase_refine rows (keyed by the run id) are
+    kept. The run must be the newest and not executed at the moment of
+    the write, else ValueError and nothing changes. Needs persist=True.
+
+    Hangar compressed ore (ruling R3): the ESI hangar's compressed ore /
+    moon ore / gas counts as the raws it reprocesses into at the asserted
+    yields (industry.refined_equivalents; never ice). The credit is
+    computed once here and the plan runs against a COPY of the snapshot
+    whose on_hand carries it (contract review A11), so every reader —
+    Phase 4, the alchemy pass's added raw rows, the allocation-time and
+    install-time availability — sees one stock figure; the caller's
+    Snapshot is not mutated. Each item records the ore-derived part as
+    on_hand_from_ore_qty. plan_steady_state's snapshots hold no
+    compressed types, so steady state is unchanged.
+
+    cycle_cut (v1.29 revision 7, user ruling 2026-09-29: final jobs
+    started inside the current buying cycle are this cycle's wave; the
+    plan sizes the rest; every ESI update re-plans the open run): the
+    moment the current buying cycle opened, an aware datetime or either
+    timestamp text (web passes buying.buying_windows' figure — see
+    _installed_this_cycle). The Snapshot's job_starts after it become
+    every row's installed_qty, stamped before Phase 4: a final builds
+    only the part of its wave not yet installed (_final_wave, in Phase 4
+    and the feedback loop alike) while its cycle need — every stage's
+    target, the R7 proration basis — stays the full wave, and a consumer
+    whose jobs are all installed still "holds jobs" for its suppliers'
+    targets. So a re-plan after half the wave is installed plans the
+    other half and the same intermediates; after the whole wave, no
+    final runs and the intermediates unchanged (they are the next
+    wave's stock). None (the default; steady state, a brand-new run
+    with no executed predecessor) or a snapshot with no job_starts:
+    nothing counts as installed — the full wave, the pre-revision-7
+    plan. The cut's known limits are _installed_this_cycle's."""
+    if replace_index_run_id is not None:
+        if not persist:
+            raise ValueError("replace_index_run_id needs persist=True")
+        # Fail fast before ~1.6 s of planning. NOT the guard: a Mark
+        # executed or a discard can land while the plan computes, so
+        # _replace_run_row re-tests inside the write transaction.
+        _replaceable_run(conn, replace_index_run_id)
+    snapshot, ore_credit = _with_hangar_ore(conn, ref, snapshot)
+    # Revision 7: this cycle's installs per type, from the job starts
+    # after the cut — computed once, stamped on every row.
+    installed = _installed_this_cycle(snapshot.job_starts, cycle_cut)
     merged = _expand_and_merge(conn, ref, output_qty)
     # Phase 3.5 (user ruling 2026-09-09): one cycle's consumption at the
     # jobs' own rounding — the target and deficit basis — and the shares
-    # the feedback loop prorates by.
+    # the feedback loop prorates by. It reads the requested wave only,
+    # never installed_qty, so the cycle need stays the full wave.
     steady_shares = _cycle_need(conn, ref, merged)
+    for item in merged.values():
+        item.installed_qty = installed.get(item.type_id, 0)
     _apply_targets(conn, ref, merged, snapshot, alchemy)
     _size_jobs(conn, ref, merged)
     _allocate_slots(conn, ref, merged, snapshot, backfill=backfill)
@@ -4079,20 +4544,24 @@ def plan_index_run(
     # where tiers trade the last contended slots back and forth forever:
     # the final allocation stands and low_stock / capacity_limited
     # (evaluated from it) tell the truth about any residue. Finals keep
-    # their exact-requested rule; steady state converges after one
-    # correction (the single pass this loop replaces).
+    # Phase 4's wave rule — the requested wave less what this cycle
+    # already installed (_final_wave, revision 7) — and steady state
+    # converges after one correction (the single pass this loop
+    # replaces).
     #
     # Review 2026-09-05: (A1) a dual-role final's COMPONENT share joins the
-    # loop — corrected = requested + max(0, draw − stock − in flight),
-    # which for a single-role final (no draw) still resolves to exactly
-    # the request. (A3, ruling R7) an intermediate's target follows the
-    # consumers that actually HOLD jobs: the Phase 4 stockpile figure
-    # (one steady cycle × (1 + buffer)) prorated to the share of its
-    # steady draw that comes from consumers with runs this cycle, plus
-    # the composite extra-runs adder only where the consuming composite
-    # holds jobs — so a stage whose consumers all flipped to buy (or were
-    # starved of slots) is neither bought nor built to a BOM target
-    # nobody draws on (no floor kept). The review's literal proposal,
+    # loop — corrected = wave_left + max(0, draw − free stock) (revision
+    # 7; before it, requested + max(0, draw − stock − in flight)), which
+    # for a single-role final (no draw) still resolves to exactly the
+    # wave not yet installed. (A3, ruling R7) an intermediate's target
+    # follows the consumers that actually HOLD jobs: the Phase 4
+    # stockpile figure (one steady cycle × (1 + buffer)) prorated to the
+    # share of its steady draw that comes from consumers with runs this
+    # cycle — or, since revision 7, with jobs already started this cycle
+    # (installed_qty > 0) — plus the composite extra-runs adder only
+    # where the consuming composite holds jobs — so a stage whose
+    # consumers all flipped to buy (or were starved of slots) is neither
+    # bought nor built to a BOM target nobody draws on (no floor kept). The review's literal proposal,
     # target = ceil(realized draw × (1 + buffer)), was tried and
     # rejected: a catch-up consumer's draw is several cycles' worth, and
     # a target scaled to it COMPOUNDS down the chain (deficit ≈ 2.05 ×
@@ -4125,17 +4594,26 @@ def plan_index_run(
                 continue
             draw = draft_draw.get(item.type_id, 0)
             if item.type_id in final_products:
-                # Target stays the Phase 4 figure (the cycle's output).
-                corrected = item.requested_qty + max(
-                    0, draw - item.on_hand_qty - item.in_progress_qty
-                )
+                # Target stays the Phase 4 figure (the cycle's output);
+                # the deficit is Phase 4's rule over the realized draw —
+                # the wave not yet installed plus the component draw the
+                # free stock does not cover (_final_wave, revision 7).
+                _credit, wave_left, free_stock = _final_wave(ref, item)
+                corrected = wave_left + max(0, draw - free_stock)
             else:
                 shares = steady_shares.get(item.type_id, {})
                 total_share = sum(shares.values())
+                # A consumer holds jobs this cycle when it has runs left
+                # to plan OR started jobs this cycle (revision 7,
+                # contract amendment 3): a wave fully installed plans 0
+                # runs, and without the second arm its suppliers'
+                # targets — the next wave's stock — collapsed to 0 all
+                # the way down the chain.
                 active_share = sum(
                     units
                     for consumer_id, units in shares.items()
                     if merged[consumer_id].runs_allocated > 0
+                    or merged[consumer_id].installed_qty > 0
                 )
                 fraction = (
                     active_share / total_share if total_share else 0.0
@@ -4222,48 +4700,84 @@ def plan_index_run(
     # converged (the pass adds nothing to the plan items).
     invention = _invention_pass(conn, ref, merged, snapshot)
 
-    index_run_id = None
-    if persist:
-        # The run number is assigned inside the INSERT itself: a separate
-        # MAX+1 read raced concurrent /run requests into duplicate numbers
-        # (the UNIQUE index on run_number is the backstop).
-        # Contract C2 (2026-09-05): the plan-time courier rates ride the
-        # run, so the realized costing lands this run's freight at the
-        # rates it was planned under rather than whatever the settings
-        # say when the run is costed.
-        settings_ = store.get_settings(conn)
-        cur = conn.execute(
-            "INSERT INTO index_run (run_number, planned_start, status, "
-            "wallet_character_isk, wallet_corporation_isk, "
-            "compressed_saving_isk, freight_in_isk_per_m3, "
-            "structure_freight_in_isk_per_m3, hub_price_basis, "
-            "structure_price_basis, manufacturing_slots_available, "
-            "reaction_slots_available) "
-            "SELECT COALESCE(MAX(run_number), 0) + 1, datetime('now'), "
-            "'planned', ?, ?, ?, ?, ?, ?, ?, ?, ? FROM index_run",
-            (
-                snapshot.character_isk,
-                snapshot.corporation_isk,
-                compressed_saving,
-                settings_.freight_in_isk_per_m3,
-                settings_.structure_freight_in_isk_per_m3,
-                settings_.hub_price_basis,
-                settings_.structure_price_basis,
-                # v1.27.1 (schema 11): the pools the plan was built and
-                # capped against — the settings' pools less multi-cycle
-                # overhang — so the run page measures it against them.
-                snapshot.slots_available.get(config.ACTIVITY_MANUFACTURING),
-                snapshot.slots_available.get(config.ACTIVITY_REACTION),
-            ),
+    # R3: the ore-derived part of each row's netted stock. A compressed
+    # ore row the sourcing pass added never nets hangar ore (its
+    # on_hand_qty stays 0), so it records none either.
+    for item in merged.values():
+        item.on_hand_from_ore_qty = (
+            0 if item.compressed_outputs else ore_credit.get(item.type_id, 0)
         )
-        index_run_id = cur.lastrowid
-        run_number = conn.execute(
-            "SELECT run_number FROM index_run WHERE index_run_id = ?",
-            (index_run_id,),
-        ).fetchone()["run_number"]
-    else:
-        run_number = store.next_run_number(conn)
-    if persist:
+        # Revision 7: the rows added after Phase 4 (the alchemy routes,
+        # the compressed buys) get this cycle's installs too, so every
+        # persisted row carries the figure (0 = none this cycle).
+        item.installed_qty = installed.get(item.type_id, 0)
+        # Revision 7 fix pass: the wave a final was sized against, for
+        # the Industry Jobs badge and the deficit dialog (only finals
+        # carry a requested share; None elsewhere).
+        item.wave_qty = (
+            _wave_units(ref, item) if item.requested_qty > 0 else None
+        )
+
+    if not persist:
+        return Plan(
+            index_run_id=None,
+            run_number=store.next_run_number(conn),
+            items=merged,
+            invention=invention,
+            compressed_saving_isk=compressed_saving,
+        )
+
+    # Contract C2 (2026-09-05): the plan-time courier rates ride the
+    # run, so the realized costing lands this run's freight at the
+    # rates it was planned under rather than whatever the settings
+    # say when the run is costed. v1.29 (user ruling 2026-09-28): the
+    # third rate — the default inbound freight for a purchase at any
+    # location other than Jita 4-4 or the structure market — rides
+    # the run the same way; runs planned before it carry NULL and the
+    # readers fall back to the live setting (same vintage rule).
+    # Review 2026-09-28: so does the structure market the plan bought
+    # against — an executed run's purchases are classed hub /
+    # structure / other against it (buying.purchase_venue), so a
+    # later Settings change of structure does not reclass history.
+    settings_ = store.get_settings(conn)
+    run_values = {
+        "wallet_character_isk": snapshot.character_isk,
+        "wallet_corporation_isk": snapshot.corporation_isk,
+        "compressed_saving_isk": compressed_saving,
+        "freight_in_isk_per_m3": settings_.freight_in_isk_per_m3,
+        "structure_freight_in_isk_per_m3": (
+            settings_.structure_freight_in_isk_per_m3
+        ),
+        "freight_in_default_isk_per_m3": settings_.freight_in_default_isk_per_m3,
+        "hub_price_basis": settings_.hub_price_basis,
+        "structure_price_basis": settings_.structure_price_basis,
+        # v1.27.1 (schema 11): the pools the plan was built and capped
+        # against, so the run page measures it against them — since
+        # v1.29 revision 6 (ruling R2) the settings' pools unchanged.
+        "manufacturing_slots_available": snapshot.slots_available.get(
+            config.ACTIVITY_MANUFACTURING
+        ),
+        "reaction_slots_available": snapshot.slots_available.get(
+            config.ACTIVITY_REACTION
+        ),
+        "structure_market_id": settings_.structure_market(),
+    }
+    # ONE transaction from the run row to the commit. Any failure rolls
+    # every write back and re-raises: left open, a half-written (or, on
+    # a replace, half-deleted) run would be committed by the next writer
+    # on this connection — ledger._begin does not BEGIN inside an open
+    # transaction, so the purchase matcher that follows a plan would
+    # (contract review A2, 2026-09-28).
+    try:
+        if replace_index_run_id is None:
+            index_run_id, run_number = _insert_run_row(
+                conn, run_values, stock_at=snapshot.fetched_at
+            )
+        else:
+            index_run_id, run_number = _replace_run_row(
+                conn, replace_index_run_id, run_values,
+                stock_at=snapshot.fetched_at,
+            )
         for item in merged.values():
             cur = conn.execute(
                 """
@@ -4288,10 +4802,14 @@ def plan_index_run(
                     compressed_wanted_qty, market_buy_qty, market_fallback_qty,
                     install_runs, install_jobs, install_limited_by,
                     install_priority, install_draw_qty, install_short_qty,
-                    install_return, install_per_job, cycle_need_qty
+                    install_return, install_per_job, cycle_need_qty,
+                    compressed_alloc, compressed_landed_isk,
+                    compressed_tax_isk, direct_landed_isk,
+                    on_hand_from_ore_qty, installed_qty, requested_qty,
+                    wave_qty
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                           ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?,?,?,?,?,?,?,?,?,?)
+                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     index_run_id,
@@ -4359,6 +4877,20 @@ def plan_index_run(
                     item.install_return,
                     item.install_per_job,
                     item.cycle_need_qty,
+                    (
+                        json.dumps(
+                            {str(m): s for m, s in item.compressed_alloc.items()}
+                        )
+                        if item.compressed_alloc is not None
+                        else None
+                    ),
+                    item.compressed_landed_isk,
+                    item.compressed_tax_isk,
+                    item.direct_landed_isk,
+                    item.on_hand_from_ore_qty,
+                    item.installed_qty,
+                    item.requested_qty,
+                    item.wave_qty,
                 ),
             )
             item_id = cur.lastrowid
@@ -4403,6 +4935,9 @@ def plan_index_run(
             ],
         )
         conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     return Plan(
         index_run_id=index_run_id,
         run_number=run_number,
@@ -4482,6 +5017,9 @@ def plan_steady_state(conn, ref, snapshot: Snapshot) -> Plan:
         snapshot,
         on_hand={},
         in_progress={},
+        # No job starts either (revision 7): the steady cycle installs
+        # its whole wave, and no cut is ever passed here anyway.
+        job_starts=None,
         character_isk=0.0,
         corporation_isk=0.0,
     )

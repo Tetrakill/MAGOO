@@ -811,7 +811,7 @@ def test_install_columns_persist_and_migrate(conn, ref):
         (plan.index_run_id, hulk.install_limited_by),
     ).fetchone()
     assert bound["install_short_qty"] > 0
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 11
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 12
 
 
 def test_schema_9_database_gains_the_columns(tmp_path, monkeypatch):
@@ -859,12 +859,13 @@ def test_schema_9_database_gains_the_columns(tmp_path, monkeypatch):
 
 
 def test_run_persists_and_shows_the_pool_it_was_planned_against(seeded_client, ref):
-    """Review 2026-09-10: the engine allocates and caps against the
-    settings' pools LESS the multi-cycle jobs running past the next run
-    (engine.snapshot_from_state), so the run page must measure the plan
-    against that pool, not the settings' figure — it is persisted on the
-    run (schema 11). 480 far-future manufacturing job ends on a 500-slot
-    pool leave 20 slots."""
+    """Review 2026-09-10 persisted the pool a run was planned against
+    (schema 11). Since v1.29 revision 6 (user ruling R2 2026-09-28) that
+    pool is always the settings' — running jobs are never subtracted
+    (they count through their output in progress) — so 480 far-future
+    manufacturing job ends on a 500-slot pool still leave 500, the page
+    measures the plan against 500 and says nothing of multi-cycle jobs
+    (contract review A7)."""
     import json
 
     c = sqlite3.connect(config.DB_PATH)
@@ -874,24 +875,21 @@ def test_run_persists_and_shows_the_pool_it_was_planned_against(seeded_client, r
         (json.dumps({"1": ["2099-01-01T00:00:00Z"] * 480}),),
     )
     c.commit()
-    assert engine.snapshot_from_state(c).slots_available[config.ACTIVITY_MANUFACTURING] == 20
+    assert engine.snapshot_from_state(c).slots_available[config.ACTIVITY_MANUFACTURING] == 500
     run_id = _plan(seeded_client)
     run = c.execute("SELECT * FROM index_run WHERE index_run_id = ?", (run_id,)).fetchone()
-    assert run["manufacturing_slots_available"] == 20 and run["reaction_slots_available"] == 500
+    assert run["manufacturing_slots_available"] == 500 and run["reaction_slots_available"] == 500
     mfg = c.execute(
-        "SELECT SUM(jobs_allocated) AS j, SUM(install_jobs) AS n FROM index_run_item "
+        "SELECT SUM(install_jobs) AS n FROM index_run_item "
         "WHERE index_run_id = ? AND activity_id = 1 AND recommended_build_qty > 0",
         (run_id,),
     ).fetchone()
     c.close()
     html = seeded_client.get(f"/runs/{run_id}").get_data(as_text=True)
-    assert f">{mfg['n']}<span class=\"sub\">/ 20" in html
-    assert "20 of the 500 configured slots" in html
-    assert mfg["n"] <= 20  # the startable jobs never exceed the pool the run had
-    if mfg["j"] > 20:
-        assert f"{mfg['j'] - 20} more than the pool" in html
-    else:
-        assert "more than the pool" not in html
+    assert f">{mfg['n']}<span class=\"sub\">/ 500" in html
+    assert "configured slots" not in html
+    assert "multi-cycle jobs" not in html
+    assert "the pool this run was planned against" not in html
 
 
 def test_run_page_names_the_pool_for_a_slot_trimmed_row(seeded_client, ref):
@@ -1043,9 +1041,10 @@ def test_the_slot_pool_clause_does_not_blame_overhang_for_a_settings_change(
     """Review 2026-09-10: the clause compared the run's PERSISTED plan-time
     pool (schema 11) with TODAY's setting and blamed any difference on
     multi-cycle jobs, so lowering the setting after planning rendered the
-    arithmetically impossible '500 of the 20 configured slots'. Overhang
-    can only REDUCE the pool, so only that direction earns the
-    explanation."""
+    arithmetically impossible '500 of the 20 configured slots'. Since
+    revision 6 (ruling R2) no pool is netted at all, so either direction
+    reads the same: the pool the run was planned against, and what
+    Settings reads now."""
     run_id = _plan(seeded_client)
     c = sqlite3.connect(config.DB_PATH)
     c.row_factory = sqlite3.Row

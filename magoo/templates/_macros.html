@@ -1,6 +1,6 @@
-{# Shared table macros for the run Plan tab (execution=true: persisted
-   plan-time snapshot) and the Planning Slot Planner (execution=false:
-   recomputed live, nothing saved). Import with context —
+{# Shared table macros for the run Industry Jobs tab (execution=true:
+   persisted plan-time snapshot), the Buy tab and the Planning Slot
+   Planner (execution=false: recomputed live, nothing saved). Import with context —
    {% import "_macros.html" as m with context %} — the macros read
    structure_buys / split_buys / venue_qty / unsourced / compressed /
    compressed_covered / settings / final_ids / final_net_margin
@@ -43,18 +43,19 @@
 
 {# Compressed sourcing (v1.25). compressed_badge: a compressed ore / moon
    ore / gas bought to be reprocessed — the tooltip names what it covers
-   and what is left over. covered_badge: a raw whose purchase the
-   compressed buys part-cover — this row is the direct remainder. #}
+   and what is left over. (A covered raw's own badge lives in the page
+   that shows it: the Buy tab's "N via compressed", the Stockpile tab's
+   "compressed".) #}
 {% macro compressed_badge(i, plan_time=true) -%}
     {% if compressed is defined and i.type_id in compressed %}{% set outs = compressed[i.type_id] %}<span class="badge accent" title="bought compressed and reprocessed at the {{ 'plan-time ' if plan_time }}yield — covers {% for m, name, out, used in outs if used %}{{ used|qty }} {{ name }}{{ ', ' if not loop.last }}{% endfor %}{% for m, name, out, used in outs if out > used %}; leftover {{ (out - used)|qty }} {{ name }}{% endfor %}; {% if i.compressed_fill_orders is none %}unit price is the market's best order for any quantity (Min Sell / Max Buy basis){% else %}unit price is the average of the {{ i.compressed_fill_orders|qty }} cheapest sell order{{ 's' if i.compressed_fill_orders != 1 }} walked{{ ' at plan time' if plan_time }}{% endif %}{% if i.compressed_wanted_qty is defined and i.compressed_wanted_qty and i.compressed_wanted_qty > i.recommended_buy_qty %}; the plan wanted {{ i.compressed_wanted_qty|qty }} but the market could fill only {{ i.recommended_buy_qty|qty }} in whole batches — the raws it covers keep a larger direct buy{% endif %}">compressed</span>{% endif %}
 {%- endmacro %}
 
-{% macro covered_badge(i, plan_time=true) -%}
-    {% if compressed_covered is defined and i.type_id in compressed_covered %}<span class="badge accent" title="{{ compressed_covered[i.type_id]|qty }} of {{ (compressed_covered[i.type_id] + (i.recommended_buy_qty or 0))|qty }} units this cycle come from reprocessing compressed purchases{{ ' (plan time)' if plan_time }} — this row is the direct remainder">{{ compressed_covered[i.type_id]|qty }} via compressed</span>{% endif %}
-{%- endmacro %}
-
-{% macro item_cell(i) -%}
-    <td><button type="button" class="itemlink"
+{# item_button is the control; item_cell is it wrapped in its own <td>.
+   The Buy tab's item column carries badges beside the name, so it calls
+   the button directly (v1.29). Either way the page must also include
+   _deficit_dialog.html and pass final_ids. #}
+{% macro item_button(i) -%}
+    <button type="button" class="itemlink"
         title="why this quantity — target, stock and jobs at plan time"
         data-name="{{ i.name }}" data-type="{{ i.type_id }}"
         data-kind="{{ 'final' if i.type_id in final_ids
@@ -68,7 +69,14 @@
         data-build="{{ i.recommended_build_qty or 0 }}"
         data-covered="{{ (i.compressed_covered_qty or 0) if i.compressed_covered_qty is defined else 0 }}"
         data-alchemy="{{ (i.alchemy_output_qty or 0) if i.alchemy_output_qty is defined else 0 }}"
-        onclick="openDeficit(this)">{{ i.name }}</button></td>
+        data-installed="{{ (i.installed_qty or 0) if i.installed_qty is defined else 0 }}"
+        data-requested="{{ i.requested_qty if (i.requested_qty is defined and i.requested_qty is not none) else '' }}"
+        data-wave="{{ i.wave_qty if (i.wave_qty is defined and i.wave_qty is not none) else '' }}"
+        onclick="openDeficit(this)">{{ i.name }}</button>
+{%- endmacro %}
+
+{% macro item_cell(i) -%}
+    <td>{{ item_button(i) }}</td>
 {%- endmacro %}
 
 {# Section-header stats (2026-09-01): every job-table h2/h3 on Plan, Chain
@@ -93,7 +101,7 @@
    runs, the per-job count rounded up to what the inputs feed), a ship or
    a saturating reaction as full jobs at the plan's count plus one short
    last job ("· last N") — with the plan's own figures in the tooltip and
-   a `short` badge. Plan tab only (execution=true): the Slot Planner is a
+   a `short` badge. Industry Jobs tab only (execution=true): the Slot Planner is a
    what-if with no stock, and a run planned before the check (NULLs) reads
    the plan. #}
 {% macro job_cells(i, execution=true) -%}
@@ -109,13 +117,33 @@
        after the Phase 6 backfill. #}
     {% set pool_cut = cut and i.install_limited_by is defined and i.install_limited_by is not none and i.install_limited_by < 0 %}
     <td class="num" data-sort="{{ last if (cut and jobs == 1) else (per_job if jobs else 0) }}"
-        title="{% if cut %}run {{ runs|qty }} of the {{ i.runs_allocated|qty }} planned runs{% if jobs %}{% if uniform %} as {{ jobs }} job{{ 's' if jobs != 1 }} of {{ per_job|qty }}{% if per_job < plan_per_job %} — the plan's {{ plan_per_job|qty }} per job, rounded to what the inputs feed{% endif %}{% elif jobs == 1 %} as 1 job of {{ last|qty }}{% else %}: {{ jobs - 1 }} job{{ 's' if jobs - 1 != 1 }} of {{ per_job|qty }} and a last job of {{ last|qty }}{% endif %}{% endif %}{% if pool_cut %} — the pool has no free slot for the rest this cycle (the plan lists more jobs than the pool){% else %} — no more can run this cycle (short on {{ name_of(i.install_limited_by) if i.install_limited_by is not none else 'an input' }}){% endif %}; the plan wanted {{ i.jobs_allocated }} job(s) of {{ plan_per_job|qty }}{% else %}{{ i.runs_allocated|qty }} runs across {{ i.jobs_allocated }} job(s){% endif %}; max {{ i.max_runs_per_job|qty }}/job">
+        title="{% if cut %}run {{ runs|qty }} of the {{ i.runs_allocated|qty }} planned runs{% if jobs %}{% if uniform %} as {{ jobs }} job{{ 's' if jobs != 1 }} of {{ per_job|qty }}{% if per_job < plan_per_job %} — the plan's {{ plan_per_job|qty }} per job, rounded to what the inputs feed{% endif %}{% elif jobs == 1 %} as 1 job of {{ last|qty }}{% else %}: {{ jobs - 1 }} job{{ 's' if jobs - 1 != 1 }} of {{ per_job|qty }} and a last job of {{ last|qty }}{% endif %}{% endif %}{% if pool_cut %} — the pool has no free slot for the rest this cycle (the plan lists more jobs than the pool){% else %} — no more can run this cycle (short on {{ name_of(i.install_limited_by) if i.install_limited_by is not none else 'an input' }}){% endif %}; the plan wanted {{ i.jobs_allocated }} job(s) of {{ plan_per_job|qty }}{% elif not i.jobs_allocated %}no job left to run this cycle{% if i.installed_qty is defined and i.installed_qty %} — this cycle's wave is already installed{% endif %}{% else %}{{ i.runs_allocated|qty }} runs across {{ i.jobs_allocated }} job(s){% endif %}{% if i.jobs_allocated %}; max {{ i.max_runs_per_job|qty }}/job{% endif %}">
       {% if not jobs %}—{% elif cut and jobs == 1 %}{{ last|qty }}{% else %}{{ per_job|qty }}{% if cut and last != per_job %} <span class="muted">· last {{ last|qty }}</span>{% endif %}{% endif %}</td>
     <td class="num {% if cut %}{{ 'bad' if not jobs else 'warn' }}{% endif %}" data-sort="{{ jobs }}"{% if cut %} title="{% if pool_cut %}{{ jobs }} of the {{ i.jobs_allocated }} planned jobs have a slot this cycle — the pool has no free slot for the rest{% elif jobs == i.jobs_allocated %}{% if uniform %}every planned job runs, but at {{ per_job|qty }} runs each rather than the plan's {{ plan_per_job|qty }}{% else %}every planned job runs; the last is short at {{ last|qty }} run{{ 's' if last != 1 }} rather than {{ per_job|qty }}{% endif %} — no more can run this cycle{% else %}{{ jobs }} of the {{ i.jobs_allocated }} planned jobs run this cycle{% endif %}"{% endif %}>{{ jobs }}</td>
     {% set build_qty = (runs * i.portion_size) if cut else i.recommended_build_qty %}
-    <td class="num" data-sort="{{ build_qty }}"{% if cut %} title="the plan builds {{ i.recommended_build_qty|qty }}; {{ build_qty|qty }} can be started now"{% endif %}>{{ build_qty|qty }}</td>
+    <td class="num" data-sort="{{ build_qty }}"{% if cut %} title="the plan builds {{ i.recommended_build_qty|qty }}; {{ build_qty|qty }} can be started now"{% endif %}>{% if not cut and not jobs %}—{% else %}{{ build_qty|qty }}{% endif %}</td>
     {% set job_runs = last if (cut and jobs == 1) else per_job %}
-    <td class="num"{% if cut and jobs > 1 and last != per_job %} title="the full jobs; the last job of {{ last|qty }} run{{ 's' if last != 1 }} takes {{ (i.time_per_run * last)|hours }}"{% endif %}>{% if cut and not jobs %}—{% else %}{{ (i.time_per_run * job_runs)|hours }}{% endif %}</td>
+    <td class="num"{% if cut and jobs > 1 and last != per_job %} title="the full jobs; the last job of {{ last|qty }} run{{ 's' if last != 1 }} takes {{ (i.time_per_run * last)|hours }}"{% endif %}>{% if not jobs %}—{% else %}{{ (i.time_per_run * job_runs)|hours }}{% endif %}</td>
+{%- endmacro %}
+
+{# This cycle's wave already installed (v1.29 revision 7, user ruling
+   2026-09-29): a final's jobs started after the cycle cut (the buying
+   window's lower bound — web._cycle_cut) are this cycle's wave, so the
+   plan sizes only the rest and the row's jobs are the remainder. N is the
+   part of the wave installed — installed_qty capped at the wave; units
+   installed beyond it count as stock and the title says so — and M the
+   wave the engine sized against (index_run_item.wave_qty: the request,
+   or once installs exist the whole blueprint copies it was planned at,
+   contract amendment 8 — so 8 requested on 10-run copies reads 10/10,
+   never 10/8; fix pass 2026-09-29). Rows planned before wave_qty fall
+   back to target_stock_qty. Finals only: installed_qty is stamped on
+   every row but feeds nothing else a reader sees. `good` once nothing is
+   left to run; neutral while jobs remain. Needs final_ids; reads
+   cycle_cut_label when the page passes it (a superseded run has no
+   window, so none). #}
+{% macro installed_badge(i) -%}
+    {% set n = (i.installed_qty or 0) if i.installed_qty is defined else 0 %}{% if n > 0 and final_ids is defined and i.type_id in final_ids %}{% set wave = i.wave_qty if (i.wave_qty is defined and i.wave_qty is not none) else i.target_stock_qty %}{% set req = i.requested_qty if (i.requested_qty is defined and i.requested_qty is not none) else none %}{% set credit = [n, wave]|min %}<span class="badge{{ ' good' if not i.jobs_allocated }}"
+      title="{{ credit|qty }} of this cycle's wave of {{ wave|qty }} already installed{% if req is not none and wave > req %} (the {{ req|qty }} requested, counted in the whole blueprint copies they were planned at){% endif %} — {% if cycle_cut_label is defined and cycle_cut_label %}jobs started since {{ cycle_cut_label }} UTC{% else %}jobs started since this buying cycle opened{% endif %} are this cycle's wave; this row builds the rest{% if not i.jobs_allocated %}, which is nothing{% else %} ({{ i.recommended_build_qty|qty }}){% endif %}{% if n > wave %}; the other {{ (n - wave)|qty }} installed beyond the wave count as stock{% endif %}">installed {{ credit|qty }}/{{ wave|qty }}</span>{% endif %}
 {%- endmacro %}
 
 {% macro install_badge(i) -%}
@@ -137,7 +165,7 @@
 {{ job_cells(i, execution) }}
     <td class="flags">{% if i.capacity_limited %}<span class="badge warn"
         title="the slot pool can't fit this item's full demand ({{ i.jobs_needed_unconstrained }} job(s) needed)">capacity</span>{% endif %}
-        {% if execution %}{{ install_badge(i) }}{% endif %}
+        {% if execution %}{{ installed_badge(i) }}{{ install_badge(i) }}{% endif %}
         {% if i.market_buy_qty is defined and i.market_buy_qty %}<span class="badge accent"
           title="{{ i.market_buy_qty|qty }} units are cheaper on the market than building them (their sell orders land at or below the build cost{{ ' at plan time' if execution }}) and are on the Buy list, less any the alchemy route supplies instead; the jobs here build the rest">+buy {{ i.market_buy_qty|qty }}</span>{% endif %}
         {% if execution and i.low_stock %}<span class="badge warn"

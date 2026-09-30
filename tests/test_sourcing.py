@@ -511,7 +511,7 @@ def test_buy_context_splits_multibuy_by_venue_quantities(ref):
     assert bc["buy_total"] == pytest.approx(1500 * 9.4 + 12 * 20.0)
 
 
-def test_run_detail_renders_split_venue_fill_tooltip_and_shallow(ref):
+def test_the_jobs_page_renders_no_split_venue_fill_or_multibuy(ref):
     from flask import render_template
 
     from test_buy_venue import settings_with
@@ -540,18 +540,21 @@ def test_run_detail_renders_split_venue_fill_tooltip_and_shallow(ref):
         settings=settings_with(manufacturing_slots=50, reaction_slots=50),
         mfg_slots_used=0, reaction_slots_used=0, alchemy_slots_used=0,
         region_wide=set(), compressed={}, compressed_covered={},
-        compressed_section=[], compressed_saving=None,
+        compressed_saving=None,
     )
     app = template_app()
     with app.test_request_context("/runs/1"):
         html = render_template("run_detail.html", **ctx)
-    assert "Jita 1,000 · C-J6 500" in html
-    assert "1 split" in html and "1 unsourced" in html
-    assert "Jita: 1,000 units at 10 avg over 2 orders" in html
-    assert "C-J6: 500 units at 8 avg over 1 order" in html
-    assert "200 units beyond the stored ladders" in html
-    assert "only 1,300 of 1,500 units were on the stored Jita / C-J6 sell orders" in html
-    # Ruling R5: the badge says the remainder is unsourced.
-    assert "unsourced" in html
-    assert ">Tritanium 1000</textarea>" in html
-    assert ">Tritanium 500</textarea>" in html
+    # v1.29 (ruling R2, 2026-09-24): purchasing left the Industry Jobs
+    # page — the venue cell, the fill tooltips, the split / unsourced
+    # badges and both Multibuy blocks are on the Buy tab now
+    # (tests/test_buy_tab.py). The _buy_context derivations asserted at
+    # :492-510 are unchanged; this test pins that the page shows none of
+    # it, so the two tabs cannot drift back together.
+    for gone in (
+        "Jita 1,000 · C-J6 500", "1 split", "unsourced",
+        "Jita: 1,000 units at 10 avg over 2 orders",
+        "200 units beyond the stored ladders", "<textarea",
+    ):
+        assert gone not in html, gone
+    assert "Buy total" in html   # the wallet stat stays

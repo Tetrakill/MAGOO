@@ -151,6 +151,15 @@ _REACTION_JOB_ACTIVITIES = {9, 11}
 # research (3/4) stays dropped entirely.
 _LAB_JOB_ACTIVITIES = {config.ACTIVITY_COPYING, config.ACTIVITY_INVENTION}
 _ACTIVE_JOB_STATUSES = {"active", "paused", "ready"}
+# v1.29 revision 7 (user ruling 2026-09-29, contract amendment 4): the job
+# feeds ask ESI for completed jobs too (include_completed — the last 90
+# days), because a final job of the current buying cycle that finished and
+# was DELIVERED before Mark executed still belongs to this cycle's wave.
+# Such a job records its start in job_starts only — its output is on hand,
+# so it never credits in_progress, the active-job counts or job_ends.
+# cancelled / reverted jobs record nothing anywhere.
+_DELIVERED_JOB_STATUS = "delivered"
+_JOB_FEED_PARAMS = {"include_completed": "true"}
 
 # v1.9: asset location flags that mean "fitted to / loaded in a ship or
 # structure" (module, rig, subsystem, service, fuel, core, drone and
@@ -396,13 +405,22 @@ def _get(
 
 
 def _get_paginated(
-    conn, character_id: int, path: str, retry_429: bool = True
+    conn, character_id: int, path: str, retry_429: bool = True,
+    params: dict | None = None,
 ) -> list:
+    """Every page of a paginated endpoint. params (v1.29 revision 7: the
+    job feeds' include_completed) ride along on every page request,
+    merged under the page number."""
     extra = {} if retry_429 else {"retry_429": False}
-    data, headers = _get(conn, character_id, path, {"page": 1}, **extra)
+    base = dict(params or {})
+    data, headers = _get(
+        conn, character_id, path, {**base, "page": 1}, **extra
+    )
     pages = _int_header(headers, "X-Pages", 1)
     for page in range(2, pages + 1):
-        more, _ = _get(conn, character_id, path, {"page": page}, **extra)
+        more, _ = _get(
+            conn, character_id, path, {**base, "page": page}, **extra
+        )
         data.extend(more)
     return data
 
@@ -428,7 +446,15 @@ def fetch_assets(conn, character_id: int) -> list:
 
 
 def fetch_industry_jobs(conn, character_id: int) -> list:
-    data, _ = _get(conn, character_id, f"/characters/{character_id}/industry/jobs/")
+    """The character's industry jobs, completed ones included (the last 90
+    days — v1.29 revision 7: a delivered final job of the current cycle
+    still counts toward its wave; refresh_state sorts them by status)."""
+    data, _ = _get(
+        conn,
+        character_id,
+        f"/characters/{character_id}/industry/jobs/",
+        dict(_JOB_FEED_PARAMS),
+    )
     return data
 
 
@@ -475,9 +501,13 @@ def fetch_corp_industry_jobs(
 ) -> list | None:
     try:
         # Paginated endpoint (unlike the character equivalent) — a single
-        # _get silently dropped corp jobs beyond page 1.
+        # _get silently dropped corp jobs beyond page 1. Completed jobs
+        # included (90 days, v1.29 revision 7) — see fetch_industry_jobs.
         return _get_paginated(
-            conn, character_id, f"/corporations/{corporation_id}/industry/jobs/"
+            conn,
+            character_id,
+            f"/corporations/{corporation_id}/industry/jobs/",
+            params=_JOB_FEED_PARAMS,
         )
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 403:
@@ -822,11 +852,38 @@ def refresh_state(conn, ref) -> dict:
       the credit — wrongly dropping it would double-build.
     - Slot capacity is user-entered. The corp feed runs FIRST and claims
       corp jobs in the job_id dedup: every corp-feed job counts toward the
-      active-job counts and the multi-cycle end dates planning nets from
-      the pool (corp ESI carries installer and end date, so corp auth
-      alone covers corp-hangar jobs — 2026-08-25). include_job_slots
-      gates only the character's remaining PERSONAL jobs; include_assets
-      gates the character's wallet contribution to buying power.
+      active-job counts (corp ESI carries installer and end date, so corp
+      auth alone covers corp-hangar jobs — 2026-08-25). Their end dates
+      are still stored (job_ends), but since v1.29 revision 6 (user
+      ruling R2 2026-09-28) no planning step reads them — the pools are
+      the Settings' pools as entered — so the counts feed only the
+      active-job figure in the update's flash and on the dashboard.
+      include_job_slots gates only the character's remaining PERSONAL
+      jobs; include_assets gates the character's wallet contribution to
+      buying power.
+    - job_starts (v1.29 revision 7, user ruling 2026-09-29): {product
+      type_id: [[start_date, units], ...]} — one entry per MANUFACTURING
+      or REACTION job of that product, units = runs x portion exactly as
+      the in_progress credit (same tracked-system filter, same corp /
+      character job_id dedup; lab jobs are never recorded). The engine
+      counts the units of jobs started after the current buying cycle's
+      cut as this cycle's wave already installed and plans only the
+      rest. start_date is ESI's own ISO '...Z' text, kept verbatim (the
+      engine parses it — never compare it as text with SQLite's
+      'YYYY-MM-DD HH:MM:SS'); a job without one records nothing.
+      Recorded for active, paused and ready jobs AND for delivered ones:
+      the job feeds ask for completed jobs (include_completed, 90 days),
+      so a final of this cycle that already finished and was delivered
+      still counts toward its wave — otherwise it would drop out and the
+      next re-plan would plan the whole wave again (contract amendment
+      4). A delivered job records its start ONLY: its output is on hand,
+      so it never credits in_progress, the active-job counts or
+      job_ends. Delivered jobs of older cycles arrive too (the cut
+      excludes them), so the job payloads and this map grow with up to
+      90 days of history. cancelled / reverted jobs record nothing.
+      Old format: revision 6 stored {type_id: latest start_date text};
+      store.latest_esi_snapshot reads that scalar format as None (not
+      recorded — the plan sizes the full wave), never as a start.
     - Corp endpoints are tried per endpoint FAMILY across pool characters
       until one holds the role (roles differ per endpoint: Director /
       Factory Manager / Accountant), instead of burning the corp on the
@@ -845,6 +902,7 @@ def refresh_state(conn, ref) -> dict:
         config.ACTIVITY_MANUFACTURING: [],
         config.ACTIVITY_REACTION: [],
     }
+    job_starts: dict[int, list[list]] = {}
     character_isk = 0.0
     corporation_isk = 0.0
     seen_job_ids: set[int] = set()
@@ -862,7 +920,12 @@ def refresh_state(conn, ref) -> dict:
         jobs: list, resolver_id: int, count_all_slots: bool = False
     ) -> None:
         for job in jobs:
-            if job.get("status") not in _ACTIVE_JOB_STATUSES:
+            # Delivered jobs (completed history, v1.29 revision 7) pass the
+            # dedup, the tracked-system filter and the lab exclusion but
+            # record their start only; every other non-active status
+            # (cancelled, reverted) records nothing.
+            delivered = job.get("status") == _DELIVERED_JOB_STATUS
+            if job.get("status") not in _ACTIVE_JOB_STATUSES and not delivered:
                 continue
             if job.get("job_id") in seen_job_ids:
                 continue  # same job visible via character AND corp endpoints
@@ -877,6 +940,8 @@ def refresh_state(conn, ref) -> dict:
             lab = job["activity_id"] in _LAB_JOB_ACTIVITIES
             if activity is None and not lab:
                 continue  # research (3/4): not tracked at all
+            if delivered and lab:
+                continue  # delivered lab output is stock; no start kept
             # Slot counting is location-blind: the line is busy wherever
             # the job runs. The corp feed (processed first, so it claims
             # corp jobs in the dedup) counts every job it pulled — corp
@@ -884,7 +949,7 @@ def refresh_state(conn, ref) -> dict:
             # suffices (2026-08-25). Character feeds count only their
             # slot-flagged installer's remaining (personal) jobs. Lab
             # jobs never touch the pools ("T2 invention chain" decision).
-            if activity is not None and (
+            if not delivered and activity is not None and (
                 count_all_slots or job.get("installer_id") in slot_ids
             ):
                 active_jobs[activity] += 1
@@ -940,10 +1005,19 @@ def refresh_state(conn, ref) -> dict:
                 portion = blueprint.portion_size if blueprint else 1
             elif job["activity_id"] == config.ACTIVITY_COPYING:
                 portion = max(1, int(job.get("licensed_runs") or 1))
-            in_progress[product_id] = (
-                in_progress.get(product_id, 0)
-                + job.get("runs", 0) * portion
-            )
+            units = job.get("runs", 0) * portion
+            if not delivered:
+                in_progress[product_id] = (
+                    in_progress.get(product_id, 0) + units
+                )
+            started = job.get("start_date")
+            if activity is not None and started:
+                # One entry per job, the same units as the in_progress
+                # credit (a delivered job's units are on hand instead).
+                # ESI's ISO text kept verbatim; the engine parses it.
+                job_starts.setdefault(product_id, []).append(
+                    [str(started), units]
+                )
 
     # Corporation data FIRST: per distinct corp, each endpoint family
     # retried across the pool until a character with the role answers
@@ -1002,7 +1076,13 @@ def refresh_state(conn, ref) -> dict:
             if corp_jobs is not None:
                 jobs_done.add(corporation_id)
                 record["jobs_via"] = character_id
-                record["job_rows"] = len(corp_jobs)
+                # Live jobs only: the feed now carries up to 90 days of
+                # completed history too (v1.29 revision 7), which is not
+                # what the ESI tab's "N jobs" means.
+                record["job_rows"] = sum(
+                    1 for j in corp_jobs
+                    if j.get("status") in _ACTIVE_JOB_STATUSES
+                )
                 add_jobs(corp_jobs, character_id, count_all_slots=True)
         if corporation_id not in wallets_done and counts["wallet"]:
             corp_isk = fetch_corp_wallets(conn, character_id, corporation_id)
@@ -1042,6 +1122,7 @@ def refresh_state(conn, ref) -> dict:
         character_isk,
         corporation_isk,
         job_ends=job_ends,
+        job_starts=job_starts,
     )
     return {
         "on_hand": on_hand,
@@ -1050,6 +1131,7 @@ def refresh_state(conn, ref) -> dict:
         "character_isk": character_isk,
         "corporation_isk": corporation_isk,
         "job_ends": job_ends,
+        "job_starts": job_starts,
     }
 
 

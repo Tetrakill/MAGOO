@@ -25,6 +25,21 @@ costing.hull_cost on the latest PRICED run executed on or before it
 products table's cost-per-unit column read the latest executed run.
 PROJECT.md §2 feature 18 and §6 "Sales ledger" carry the rules.
 
+Buy side (v1.29 revision 3, user ruling R1 2026-09-28): the same pull also
+keeps what it used to drop — wallet BUY transactions (buy_transaction) and
+the item exchanges the pool ACCEPTED (buy_contract / buy_contract_item) —
+so buying.assign_purchases can derive each run's purchase lines from ESI.
+Orders stay behind Count sales; the wallet and contracts families run when
+Count sales OR Count buys is on. Sells and sale contracts are written only
+with Count sales on (the Ledger's tables stay byte-identical); buys and
+bought contracts are ALWAYS written, because the transactions cursor is
+shared and a buy skipped at write time would sit behind it for good —
+Count buys is honoured at read time (store.buys_enabled_owners, contract
+review C7). Known limit: an owner that ran buys-only and is then switched
+to Count sales on does not recover the sells of the id range read in
+between. This module never imports buying (the web route calls it after
+the price step, contract review C1).
+
 Direct SQL on the state tables (the engine.py precedent; the DDL lives in
 store.py). No Flask, no SDE file shapes.
 """
@@ -111,6 +126,12 @@ class PullSummary:
     open_orders: int = 0
     degraded_feeds: int = 0
     skipped: bool = False
+    # v1.29 revision 3: the buy side, appended after `skipped` with
+    # defaults so positional construction keeps its meaning (contract
+    # review C12). new_buys counts wallet buys first stored this pull;
+    # bought_contracts the accepted item exchanges that became finished.
+    new_buys: int = 0
+    bought_contracts: int = 0
 
 
 @dataclass(frozen=True)
@@ -235,6 +256,25 @@ def _sales_on(ctx: _PullCtx, owner: _Owner) -> bool:
     return bool(pref is None or pref["count_sales"])
 
 
+def _buys_on(ctx: _PullCtx, owner: _Owner) -> bool:
+    """The Count buys toggle (R4, v1.29 revision 3), mirror of _sales_on.
+    It only decides whether the wallet and contracts families are read at
+    all: what they fetch on the buy side is stored either way and the
+    toggle is honoured at read time (contract review C7)."""
+    if owner.kind == "character":
+        row = next((c for c in ctx.pool if c["character_id"] == owner.id), None)
+        return bool(row is None or row["count_buys"])
+    pref = ctx.corp_prefs.get(owner.id)
+    return bool(pref is None or pref["count_buys"])
+
+
+def _family_wanted(sales: bool, buys: bool, family: str) -> bool:
+    """Whether one family is read for an owner with these two toggles:
+    orders carry only sells; the wallet and contracts feed both sides
+    (contract review C7). mark_skipped applies the same rule."""
+    return sales if family == "orders" else (sales or buys)
+
+
 def _candidates(ctx: _PullCtx, owner: _Owner, family: str) -> list[int]:
     scope = esi.LEDGER_SCOPES[(owner.kind, family)]
     ids = [owner.id] if owner.kind == "character" else ctx.members.get(owner.id, [])
@@ -242,9 +282,12 @@ def _candidates(ctx: _PullCtx, owner: _Owner, family: str) -> list[int]:
 
 
 def pull_sales(conn, ref) -> PullSummary:
-    """Read every enabled owner's sell-side feeds and persist them. Never
-    raises for scope, role, token, rate-limit or network trouble — each
-    owner × family records its own status in sales_pull instead."""
+    """Read every enabled owner's feeds and persist them: the sell side for
+    the Ledger, and (v1.29 revision 3) the buy side — wallet buys and
+    accepted item exchanges — for buying.assign_purchases, which the
+    caller runs afterwards. Never raises for scope, role, token,
+    rate-limit or network trouble — each owner × family records its own
+    status in sales_pull instead."""
     ctx = _build_ctx(conn, ref)
     for owner in _owners(ctx):
         for family in FAMILIES:
@@ -311,7 +354,7 @@ def _pull_family(
         _record_pull(conn, owner, family, division, status, message)
         return None, status, message
 
-    if not _sales_on(ctx, owner):
+    if not _family_wanted(_sales_on(ctx, owner), _buys_on(ctx, owner), family):
         return fail("off")
     if ctx.esi_down:
         return fail("skipped", "ESI unavailable — the next refresh retries")
@@ -455,21 +498,27 @@ def _record_pull(
 
 def mark_skipped(conn, message: str) -> None:
     """ESI was down before the sales step: say so for every enabled owner ×
-    family without a single network call (cursors are preserved); an
-    owner whose Count sales is off stays 'off'."""
+    family without a single network call (cursors are preserved). A
+    family the owner's toggles do not read stays 'off' — orders with
+    Count sales off, the wallet and contracts only with BOTH Count sales
+    and Count buys off (_family_wanted, the pull's own gate)."""
     now = _now_iso()
+
+    def status_for(sales, buys, family):
+        on = _family_wanted(bool(sales), bool(buys), family)
+        return ("skipped", message) if on else ("off", None)
+
     for character in store.pool_characters(conn):
         owner = _Owner("character", character["character_id"], character["character_name"])
-        status = "skipped" if character["count_sales"] else "off"
-        note = message if status == "skipped" else None
         for family in FAMILIES:
+            status, note = status_for(character["count_sales"], character["count_buys"], family)
             _record_pull(conn, owner, family, 0, status, note, now=now, commit=False)
     for corp_id, pref in store.corp_settings(conn).items():
         owner = _Owner("corporation", corp_id, pref["corporation_name"] or "")
-        status = "skipped" if pref["count_sales"] else "off"
-        note = message if status == "skipped" else None
         for family in ("orders", "contracts"):
+            status, note = status_for(pref["count_sales"], pref["count_buys"], family)
             _record_pull(conn, owner, family, 0, status, note, now=now, commit=False)
+        status, note = status_for(pref["count_sales"], pref["count_buys"], "transactions")
         for division in CORP_DIVISIONS:
             _record_pull(conn, owner, "transactions", division, status, note,
                          now=now, commit=False)
@@ -477,6 +526,10 @@ def mark_skipped(conn, message: str) -> None:
 
 
 def summary_line(summary: PullSummary) -> str:
+    """The pull's clause of the ESI refresh flash. The buy-side counts
+    (v1.29 revision 3) appear only when either is non-zero, so a pull
+    that bought nothing reads exactly as it did before (contract review
+    C12)."""
     if summary.skipped:
         return "sales pull skipped — ESI unavailable"
     line = (
@@ -484,6 +537,8 @@ def summary_line(summary: PullSummary) -> str:
         f"{summary.contracts_finished} contracts finished, "
         f"{summary.open_orders} open orders (all products)"
     )
+    if summary.new_buys or summary.bought_contracts:
+        line += f"; {summary.new_buys} buys, {summary.bought_contracts} bought contracts"
     if summary.degraded_feeds:
         line += f" ({summary.degraded_feeds} feeds partial — see Ledger)"
     return line
@@ -662,9 +717,15 @@ def _fetch_transactions(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -
     the newest page down until it joins the stored range (uncapped once a
     range exists — the join is what lets newest_id move); pass B, the only
     pass that may declare history exhausted, back-fills below oldest_id a
-    capped number of pages per refresh. Buys count for the cursor and are
-    never stored."""
+    capped number of pages per refresh. The cursor covers both sides.
+
+    Since v1.29 revision 3 the buys are kept (buy_transaction, same owner
+    resolution as the sells) and ALWAYS returned — with Count buys off
+    too, because a buy dropped here sits behind the shared cursor for
+    good; the toggle is honoured at read time. The sells are returned
+    only while Count sales is on (contract review C7)."""
     conn = ctx.conn
+    sales_on = _sales_on(ctx, owner)
     group, budget = _group_budget(owner.kind, "transactions")
     cap = config.LEDGER_TX_PAGES_PER_REFRESH
     cursor = _cursor(conn, owner, division)
@@ -687,19 +748,19 @@ def _fetch_transactions(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -
         return {int(t["transaction_id"]) for t in page}
 
     sells: dict[int, dict] = {}
+    buys: dict[int, dict] = {}
     seen: set[int] = set()
 
     def collect(page):
         for t in page:
-            if t.get("is_buy", False):
-                continue
+            side = buys if t.get("is_buy", False) else sells
             if owner.kind == "corporation":
                 kind, oid, div = "corporation", owner.id, division
             elif t.get("is_personal", True) or not ctx.corp_of.get(cid):
                 kind, oid, div = "character", cid, None
             else:
                 kind, oid, div = "corporation", ctx.corp_of[cid], None
-            sells[int(t["transaction_id"])] = {
+            side[int(t["transaction_id"])] = {
                 "transaction_id": int(t["transaction_id"]),
                 "owner_kind": kind,
                 "owner_id": oid,
@@ -759,7 +820,11 @@ def _fetch_transactions(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -
     except _BudgetHit as exc:
         budget_hit = str(exc)
 
-    _resolve_locations(ctx, cid, [s["location_id"] for s in sells.values()])
+    if not sales_on:
+        sells.clear()  # read for the buys and the cursor only (C7)
+    _resolve_locations(
+        ctx, cid, [s["location_id"] for s in (*sells.values(), *buys.values())]
+    )
     if not connected:
         new_cursor = None
         status = "partial"
@@ -777,6 +842,7 @@ def _fetch_transactions(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -
         )
     return {
         "sells": list(sells.values()),
+        "buys": list(buys.values()),
         "rows": len(seen),
         "calls": calls,
         "cursor": new_cursor,
@@ -801,10 +867,25 @@ def _write_transactions(ctx: _PullCtx, owner: _Owner, division: int, via: int, b
     )
     after = conn.execute("SELECT COUNT(*) FROM sale_transaction").fetchone()[0]
     ctx.summary.new_sales += after - before
+    # The buy side (v1.29 revision 3): the same upsert and owner re-own
+    # rule, into its own table so the Ledger's sale_transaction never
+    # sees a buy.
+    buys_before = conn.execute("SELECT COUNT(*) FROM buy_transaction").fetchone()[0]
+    conn.executemany(
+        "INSERT INTO buy_transaction (transaction_id, owner_kind, owner_id, division, "
+        "source_feed, type_id, quantity, unit_price, date, location_id, client_id, "
+        "journal_ref_id, fetched_at) VALUES (:transaction_id, :owner_kind, :owner_id, "
+        ":division, :source_feed, :type_id, :quantity, :unit_price, :date, :location_id, "
+        ":client_id, :journal_ref_id, :now) ON CONFLICT (transaction_id) DO UPDATE SET "
+        + _OWNER_REOWN.format(t="buy_transaction"),
+        [dict(r, now=now) for r in bundle.get("buys", ())],
+    )
+    buys_after = conn.execute("SELECT COUNT(*) FROM buy_transaction").fetchone()[0]
+    ctx.summary.new_buys += buys_after - buys_before
     _record_pull(
         conn, owner, "transactions", division, bundle["status"], bundle["message"], via,
-        rows=bundle["rows"], rows_new=after - before, calls=bundle["calls"],
-        cursor=bundle["cursor"], now=now, commit=False,
+        rows=bundle["rows"], rows_new=(after - before) + (buys_after - buys_before),
+        calls=bundle["calls"], cursor=bundle["cursor"], now=now, commit=False,
     )
     conn.commit()
 
@@ -828,11 +909,57 @@ def _contract_owner(owner: _Owner, cid: int, row: dict):
     return None
 
 
+def _contract_buyer(ctx: _PullCtx, owner: _Owner, cid: int, row: dict):
+    """Acceptor side (v1.29 revision 3, contract review C9): who BOUGHT an
+    item exchange the pool accepted, or None. Item exchanges only — a
+    courier our pilot hauled also names them as acceptor. ESI has no
+    acceptor-side for_corporation flag; acceptor_id itself names the
+    entity that accepted, which is the corporation's id when a member
+    accepted on its behalf (verify live). Character feed: the character,
+    or its current corporation; corporation feed: only contracts THIS
+    corporation accepted. _contract_owner (the issuer side) is left
+    untouched; a contract can land on both sides (a member selling to its
+    own corporation) and each table flags it internal on its own."""
+    if (row.get("type") or "") != "item_exchange":
+        return None
+    try:
+        acceptor = int(row.get("acceptor_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not acceptor:
+        return None
+    if owner.kind == "character":
+        if acceptor == cid:
+            return "character", cid
+        corp = ctx.corp_of.get(cid)
+        if corp and acceptor == corp:
+            return "corporation", corp
+        return None
+    if acceptor == owner.id:
+        return "corporation", owner.id
+    return None
+
+
 def _wants_items(row) -> bool:
     return row["type"] == "item_exchange" and row["status"] in ITEMS_WANTED_STATUSES
 
 
+def _optional_int(value):
+    return int(value) if value is not None else None
+
+
+# Where a contract's items go, by the list the contract came from.
+_SALE_SIDE = "sale"
+_BUY_SIDE = "buy"
+_SIDE_TABLE = {_SALE_SIDE: "sale_contract", _BUY_SIDE: "buy_contract"}
+
+
 def _fetch_contracts(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -> dict:
+    """One owner's contract listing, split by side: contracts it ISSUED
+    (sale_contract, only while Count sales is on) and item exchanges it
+    ACCEPTED (buy_contract, always — Count buys is honoured at read time,
+    contract review C7), then the item lists both sides still need,
+    fetched against one shared budget before the family's write."""
     conn = ctx.conn
     group, budget = _group_budget(owner.kind, "contracts")
     _spend(ctx, group, budget)
@@ -843,9 +970,32 @@ def _fetch_contracts(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -> d
         listing = esi.fetch_corp_contracts(conn, cid, owner.id)
         if listing is None:
             raise _NoRole()
+    sales_on = _sales_on(ctx, owner)
     rows = []
+    bought = []
     for c in listing:
-        who = _contract_owner(owner, cid, c)
+        buyer = _contract_buyer(ctx, owner, cid, c)
+        if buyer is not None:
+            bought.append({
+                "contract_id": int(c["contract_id"]),
+                "owner_kind": buyer[0],
+                "owner_id": buyer[1],
+                "issuer_id": int(c["issuer_id"]),
+                "issuer_corporation_id": _optional_int(c.get("issuer_corporation_id")),
+                "for_corporation": 1 if c.get("for_corporation") else 0,
+                "acceptor_id": _optional_int(c.get("acceptor_id")),
+                "type": c.get("type") or "unknown",
+                "status": c.get("status") or "unknown",
+                "price": c.get("price"),
+                "reward": c.get("reward"),
+                "title": c.get("title"),
+                "date_issued": c["date_issued"],
+                "date_accepted": c.get("date_accepted"),
+                "date_completed": c.get("date_completed"),
+                "start_location_id": c.get("start_location_id"),
+                "via_character_id": cid,
+            })
+        who = _contract_owner(owner, cid, c) if sales_on else None
         if who is None:
             continue
         rows.append({
@@ -869,44 +1019,55 @@ def _fetch_contracts(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -> d
             "start_location_id": c.get("start_location_id"),
             "via_character_id": cid,
         })
-    _resolve_locations(ctx, cid, [r["start_location_id"] for r in rows])
+    _resolve_locations(
+        ctx, cid, [r["start_location_id"] for r in (*rows, *bought)]
+    )
 
     # Items: stored rows still waiting, plus the rows listed just now
     # (finished first, then newest), fetched before the family's write.
-    settled = set()
-    listed_ids = [r["contract_id"] for r in rows]
-    for start in range(0, len(listed_ids), 500):
-        chunk = listed_ids[start:start + 500]
-        settled |= {
-            r[0]
-            for r in conn.execute(
-                f"SELECT contract_id FROM sale_contract WHERE contract_id IN "
-                f"({_placeholders(chunk)}) AND (items_fetched_at IS NOT NULL "
-                f"OR items_status IS NOT NULL)",
-                chunk,
-            )
-        }
+    # Both sides share the budget; each side's settled set and backlog
+    # read its own table (contract review C9), and the items go back to
+    # the table of the list the contract came from.
+    listed = {_SALE_SIDE: rows, _BUY_SIDE: bought}
     wanted = {}
-    for r in rows:
-        if _wants_items(r) and r["contract_id"] not in settled:
-            wanted[r["contract_id"]] = r
-    for r in conn.execute(
-        "SELECT contract_id, type, status, date_issued FROM sale_contract "
-        "WHERE owner_kind = ? AND owner_id = ? AND items_fetched_at IS NULL "
-        "AND items_status IS NULL AND type = 'item_exchange' "
-        "AND status IN ('outstanding', 'in_progress', 'finished')",
-        (owner.kind, owner.id),
-    ):
-        wanted.setdefault(r["contract_id"], dict(r))
-    order = sorted(wanted.values(), key=lambda r: r["date_issued"], reverse=True)
-    order.sort(key=lambda r: 0 if r["status"] == "finished" else 1)
+    for side, side_rows in listed.items():
+        table = _SIDE_TABLE[side]
+        settled = set()
+        listed_ids = [r["contract_id"] for r in side_rows]
+        for start in range(0, len(listed_ids), 500):
+            chunk = listed_ids[start:start + 500]
+            settled |= {
+                r[0]
+                for r in conn.execute(
+                    f"SELECT contract_id FROM {table} WHERE contract_id IN "
+                    f"({_placeholders(chunk)}) AND (items_fetched_at IS NOT NULL "
+                    f"OR items_status IS NOT NULL)",
+                    chunk,
+                )
+            }
+        for r in side_rows:
+            if _wants_items(r) and r["contract_id"] not in settled:
+                wanted[(side, r["contract_id"])] = r
+        if side == _SALE_SIDE and not sales_on:
+            continue  # its stored backlog waits for Count sales (C7)
+        for r in conn.execute(
+            f"SELECT contract_id, type, status, date_issued FROM {table} "
+            "WHERE owner_kind = ? AND owner_id = ? AND items_fetched_at IS NULL "
+            "AND items_status IS NULL AND type = 'item_exchange' "
+            "AND status IN ('outstanding', 'in_progress', 'finished')",
+            (owner.kind, owner.id),
+        ):
+            wanted.setdefault((side, r["contract_id"]), dict(r))
+    order = sorted(wanted.items(), key=lambda kv: kv[1]["date_issued"], reverse=True)
+    order.sort(key=lambda kv: 0 if kv[1]["status"] == "finished" else 1)
     tokens = [cid] + [
         m for m in _candidates(ctx, owner, "contracts") if m != cid
     ] if owner.kind == "corporation" else [cid]
-    items_out = {}  # contract_id -> ("ok", items) | ("missing" | "unavailable" | "attempt", None)
+    # (side, contract_id) -> ("ok", items) | ("missing" | "unavailable" | "attempt", None)
+    items_out = {}
     remaining = 0
     halted = None
-    for r in order:
+    for key, r in order:
         if halted or ctx.items_budget <= 0:
             remaining += 1
             continue
@@ -958,14 +1119,67 @@ def _fetch_contracts(ctx: _PullCtx, owner: _Owner, division: int, cid: int) -> d
         if result is None:
             # Every candidate was refused (403) or dead: no token can read it.
             result = ("unavailable", None) if forbidden else ("attempt", None)
-        items_out[r["contract_id"]] = result
+        items_out[key] = result
     return {
         "rows": rows,
-        "items": items_out,
+        "items": {cid_: v for (side, cid_), v in items_out.items() if side == _SALE_SIDE},
+        "bought": bought,
+        "bought_items": {
+            cid_: v for (side, cid_), v in items_out.items() if side == _BUY_SIDE
+        },
         "remaining": remaining,
         "halted": halted,
         "calls": calls,
         "listed_finished": sum(1 for r in rows if r["status"] in SOLD_CONTRACT_STATUSES),
+    }
+
+
+def _write_contract_items(conn, table: str, items_by_contract: dict, now: str) -> None:
+    """One side's item lists and their items_* bookkeeping — the same rules
+    on sale_contract and buy_contract (a buy_contract_item row's frozen
+    unit_price starts NULL; buying.assign_purchases writes it)."""
+    for contract_id, (kind, items) in items_by_contract.items():
+        if kind == "ok":
+            conn.executemany(
+                f"INSERT OR IGNORE INTO {table}_item (contract_id, record_id, type_id, "
+                "quantity, raw_quantity, is_included, is_singleton) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        contract_id, int(i["record_id"]), int(i["type_id"]),
+                        int(i["quantity"]), i.get("raw_quantity"),
+                        1 if i.get("is_included") else 0, 1 if i.get("is_singleton") else 0,
+                    )
+                    for i in items
+                ],
+            )
+            conn.execute(
+                f"UPDATE {table} SET items_fetched_at = ?, items_status = 'ok' "
+                "WHERE contract_id = ?",
+                (now, contract_id),
+            )
+        elif kind in ("missing", "unavailable"):
+            conn.execute(
+                f"UPDATE {table} SET items_fetched_at = ?, items_status = ? "
+                "WHERE contract_id = ?",
+                (now, kind, contract_id),
+            )
+        else:
+            conn.execute(
+                f"UPDATE {table} SET items_attempts = items_attempts + 1, "
+                "items_status = CASE WHEN items_attempts + 1 >= ? THEN 'missing' "
+                "ELSE items_status END, items_fetched_at = CASE WHEN items_attempts + 1 >= ? "
+                "THEN ? ELSE items_fetched_at END WHERE contract_id = ?",
+                (config.LEDGER_ITEM_ATTEMPTS, config.LEDGER_ITEM_ATTEMPTS, now, contract_id),
+            )
+
+
+def _finished_exchanges(conn, table: str) -> set[int]:
+    return {
+        r["contract_id"]
+        for r in conn.execute(
+            f"SELECT contract_id FROM {table} WHERE status = 'finished' "
+            "AND type = 'item_exchange'"
+        )
     }
 
 
@@ -999,48 +1213,45 @@ def _write_contracts(ctx: _PullCtx, owner: _Owner, division: int, via: int, bund
         "via_character_id = COALESCE(sale_contract.via_character_id, excluded.via_character_id)",
         [dict(r, now=now) for r in bundle["rows"]],
     )
-    for contract_id, (kind, items) in bundle["items"].items():
-        if kind == "ok":
-            conn.executemany(
-                "INSERT OR IGNORE INTO sale_contract_item (contract_id, record_id, type_id, "
-                "quantity, raw_quantity, is_included, is_singleton) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        contract_id, int(i["record_id"]), int(i["type_id"]),
-                        int(i["quantity"]), i.get("raw_quantity"),
-                        1 if i.get("is_included") else 0, 1 if i.get("is_singleton") else 0,
-                    )
-                    for i in items
-                ],
-            )
-            conn.execute(
-                "UPDATE sale_contract SET items_fetched_at = ?, items_status = 'ok' "
-                "WHERE contract_id = ?",
-                (now, contract_id),
-            )
-        elif kind in ("missing", "unavailable"):
-            conn.execute(
-                "UPDATE sale_contract SET items_fetched_at = ?, items_status = ? "
-                "WHERE contract_id = ?",
-                (now, kind, contract_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE sale_contract SET items_attempts = items_attempts + 1, "
-                "items_status = CASE WHEN items_attempts + 1 >= ? THEN 'missing' "
-                "ELSE items_status END, items_fetched_at = CASE WHEN items_attempts + 1 >= ? "
-                "THEN ? ELSE items_fetched_at END WHERE contract_id = ?",
-                (config.LEDGER_ITEM_ATTEMPTS, config.LEDGER_ITEM_ATTEMPTS, now, contract_id),
-            )
+    _write_contract_items(conn, "sale_contract", bundle["items"], now)
     after = conn.execute("SELECT COUNT(*) FROM sale_contract").fetchone()[0]
-    finished_after = {
-        r["contract_id"]
-        for r in conn.execute(
-            "SELECT contract_id FROM sale_contract WHERE status = 'finished' "
-            "AND type = 'item_exchange'"
-        )
-    }
+    finished_after = _finished_exchanges(conn, "sale_contract")
     ctx.summary.contracts_finished += len(finished_after - finished_before)
+    # The buy side (v1.29 revision 3): accepted item exchanges, never
+    # mixed into sale_contract. `excluded.` below is SQLite's upsert
+    # pseudo-table (the incoming row); buy_contract's own column named
+    # excluded, like k / unpriced_items / priced_at, is buying.py's and
+    # the upsert never touches it.
+    bought_before = _finished_exchanges(conn, "buy_contract")
+    buy_count_before = conn.execute("SELECT COUNT(*) FROM buy_contract").fetchone()[0]
+    conn.executemany(
+        "INSERT INTO buy_contract (contract_id, owner_kind, owner_id, issuer_id, "
+        "issuer_corporation_id, for_corporation, acceptor_id, type, status, price, "
+        "reward, title, date_issued, date_accepted, date_completed, start_location_id, "
+        "via_character_id, first_seen_at, last_seen_at) VALUES (:contract_id, "
+        ":owner_kind, :owner_id, :issuer_id, :issuer_corporation_id, :for_corporation, "
+        ":acceptor_id, :type, :status, :price, :reward, :title, :date_issued, "
+        ":date_accepted, :date_completed, :start_location_id, :via_character_id, :now, "
+        ":now) "
+        "ON CONFLICT (contract_id) DO UPDATE SET status = excluded.status, "
+        "for_corporation = excluded.for_corporation, "
+        "acceptor_id = COALESCE(excluded.acceptor_id, buy_contract.acceptor_id), "
+        "issuer_corporation_id = COALESCE(excluded.issuer_corporation_id, "
+        "buy_contract.issuer_corporation_id), "
+        "date_accepted = COALESCE(excluded.date_accepted, buy_contract.date_accepted), "
+        "date_completed = COALESCE(excluded.date_completed, buy_contract.date_completed), "
+        "price = COALESCE(excluded.price, buy_contract.price), "
+        "reward = COALESCE(excluded.reward, buy_contract.reward), "
+        "title = COALESCE(excluded.title, buy_contract.title), "
+        "last_seen_at = excluded.last_seen_at, "
+        "via_character_id = COALESCE(buy_contract.via_character_id, excluded.via_character_id)",
+        [dict(r, now=now) for r in bundle.get("bought", ())],
+    )
+    _write_contract_items(conn, "buy_contract", bundle.get("bought_items", {}), now)
+    buy_count_after = conn.execute("SELECT COUNT(*) FROM buy_contract").fetchone()[0]
+    ctx.summary.bought_contracts += len(
+        _finished_exchanges(conn, "buy_contract") - bought_before
+    )
     if bundle["halted"]:
         status, message = "partial", bundle["halted"]
     elif bundle["remaining"]:
@@ -1053,8 +1264,9 @@ def _write_contracts(ctx: _PullCtx, owner: _Owner, division: int, via: int, bund
         status, message = "ok", None
     _record_pull(
         conn, owner, "contracts", division, status, message, via,
-        rows=len(bundle["rows"]), rows_new=after - before, calls=bundle["calls"],
-        now=now, commit=False,
+        rows=len(bundle["rows"]) + len(bundle.get("bought", ())),
+        rows_new=(after - before) + (buy_count_after - buy_count_before),
+        calls=bundle["calls"], now=now, commit=False,
     )
     conn.commit()
 
@@ -2105,14 +2317,33 @@ def degrade_notes(conn, ref, finals_map, window: Window, enabled, sales, names) 
             if key in seen:
                 continue
             seen.add(key)
-            notes.append(
-                f"{label} — {FAMILY_LABEL[r['family']]}: {r['status']} "
-                f"({r['message'] or 'no detail'}) — "
-                + {
+            # Since v1.29 revision 3 the wallet and contracts feeds are
+            # also read for an owner with Count sales OFF (Count buys on,
+            # contract review C7). Its sales do not count, so what such a
+            # feed's gap costs is purchases on the Buy tab, not sales
+            # (review 2026-09-28).
+            effect = (
+                {
                     "orders": "its open orders and order history are not current",
                     "transactions": "some of its sales may be missing",
                     "contracts": "its contract sales may be missing",
-                }[r["family"]]
+                }
+                if (kind, oid) in enabled
+                else {
+                    "orders": "its open orders and order history are not current",
+                    "transactions": (
+                        "some of its purchases may be missing from the Buy tab "
+                        "(its sales are off; turn Count buys off too to stop reading it)"
+                    ),
+                    "contracts": (
+                        "its bought contracts may be missing from the Buy tab "
+                        "(its sales are off; turn Count buys off too to stop reading it)"
+                    ),
+                }
+            )[r["family"]]
+            notes.append(
+                f"{label} — {FAMILY_LABEL[r['family']]}: {r['status']} "
+                f"({r['message'] or 'no detail'}) — {effect}"
             )
     off_owners = {(s.owner_kind, s.owner_id) for s in sales if "sales off" in s.flags}
     for kind, oid in sorted(off_owners):
