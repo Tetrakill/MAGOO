@@ -109,8 +109,12 @@ def test_replace_rewrites_the_open_run_in_place(conn, ref):
     first = _hulk_run(conn, ref)
     run_id = first.index_run_id
     row = _run(conn, run_id)
-    # A fresh run opens when it is first planned.
-    assert row["opened_at"] == row["planned_start"] is not None
+    # A fresh run opens when it is first planned; its planned_start is
+    # the snapshot it read (never later than now — pre-release review
+    # 2026-09-30), which the fixture saved moments before.
+    fetched = conn.execute("SELECT MAX(fetched_at) FROM esi_snapshot").fetchone()[0]
+    assert row["planned_start"] == fetched is not None
+    assert row["opened_at"] >= row["planned_start"]
     _age(conn, run_id)
     pipeline_id = conn.execute("SELECT pipeline_id FROM pipeline").fetchone()[0]
     # What a cycle accumulates on its run: a purchase line, an executed
@@ -208,7 +212,8 @@ def test_replace_dates_planned_start_at_the_snapshot_it_read(conn, ref):
     the replace dates the run at that snapshot's fetched_at, not at now:
     a purchase made after the snapshot stays post-plan. A snapshot dated
     in the future (clock skew) or a hand-built Snapshot with no
-    fetched_at falls back to now; a CREATE still stamps now."""
+    fetched_at falls back to now. A CREATE dates the same way since the
+    pre-release review of 2026-09-30 (the next test)."""
     first = _hulk_run(conn, ref)
     run_id = first.index_run_id
     _age(conn, run_id)
@@ -235,6 +240,51 @@ def test_replace_dates_planned_start_at_the_snapshot_it_read(conn, ref):
         replace_index_run_id=run_id,
     )
     assert now <= _run(conn, run_id)["planned_start"] < "2999"
+
+
+def test_a_new_run_dates_planned_start_at_the_snapshot_it_read(conn, ref):
+    """Pre-release review 2026-09-30: the usual cycle turn is ⟳ Update,
+    Mark executed, buy, ▶ Plan — the ▶ Plan CREATES a run from the stored
+    pre-execution snapshot. Stamping that run's planned_start at the
+    click classed a purchase made after the snapshot (between Mark
+    executed and ▶ Plan) as stock the plan had netted. The create now
+    uses the replace's expression: planned_start = the snapshot's
+    fetched_at, opened_at = the click (the first buying window still
+    opens then), and a second ▶ Plan from the same snapshot leaves
+    planned_start exactly where it was."""
+    from datetime import datetime, timezone
+
+    from magoo import costing
+
+    add_pipeline(conn, ref, "Hulk", 8)
+    store.save_esi_snapshot(conn, {}, {}, {}, 0.0, 0.0)
+    conn.execute("UPDATE esi_snapshot SET fetched_at = '2026-03-01 09:00:00'")
+    conn.commit()
+    now = conn.execute("SELECT datetime('now')").fetchone()[0]
+    created = engine.plan_index_run(conn, ref, _snap(conn, ref))
+    run_id = created.index_run_id
+    row = _run(conn, run_id)
+    assert row["planned_start"] == "2026-03-01 09:00:00"
+    assert row["opened_at"] >= now > row["planned_start"]
+    # A purchase made after the snapshot but before the click is NOT
+    # pre-plan: the plan never saw it on hand.
+    cut = costing._when(row["planned_start"])
+    bought = {"date": "2026-03-01T10:00:00Z"}
+    assert not costing._pre_plan(bought, cut)
+    assert costing._pre_plan({"date": "2026-03-01T09:00:00Z"}, cut)
+    assert cut < datetime.now(timezone.utc)
+    # Idempotent: a second ▶ Plan (an in-place re-plan of the open run)
+    # from the same snapshot keeps the cut and the opening.
+    engine.plan_index_run(conn, ref, _snap(conn, ref), replace_index_run_id=run_id)
+    again = _run(conn, run_id)
+    assert again["planned_start"] == "2026-03-01 09:00:00"
+    assert again["opened_at"] == row["opened_at"]
+    # A future-dated snapshot (clock skew) falls back to now.
+    conn.execute("UPDATE index_run SET status = 'complete', completed_at = datetime('now')")
+    conn.execute("UPDATE esi_snapshot SET fetched_at = '2999-01-01 00:00:00'")
+    conn.commit()
+    skewed = engine.plan_index_run(conn, ref, _snap(conn, ref))
+    assert now <= _run(conn, skewed.index_run_id)["planned_start"] < "2999"
 
 
 def test_a_replan_never_moves_the_cycles_buying_window(conn, ref):

@@ -2108,7 +2108,7 @@ def test_a_contract_handed_over_elsewhere_says_where(seeded_client):
     assert text == "100 @ 12"
     assert (
         " · 100 contract (item exchange “Amarr lot”, k = 0.9000 — its price "
-        "spread over the items received at their Jita reference prices (R7); "
+        "spread over the items received at their Jita reference prices; "
         "handed over in Amarr, at neither Jita 4-4 nor the structure market — "
         "landed at the default inbound rate)"
     ) in title
@@ -2607,12 +2607,21 @@ def test_a_live_plan_older_than_the_last_esi_update_says_nothing_is_netted(
     left — never the cycle's final jobs installing."""
     c = _state()
     run_id = _run(c)          # planned 2026-09-20; the fixture pulled later
+    # A run a v1.29 build planned (opened_at set): its newer update's
+    # re-plan really was skipped. The legacy wording is the next test's.
+    c.execute(
+        "UPDATE index_run SET opened_at = '2026-09-20' WHERE index_run_id = ?",
+        (run_id,),
+    )
+    c.commit()
     _item(c, run_id, TRITANIUM, qty=100, price=10.0)
     _buy(c, run_id, _line(TRITANIUM, 40, 9.0))
     newest = c.execute("SELECT MAX(fetched_at) FROM esi_snapshot").fetchone()[0]
     page = _buy_page(seeded_client, run_id)
     flat = " ".join(html.unescape(page).split())
     assert f"The ESI update of {newest} UTC did not re-plan it" in flat
+    assert "UTC (its re-plan was skipped)" in html.unescape(_stat(page, "Remaining")[1])
+    assert f"It predates the ESI update of {newest} UTC, which did not re-plan it" in flat
     assert (
         "its flash said why: nothing to plan from — no active pipeline or "
         "prices — or the re-plan failed"
@@ -2647,6 +2656,55 @@ def test_a_live_plan_older_than_the_last_esi_update_says_nothing_is_netted(
     assert "did not re-plan it" not in flat
     assert "so it is off Remaining already" in flat
     assert "in transit?" in page
+    c.close()
+
+
+def test_a_stale_plan_from_before_v129_blames_no_skipped_replan(seeded_client):
+    """Pre-release review 2026-09-30: every open run carried over from
+    v1.28 (opened_at NULL — no v1.29 build planned it) is older than the
+    ESI updates v1.28 made, which never re-planned anything. The first
+    Buy tab view after the upgrade must still say nothing since the plan
+    is netted and point at ▶ Re-plan, but name no skipped or failed
+    re-plan and no flash that never existed."""
+    c = _state()
+    run_id = _run(c)          # opened_at NULL, planned 2026-09-20
+    assert c.execute(
+        "SELECT opened_at FROM index_run WHERE index_run_id = ?", (run_id,)
+    ).fetchone()[0] is None
+    _item(c, run_id, TRITANIUM, qty=100, price=10.0)
+    _buy(c, run_id, _line(TRITANIUM, 40, 9.0))
+    newest = c.execute("SELECT MAX(fetched_at) FROM esi_snapshot").fetchone()[0]
+    page = _buy_page(seeded_client, run_id)
+    flat = " ".join(html.unescape(page).split())
+    cap = page[page.index('<span class="cap">'):]
+    cap = " ".join(html.unescape(cap[:cap.index("</span>")]).split())
+    assert (
+        "This plan was made before Magoo re-planned the open run on every "
+        f"ESI update (or that update could not re-plan it), so it predates "
+        f"the ESI update of {newest} UTC"
+    ) in cap
+    assert "stock and purchases since then are not netted" in cap
+    assert "▶ Re-plan run 1 on the dashboard, or ⟳ Update from ESI" in cap
+    assert "its flash said why" not in flat
+    assert "did not re-plan it" not in flat
+    title = html.unescape(_stat(page, "Remaining")[1])
+    assert f"predates the ESI update of {newest} UTC (it was not re-planned then)" in title
+    assert "skipped" not in title
+    assert (
+        f"It predates the ESI update of {newest} UTC and has not been "
+        "re-planned since"
+    ) in flat
+    assert "in transit?" not in page
+    # Once a v1.29 build plans it (opened_at set) the ordinary wording
+    # returns while it is still stale.
+    c.execute(
+        "UPDATE index_run SET opened_at = planned_start WHERE index_run_id = ?",
+        (run_id,),
+    )
+    c.commit()
+    flat = " ".join(html.unescape(_buy_page(seeded_client, run_id)).split())
+    assert f"The ESI update of {newest} UTC did not re-plan it" in flat
+    assert "This plan was made before Magoo" not in flat
     c.close()
 
 

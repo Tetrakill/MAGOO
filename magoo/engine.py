@@ -105,7 +105,8 @@ class Snapshot:
     corporation_isk: float = 0.0
     # Review 2026-09-28: the fetched_at of the esi_snapshot row this was
     # built from (snapshot_from_state; SQLite 'YYYY-MM-DD HH:MM:SS' UTC),
-    # None for a hand-built Snapshot. An in-place re-plan dates the run's
+    # None for a hand-built Snapshot. A plan — a new run or an in-place
+    # re-plan (pre-release review 2026-09-30) — dates the run's
     # planned_start — costing's pre-plan cut — at it, not at now: a ▶ Plan
     # from a stored snapshot hours old never saw the purchases made since.
     fetched_at: str | None = None
@@ -4334,23 +4335,37 @@ def _replaceable_run(conn, index_run_id: int) -> int:
     return int(row["run_number"])
 
 
-def _insert_run_row(conn, run_values: dict) -> tuple[int, int]:
+def _insert_run_row(
+    conn, run_values: dict, stock_at: str | None = None
+) -> tuple[int, int]:
     """INSERT a new index_run with the per-run columns in `run_values`;
     (index_run_id, run_number). The run number is assigned inside the
     INSERT itself: a separate MAX+1 read raced concurrent /run requests
     into duplicate numbers (the UNIQUE index on run_number is the
     backstop). opened_at — when the cycle's run was FIRST planned, what
     buying.buying_windows opens its first window at (contract review
-    A3) — takes the same datetime('now') as planned_start (SQLite holds
-    'now' fixed within one statement step)."""
+    A3) — is datetime('now'): the click that created the run.
+
+    planned_start is the snapshot's fetched_at (`stock_at`), or now when
+    there is none or it reads later than now — the SAME expression as
+    _replace_run_row's (pre-release review 2026-09-30). It is
+    costing._pre_plan's cut, and the usual cycle turn (Update from ESI,
+    Mark executed, buy, then Plan) creates a run from a snapshot that
+    predates the purchases made after Mark executed: stamping now classed
+    them as stock the plan had netted. With the snapshot's time a second
+    Plan from the same snapshot also leaves planned_start where it was.
+    It can therefore sit before opened_at (and before the previous run's
+    completed_at); the buying windows read opened_at, never it."""
     columns = list(run_values)
     cur = conn.execute(
         "INSERT INTO index_run (run_number, planned_start, opened_at, "
         f"status, {', '.join(columns)}) "
-        "SELECT COALESCE(MAX(run_number), 0) + 1, datetime('now'), "
+        "SELECT COALESCE(MAX(run_number), 0) + 1, "
+        "CASE WHEN ? IS NOT NULL AND ? < datetime('now') "
+        "THEN ? ELSE datetime('now') END, "
         f"datetime('now'), 'planned', {', '.join('?' for _ in columns)} "
         "FROM index_run",
-        [run_values[c] for c in columns],
+        [stock_at, stock_at, stock_at, *(run_values[c] for c in columns)],
     )
     index_run_id = cur.lastrowid
     run_number = conn.execute(
@@ -4755,7 +4770,9 @@ def plan_index_run(
     # (contract review A2, 2026-09-28).
     try:
         if replace_index_run_id is None:
-            index_run_id, run_number = _insert_run_row(conn, run_values)
+            index_run_id, run_number = _insert_run_row(
+                conn, run_values, stock_at=snapshot.fetched_at
+            )
         else:
             index_run_id, run_number = _replace_run_row(
                 conn, replace_index_run_id, run_values,

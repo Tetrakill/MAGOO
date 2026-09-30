@@ -2495,3 +2495,94 @@ def test_bought_cell_counts_a_pre_plan_via_ore_line_as_pre_plan(conn):
     assert cell.remaining == 1000
     assert cell.bought_landed == pytest.approx(300 * 2.0 + 100 * 13.0)
     assert cell.bought_unit == pytest.approx((300 * 2.0 + 100 * 13.0) / 400)
+
+
+# --- pre-release review 2026-09-30 (P1): the unsourced direct remainder ----
+#
+# The engine lands a covered raw's direct remainder with fill_merged, which
+# hauls the units no ladder could source at the HUB rate whenever the item
+# has a Jita ladder ("remainder at marginal"). blend_purchases splits the
+# whole remainder by the FILLED units' venue share instead. The re-blend
+# used to swap the engine's figure for the blend outright once the raw had
+# a single post-plan line, so one unit moved the row by the difference.
+#
+# Hand-built Tritanium (0.01 m³), rates hub 350 / structure 100 ISK/m³
+# (3.5 / 1.0 ISK per unit): direct 100 = 20 filled in Jita at 10.0 +
+# 30 at the structure at 6.0 + 50 unsourced at the marginal 10.0; covered
+# 100 by one ore landed 500 (share 1.0); cycle need 200, so no stock slice.
+#
+#   engine direct_landed_isk = 20 × 13.5 + 30 × 7.0 + 50 × 13.5 = 1155
+#   price_snapshot          = (200 + 180 + 500) / 100          = 8.8
+#   costing's no-line blend = 100 × 8.8 + (40 × 3.5 + 60 × 1.0) = 1080
+#   effective               = (1155 + 500) / 200               = 8.275
+
+UNSOURCED_RATES = {HUB: 350.0, STRUCT: 100.0, OTHER: 0.0}
+
+
+def _unsourced_rows():
+    base = dict.fromkeys((
+        "price_snapshot", "buy_venue", "hub_buy_qty", "structure_buy_qty",
+        "hub_fill_price", "structure_fill_price", "unfilled_qty",
+        "compressed_outputs", "compressed_alloc", "compressed_landed_isk",
+        "compressed_tax_isk", "direct_landed_isk", "cycle_need_qty",
+        "merged_min_qty", "effective_unit_cost", "compressed_covered_qty",
+        "recommended_buy_qty",
+    ))
+    trit = dict(
+        base, type_id=TRIT, recommended_buy_qty=100, compressed_covered_qty=100,
+        cycle_need_qty=200, price_snapshot=8.8, buy_venue=SPLIT,
+        hub_buy_qty=20, structure_buy_qty=30, hub_fill_price=10.0,
+        structure_fill_price=6.0, unfilled_qty=50, direct_landed_isk=1155.0,
+        effective_unit_cost=(1155.0 + 500.0) / 200,
+    )
+    ore = dict(
+        base, type_id=COMPRESSED_VELDSPAR, recommended_buy_qty=10,
+        price_snapshot=50.0, buy_venue=HUB,
+        compressed_outputs=json.dumps([[TRIT, 100, 100]]),
+        compressed_alloc=json.dumps({str(TRIT): 1.0}),
+        compressed_landed_isk=500.0, compressed_tax_isk=0.0,
+    )
+    return [trit, ore]
+
+
+def _unsourced_trit(ref, venue, price):
+    line = {"venue": venue, "quantity": 1, "unit_price": price,
+            "date": "2026-09-10T13:00:00Z"}  # after the plan
+    return costing.covered_raw_costs(
+        _unsourced_rows(), {TRIT: [line]}, ref, UNSOURCED_RATES, None,
+        PLANNED_START,
+    )[TRIT]
+
+
+def test_the_unsourced_fixture_is_the_engines_own_fill(ref):
+    """The 1155 above is what fill_merged returns for this book: a whole
+    (untruncated) Jita book, so the 50 units past it are unsourced, at the
+    last rung walked (the hub's 10.0) plus the HUB rate."""
+    fill = costing.fill_merged(
+        [(10.0, 20)], [(6.0, 30)], 100, 350.0, 100.0, MINERAL_M3
+    )
+    assert (fill.hub_units, fill.structure_units, fill.unfilled) == (20, 30, 50)
+    assert fill.remainder_venue is None
+    assert fill.landed_cost == pytest.approx(1155.0)
+
+
+def test_a_unit_that_changes_nothing_moves_no_number_with_unsourced_units(ref):
+    """One post-plan unit delivered at 10.8 — exactly the per-unit landed
+    price the plan's own remainder blend gives each direct unit (1080 /
+    100) — replaces one remainder unit by itself: the row must not move.
+    Before the fix it dropped by 1155 − 1080 = 75 (the freight gap)."""
+    trit = _unsourced_trit(ref, DELIVERED, 10.8)
+    assert trit.locked and trit.displaced_fraction == 0.0
+    assert trit.plan_total == pytest.approx(1655.0)
+    assert trit.realized_total == pytest.approx(1655.0, abs=1e-9)
+    assert trit.unit_cost == pytest.approx((1155.0 + 500.0) / 200, abs=1e-12)
+
+
+def test_one_unit_at_the_plans_hub_fill_moves_the_row_by_that_unit_only(ref):
+    """One post-plan unit bought in Jita at the plan's hub fill (10.0,
+    13.5 landed) replaces one remainder unit priced at 8.8 + 0.4 × 3.5 +
+    0.6 × 1.0 = 10.8 landed: +2.7 and nothing else. The old re-blend read
+    1082.7 + 500 = 1582.7 (a 72.3 ISK drop from one unit)."""
+    trit = _unsourced_trit(ref, HUB, 10.0)
+    assert trit.realized_total == pytest.approx(1655.0 + 2.7)
+    assert trit.delta == pytest.approx(2.7)

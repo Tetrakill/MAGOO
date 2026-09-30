@@ -1126,7 +1126,7 @@ def _line_sources(lines, contracts, structure_label, where=None,
                         f"item exchange {_contract_label(contract, esi_id)}"
                         + (
                             f", k = {k:.4f} — its price spread over the items "
-                            "received at their Jita reference prices (R7)"
+                            "received at their Jita reference prices"
                             if k is not None else ""
                         )
                         + f"; {handed}"
@@ -1152,8 +1152,8 @@ def _line_sources(lines, contracts, structure_label, where=None,
         entry = out.setdefault(key, {
             "label": label, "tone": "", "units": 0,
             "title": (
-                "recorded by hand before v1.29 revision 3 read purchases "
-                "from ESI" if kind is None else title
+                "recorded by hand in a development build, before purchases "
+                "were read from ESI" if kind is None else title
             ),
             "_where": set(),
         })
@@ -1178,8 +1178,7 @@ def _line_sources(lines, contracts, structure_label, where=None,
                 "over what it yields by value at this run's plan prices. The "
                 "plan did not pick "
                 + ("this ore" if len(parts) == 1 else "these ores")
-                + ", so the purchase counts as what it refines into (user "
-                "ruling 2026-09-28)"
+                + ", so the purchase counts as what it refines into"
             )
         elif entry.get("_where") and not entry["title"]:
             entry["title"] = (
@@ -1209,7 +1208,7 @@ _RECORD_STATUS_NOTE = {
     "internal": (
         "", "a transfer from one of your own characters or corporations — "
         "not a purchase, so it writes no line: the units were costed where "
-        "they were first bought (contract review C9)",
+        "they were first bought",
     ),
     "buys_off": (
         "", "this owner's Count buys is off (ESI tab) — stored, not counted",
@@ -1593,6 +1592,9 @@ def _buy_tab_context(
     ESI update (`stale_since`: that update's re-plan was skipped — nothing
     to plan from — or failed; review 2026-09-28) nets nothing since it
     was made: the captions say so instead and the transit cue is off.
+    `stale_legacy` marks a stale run no v1.29 build ever planned
+    (opened_at NULL — a v1.28 plan whose updates never re-planned
+    anything); its copy names no skipped re-plan.
 
     Rows (C14.4) are revision 2's — in Minerals, Moon Materials and Gas
     the END-RESULT raws at their demand (direct + compressed-covered),
@@ -1667,6 +1669,13 @@ def _buy_tab_context(
         plan_at = costing._when(planned_start)
         if newest_at is not None and plan_at is not None and newest_at > plan_at:
             stale_since = newest
+    # Pre-release review 2026-09-30: a run no v1.29 build has planned or
+    # re-planned (opened_at NULL — the engine's INSERT and the replace's
+    # COALESCE both set it) was planned when an ESI update never
+    # re-planned anything, so its staleness blames no skipped re-plan:
+    # every open run carried over from v1.28 is stale on the first view
+    # after the upgrade. The copy then says so neutrally.
+    stale_legacy = stale_since is not None and _row_value(run, "opened_at") is None
 
     def sources_of(lines):
         return _line_sources(
@@ -2058,6 +2067,7 @@ def _buy_tab_context(
         structure_label=structure_label,
         live=live,
         stale_since=stale_since,
+        stale_legacy=stale_legacy,
         # The margin the Settings read NOW: it is not persisted on the run,
         # so the Required title names it as today's setting, never as the
         # one this plan used (review 2026-09-28).

@@ -1949,7 +1949,27 @@ def _purchase_math(rows, purchases, ref, rates=None, settings=None, planned_star
             # direct_blend() is sized to the plan's direct quantity, so
             # its landed_unit already IS that price when locked > direct
             # (and the pro rata cap on an over-lock comes with it).
+            #
+            # Priced as a DELTA against this pass's own no-line blend
+            # (pre-release review 2026-09-30, P1): the engine lands a
+            # direct remainder's unsourced units at the hub rate whenever
+            # the item has a Jita ladder (fill_merged — "remainder at
+            # marginal"), while blend_purchases splits the whole
+            # remainder by the filled units' venue share. On a v1.29 row
+            # with unfilled units, a structure share and hub rate ≠
+            # structure rate the two figures differ, so swapping
+            # plan_direct for the blend outright moved the row by that
+            # whole difference on the first purchased unit. The
+            # difference now stays where no line touches it (like
+            # `residual`), and one unit moves the row by what that unit
+            # changed — and, like the residual, it stands even once every
+            # direct unit is bought (a known, bounded over-statement: the
+            # unsourced units × m³ × the hub rate's excess over the
+            # share-weighted rate). A pre-v1.29 row's plan_direct IS the no-line
+            # blend, so it keeps the plain expression (bit for bit).
             direct = own.landed_unit * direct_qty
+            if row["direct_landed_isk"] is not None:
+                direct += plan_direct - plan_blend(type_id).landed_total
             spill = own.landed_unit * fraction * covered_qty
             missing = own.missing_price
             # C13.4: the stock slice is displaced last — only by units

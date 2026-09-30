@@ -35,6 +35,11 @@ leave it; there is no Magoo server.
   wallet transactions, sell orders and contracts from ESI, netted by where
   each hull sold and costed at the run executed before each sale: revenue, cost of
   goods sold, net income, unrealized revenue, Top 10s and charts.
+- **Tracks what you actually paid** — a Buy tab per run shows what the cycle
+  requires, has on hand, still needs and purchased, read from your wallet
+  buys and accepted item exchanges on ESI (never typed in); realized cost
+  prices those units at what was paid. The open run is re-planned on every
+  ESI update, so it always reads the cycle as it stands.
 
 The plan is advisory; ESI is the ledger.
 
@@ -71,8 +76,8 @@ Magoo walks you through it with an on-screen checklist. In short:
 2. **Log in with EVE** — opens your normal browser so you can see you are on
    `login.eveonline.com`. Magoo never sees your password.
 3. **Update from ESI** — snapshots your assets, industry jobs and wallets,
-   reads your sales for the Ledger, then refreshes prices (once you have
-   pipelines).
+   reads your sales and purchases, refreshes prices (once you have
+   pipelines) and re-plans the open run.
 4. **Add your pipelines** — what you build, and how many per cycle.
 5. **Update from ESI** once more — now that pipelines exist it has something
    to price — then **Plan index run**.

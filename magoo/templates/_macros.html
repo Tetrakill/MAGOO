@@ -43,14 +43,11 @@
 
 {# Compressed sourcing (v1.25). compressed_badge: a compressed ore / moon
    ore / gas bought to be reprocessed — the tooltip names what it covers
-   and what is left over. covered_badge: a raw whose purchase the
-   compressed buys part-cover — this row is the direct remainder. #}
+   and what is left over. (A covered raw's own badge lives in the page
+   that shows it: the Buy tab's "N via compressed", the Stockpile tab's
+   "compressed".) #}
 {% macro compressed_badge(i, plan_time=true) -%}
     {% if compressed is defined and i.type_id in compressed %}{% set outs = compressed[i.type_id] %}<span class="badge accent" title="bought compressed and reprocessed at the {{ 'plan-time ' if plan_time }}yield — covers {% for m, name, out, used in outs if used %}{{ used|qty }} {{ name }}{{ ', ' if not loop.last }}{% endfor %}{% for m, name, out, used in outs if out > used %}; leftover {{ (out - used)|qty }} {{ name }}{% endfor %}; {% if i.compressed_fill_orders is none %}unit price is the market's best order for any quantity (Min Sell / Max Buy basis){% else %}unit price is the average of the {{ i.compressed_fill_orders|qty }} cheapest sell order{{ 's' if i.compressed_fill_orders != 1 }} walked{{ ' at plan time' if plan_time }}{% endif %}{% if i.compressed_wanted_qty is defined and i.compressed_wanted_qty and i.compressed_wanted_qty > i.recommended_buy_qty %}; the plan wanted {{ i.compressed_wanted_qty|qty }} but the market could fill only {{ i.recommended_buy_qty|qty }} in whole batches — the raws it covers keep a larger direct buy{% endif %}">compressed</span>{% endif %}
-{%- endmacro %}
-
-{% macro covered_badge(i, plan_time=true) -%}
-    {% if compressed_covered is defined and i.type_id in compressed_covered %}<span class="badge accent" title="{{ compressed_covered[i.type_id]|qty }} of the {{ (compressed_covered[i.type_id] + (i.recommended_buy_qty or 0))|qty }} units this cycle come from reprocessing compressed purchases{{ ' (plan time)' if plan_time }}; the other {{ (i.recommended_buy_qty or 0)|qty }} are bought direct — the ore is a line in a Multibuy block below — the one for whichever group covers most of what it reprocesses into — not a row of its own (v1.29)">{{ compressed_covered[i.type_id]|qty }} via compressed</span>{% endif %}
 {%- endmacro %}
 
 {# item_button is the control; item_cell is it wrapped in its own <td>.
