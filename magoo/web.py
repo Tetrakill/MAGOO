@@ -1450,12 +1450,13 @@ def _cycle_cut(conn) -> datetime | None:
     finals of the executed cycle installed after Mark executed — or
     within the PC clock's skew from CCP's, since completed_at is the PC's
     datetime('now') and start_date the server's — count as the NEW
-    cycle's wave, so the new run plans that many fewer — and the Profit
-    tab counts those hulls on BOTH executed runs (the old run's last plan
-    still holds them as runs; the new run's installed_qty holds them
-    too); and on the first cycle, finals installed before the first
-    ▶ Plan are ignored and planned again. The Industry Jobs badge
-    (installed N/M) makes either visible."""
+    cycle's wave, so the new run plans that many fewer (the Profit tab
+    counts such a hull once, on the run whose buying window holds its
+    start — since the user's ruling of 2026-10-24 costing.hull_cost
+    reads the industry_job record over the window, so the plan's figure
+    no longer double-counts it); and on the first cycle, finals
+    installed before the first ▶ Plan are ignored and planned again.
+    The Industry Jobs badge (installed N/M) makes either visible."""
     windows = buying.buying_windows(conn)
     open_window = [w for w in windows if w.hi is None]
     if open_window:
@@ -4407,6 +4408,50 @@ def create_app() -> Flask:
             reason=None,
         )
 
+    def _whatif_cards(c, r, settings_) -> list:
+        """The today's-prices what-if, one card per ACTIVE pipeline at its
+        requested units (costing.current_hull_cost against the cached
+        prices, inputs at the cheaper landed venue — v1.10; finals keep
+        the hub quote, their sell side is sell_quote's business), best
+        margin first. Planning → Profit's table, and since the user's
+        ruling of 2026-10-24 the Index Runs list's estimate for the open
+        run."""
+        type_ids = engine.demand_type_ids(c, r)
+        prices, venues, _units, region_wide, adjusted = _price_maps(
+            c, r, settings_, type_ids
+        )
+        region_wide = frozenset(region_wide)
+        cards = []
+        for p in store.active_pipelines(c):
+            cost = costing.current_hull_cost(
+                c, r, settings_, p, prices, adjusted,
+                region_wide=region_wide, venues=venues,
+            )
+            info = r.type_info(p["final_product_type_id"])
+            price, net, capital = sell_quote(
+                c, settings_, p["final_product_type_id"]
+            )
+            cards.append(
+                {
+                    "pipeline": p,
+                    "name": info.name,
+                    "cost": cost,
+                    "price": price,
+                    "net": net,
+                    "capital": capital,
+                    "margin": (
+                        net - cost.total if net is not None else None
+                    ),
+                }
+            )
+        cards.sort(
+            key=lambda card: card["margin"]
+            if card["margin"] is not None
+            else float("-inf"),
+            reverse=True,
+        )
+        return cards
+
     @app.route("/planning")
     def planning():
         """Planning — today's estimates, nothing persisted. Two views:
@@ -4429,42 +4474,7 @@ def create_app() -> Flask:
         r = ref()
         settings_ = store.get_settings(c)
         if request.args.get("view") != "slots":
-            type_ids = engine.demand_type_ids(c, r)
-            # v1.10: inputs at the cheaper landed venue (finals keep the
-            # hub quote — their sell side is sell_quote's business).
-            prices, venues, _units, region_wide, adjusted = _price_maps(
-                c, r, settings_, type_ids
-            )
-            region_wide = frozenset(region_wide)
-            cards = []
-            for p in store.active_pipelines(c):
-                cost = costing.current_hull_cost(
-                    c, r, settings_, p, prices, adjusted,
-                    region_wide=region_wide, venues=venues,
-                )
-                info = r.type_info(p["final_product_type_id"])
-                price, net, capital = sell_quote(
-                    c, settings_, p["final_product_type_id"]
-                )
-                cards.append(
-                    {
-                        "pipeline": p,
-                        "name": info.name,
-                        "cost": cost,
-                        "price": price,
-                        "net": net,
-                        "capital": capital,
-                        "margin": (
-                            net - cost.total if net is not None else None
-                        ),
-                    }
-                )
-            cards.sort(
-                key=lambda card: card["margin"]
-                if card["margin"] is not None
-                else float("-inf"),
-                reverse=True,
-            )
+            cards = _whatif_cards(c, r, settings_)
             _count, prices_at = market.price_cache_state(
                 c, settings_.price_region_id, settings_.price_source
             )
@@ -4937,20 +4947,100 @@ def create_app() -> Flask:
             out.append(r)
         return out
 
+    def _run_figures(totals, kind: str, hulls_from_esi=None) -> dict:
+        """One row's revenue / profit cell pair from a costing.CycleTotals:
+        net proceeds per cycle, profit per cycle, how many finals had no
+        sell quote (left out of both), whether the pair is realized (an
+        executed run's Profit tab) or an estimate (the open run), and —
+        realized only — whether the units came from the ESI job record
+        or the plan's started figure (HullCost.hulls_from_esi, one value
+        per run), so the tooltip says which."""
+        return {
+            "revenue": totals.proceeds,
+            "profit": totals.profit,
+            "unquoted": totals.unpriced,
+            "priced": totals.priced,
+            "kind": kind,
+            "hulls_from_esi": hulls_from_esi,
+        }
+
     @app.route("/runs")
     def runs():
+        """The Index Runs list. Since the user's ruling of 2026-10-24 each
+        row carries: the Buy total the run's OPENING plan asked for
+        (`index_run.opening_buy_total_isk`, frozen by the engine's INSERT —
+        the live sum, which the run's own pages keep showing, shrinks as
+        the in-place re-plans net bought stock; a run opened before the
+        columns falls back to the live sum and is badged), and revenue and
+        profit per cycle: an executed run's are its Profit tab's cycle
+        totals (net proceeds at today's quotes for the hulls ESI shows
+        installed, and that less the lagged chain cost), the open run's
+        the today's-prices what-if Planning → Profit shows (badged est.),
+        a superseded plan's none."""
         c = conn()
         all_runs = _mark_superseded(
             c.execute(
                 "SELECT r.*, COUNT(i.index_run_item_id) AS items, "
-                "SUM(i.recommended_buy_qty * i.price_snapshot) AS buy_total, "
+                "SUM(i.recommended_buy_qty * i.price_snapshot) AS live_buy_total, "
                 "SUM(CASE WHEN i.recommended_buy_qty > 0 "
                 "  AND i.price_snapshot IS NULL THEN 1 ELSE 0 END) "
-                "  AS buys_unpriced "
+                "  AS live_buys_unpriced "
                 "FROM index_run r LEFT JOIN index_run_item i USING (index_run_id) "
                 "GROUP BY r.index_run_id ORDER BY r.index_run_id DESC"
             ).fetchall()
         )
+        estimate = None  # the open run's what-if, built once if needed
+        estimate_failed = False
+        for r in all_runs:
+            frozen = r.get("opening_buy_total_isk")
+            r["buy_total_opening"] = frozen is not None
+            r["buy_total"] = frozen if frozen is not None else r["live_buy_total"]
+            r["buys_unpriced"] = (
+                r.get("opening_buys_unpriced") if frozen is not None
+                else r["live_buys_unpriced"]
+            ) or 0
+            r["figures"] = None
+            r["figures_failed"] = False
+            if r["status"] == "complete":
+                # One uncostable run (a final whose type left the SDE, say)
+                # must not take down the page ▶ Plan and discard redirect
+                # to (review 2026-10-24; the _run_purchase_records
+                # precedent): that row shows a dash and its Profit tab the
+                # error. A run with nothing attributable (no cards) is a
+                # dash too — its Profit tab shows no totals, not 0 / 0.
+                try:
+                    cards = _profit_cards(c, r["index_run_id"])
+                except Exception:  # noqa: BLE001 — logged; the list stays up
+                    log.exception(
+                        "Index Runs list: costing run %s failed", r["index_run_id"]
+                    )
+                    r["figures_failed"] = True
+                else:
+                    if cards:
+                        r["figures"] = _run_figures(
+                            costing.cycle_totals(cards),
+                            "realized",
+                            hulls_from_esi=bool(cards[0]["cost"].hulls_from_esi),
+                        )
+            elif not r["superseded"]:
+                if (
+                    estimate is None
+                    and not estimate_failed
+                    and sde_ready()
+                    and store.active_pipelines(c)
+                ):
+                    try:
+                        estimate = _run_figures(
+                            costing.cycle_totals(
+                                _whatif_cards(c, ref(), store.get_settings(c))
+                            ),
+                            "estimate",
+                        )
+                    except Exception:  # noqa: BLE001 — logged; the list stays up
+                        log.exception("Index Runs list: the open run's estimate failed")
+                        estimate_failed = True
+                r["figures"] = estimate
+                r["figures_failed"] = estimate_failed
         show_all = request.args.get("all") == "1"
         return render_template(
             "runs.html",
@@ -5005,53 +5095,60 @@ def create_app() -> Flask:
         flash(message)
         return redirect(url_for("runs"))
 
+    def _profit_cards(c, index_run_id) -> list:
+        """An EXECUTED run's realized profit cards, one per pipeline
+        ATTRIBUTABLE to the run (not the currently-active ones:
+        deactivating a pipeline later must not hide the intact cost
+        history of its past executed runs), best margin first — the
+        Profit tab's table and, since the user's ruling of 2026-10-24,
+        what the Index Runs list rolls up into revenue and profit."""
+        settings_ = store.get_settings(c)
+        attributable = c.execute(
+            "SELECT DISTINCT p.* FROM pipeline p "
+            "JOIN index_run_item_pipeline a "
+            "  ON a.pipeline_id = p.pipeline_id "
+            "JOIN index_run_item i "
+            "  ON i.index_run_item_id = a.index_run_item_id "
+            "WHERE i.index_run_id = ?",
+            (index_run_id,),
+        ).fetchall()
+        cards = []
+        for p in attributable:
+            cost = costing.hull_cost(
+                c, ref(), settings_, index_run_id, p["pipeline_id"]
+            )
+            if cost is None:
+                continue
+            info = ref().type_info(p["final_product_type_id"])
+            price, net, capital = sell_quote(
+                c, settings_, p["final_product_type_id"]
+            )
+            cards.append(
+                {
+                    "name": info.name,
+                    "cost": cost,
+                    "price": price,
+                    "net": net,
+                    "capital": capital,
+                    "margin": (
+                        net - cost.total if net is not None else None
+                    ),
+                }
+            )
+        cards.sort(
+            key=lambda card: card["margin"]
+            if card["margin"] is not None
+            else float("-inf"),
+            reverse=True,
+        )
+        return cards
+
     def _run_profit_context(run, index_run_id) -> dict:
         """run_detail's Profit-view context: realized cost cards for an
         executed run (planned runs show an empty list)."""
         c = conn()
         settings_ = store.get_settings(c)
-        cards = []
-        if run["status"] == "complete":
-            # Pipelines ATTRIBUTABLE to this run, not currently-active
-            # ones: deactivating a pipeline later must not hide the
-            # intact cost history of its past executed runs.
-            attributable = c.execute(
-                "SELECT DISTINCT p.* FROM pipeline p "
-                "JOIN index_run_item_pipeline a "
-                "  ON a.pipeline_id = p.pipeline_id "
-                "JOIN index_run_item i "
-                "  ON i.index_run_item_id = a.index_run_item_id "
-                "WHERE i.index_run_id = ?",
-                (index_run_id,),
-            ).fetchall()
-            for p in attributable:
-                cost = costing.hull_cost(
-                    c, ref(), settings_, index_run_id, p["pipeline_id"]
-                )
-                if cost is None:
-                    continue
-                info = ref().type_info(p["final_product_type_id"])
-                price, net, capital = sell_quote(
-                    c, settings_, p["final_product_type_id"]
-                )
-                cards.append(
-                    {
-                        "name": info.name,
-                        "cost": cost,
-                        "price": price,
-                        "net": net,
-                        "capital": capital,
-                        "margin": (
-                            net - cost.total if net is not None else None
-                        ),
-                    }
-                )
-            cards.sort(
-                key=lambda card: card["margin"]
-                if card["margin"] is not None
-                else float("-inf"),
-                reverse=True,
-            )
+        cards = _profit_cards(c, index_run_id) if run["status"] == "complete" else []
         return dict(
             cards=cards,
             totals=costing.cycle_totals(cards),
@@ -5059,6 +5156,10 @@ def create_app() -> Flask:
             broker_rate=costing.broker_fee_rate(settings_),
             sales_tax=costing.sales_tax_rate(settings_),
             settings=settings_,
+            # What the ESI-sourced Units are "as of" (user ruling
+            # 2026-10-24; review the same day): the last pull that
+            # refreshed the job record, None before the first.
+            jobs_as_of=store.last_job_pull(c),
         )
 
     @app.route("/runs/<int:index_run_id>")
@@ -5272,6 +5373,19 @@ def create_app() -> Flask:
             "run marked executed — it now feeds cost history; "
             "▶ Plan index run opens the next cycle"
         )
+        # The Profit tab's Units read the ESI job record, which only an
+        # update refreshes (review 2026-10-24): the run's cycle has just
+        # closed AFTER every logged pull, so the tab keeps the plan's
+        # started figure until the next update records the jobs installed
+        # through Mark executed (pre-release review 2026-10-25) — say so,
+        # so the plan's figure is not mistaken for ESI's.
+        jobs_as_of = store.last_job_pull(c)
+        if jobs_as_of:
+            message += (
+                f" — Profit-tab Units keep the plan's started figure until the "
+                f"next ⟳ Update from ESI records the jobs installed through Mark "
+                f"executed (the job record is as of {jobs_as_of})"
+            )
         match_message, ok = _assign_purchases(c)
         if not ok:
             message += f" — {match_message}"

@@ -472,8 +472,9 @@ and hover with the teal Hover Wash.
   not an input, stopped the job: the plan lists more jobs than the pool
   after the slot backfill, and those wait for a slot. No separate column. The Mfg / Reaction slots
   stats count the same jobs against the pool the run was planned against
-  (the settings' pools less multi-cycle overhang, persisted on the run
-  since schema 11; the tooltip says so when they differ), with a dim
+  (the settings' pools as entered, persisted on the run since schema 11
+  — nothing subtracted since v1.29 revision 6, user ruling R2 2026-09-28;
+  the tooltip says so when Settings now differs), with a dim
   "· plan N" sub where the plan's count differs — stock feeds fewer, or the plan lists more jobs than the
   pool because the slots of jobs stock cannot start went to others and
   those jobs wait (the tooltip says which); the alert-warn panel is itself a
@@ -487,9 +488,28 @@ and hover with the teal Hover Wash.
   table (planned draw, available with its on-hand + in-jobs + bought +
   compressed breakdown in the tooltip, short in Loss Red, held back = the
   cut jobs that eat it, four named and "+N more" on hover). On an executed
-  run's Profit tab the Units cell counts the hulls the cycle started
-  (tinted warn, bad at zero, the plan's count in its tooltip) and the row
-  carries `short` when that is below the plan.
+  run's Profit tab the Units cell counts the hulls whose jobs ESI shows
+  started inside the run's buying cycle, as of the last ESI update (user
+  ruling 2026-10-24): this pipeline's share where another pipeline shares
+  the final, not capped at the plan. Where it differs from what the plan
+  sized the plan's count is in the tooltip; the cell is tinted warn (bad
+  at zero) and the row carries `short` when fewer were installed, and
+  shows the tooltip alone (no badge) when more. Where the logged ESI
+  pulls do not cover the run's cycle the cell keeps the plan's started
+  figure, the tooltip and the "How this is computed" note say so, and
+  `short` keeps its older stock-shortfall sense.
+- **Index Runs list (user ruling 2026-10-24):** the Buy total is the
+  opening plan's figure (full ISK and its provenance in `title`); neutral
+  `latest` marks a run opened before the opening columns, where the cell
+  falls back to the live sum of its last plan; warn `N unpriced` as
+  before. Revenue and Profit `.num` cells (profit tinted good / bad by
+  sign, full ISK and the figure's source in `title` — the Profit tab's
+  *Net proceeds / cycle* and *Profit / cycle*, or Planning → Profit's
+  estimate) carry neutral `est.` on the open run and warn `N unquoted`
+  where finals have no sell quote; a muted dash with the reason in
+  `title` on a superseded plan, an executed run with nothing
+  attributable, a run that could not be costed, or an open run with no
+  estimate yet.
 
 ### Status Pills
 - **Style:** 999px chips in 11.5px mono with a 7px status dot — Profit Green

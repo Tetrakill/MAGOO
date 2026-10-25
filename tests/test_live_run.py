@@ -662,15 +662,17 @@ def test_a_replan_after_the_whole_wave_plans_no_more_hulls(conn, ref):
 def test_a_slot_limited_final_relists_its_rest_against_the_configured_pool(
     conn, ref
 ):
-    """Known limit, pending the user's ruling (review of revision 7,
-    2026-09-29; PROJECT.md §11 "Busy lines after the installs"). The
-    pools are the configured pools (ruling R2, 2026-09-28): Hulk x 8 on
-    6 manufacturing lines plans 6 jobs; once those 6 are installed —
+    """The pools are the configured pools (ruling R2, 2026-09-28): Hulk x
+    8 on 6 manufacturing lines plans 6 jobs; once those 6 are installed —
     every line busy — the re-plan still sees 6 free lines and lists the
-    other 2 Hulks as jobs to run now, and the executed run's started
-    hull count (costing.hull_cost: install_runs + installed_qty) counts
-    them. This pins today's behaviour so a ruling to net this cycle's
-    running jobs out of the pool flips it deliberately."""
+    other 2 Hulks as jobs to run now (PROJECT.md §11 "Busy lines after
+    the installs" — the Buy-tab side of that limit stands). What the
+    user ruled on 2026-10-24 is the Profit tab: the executed run's Units
+    are the Hulk jobs ESI shows STARTED inside the cycle (the durable
+    job record), so the 2 relisted against busy lines count only if
+    they were really installed — 6 here. The plan's started figure
+    (install_runs + installed_qty = 8) is the fallback where the record
+    does not reach the run's cycle, and stays hulls_planned."""
     from magoo import costing
 
     first, steady, draw_of = _steady_hulk_run(conn, ref)
@@ -701,18 +703,33 @@ def test_a_slot_limited_final_relists_its_rest_against_the_configured_pool(
     h = post.items[hulk]
     assert h.installed_qty == 6
     assert (h.deficit_qty, h.runs_allocated, h.install_runs) == (2, 2, 2)
+    # Executed a day after the cycle opened (LEGACY_START), so a pull that
+    # day covers the whole window — a pull "now" would reach only 90 days
+    # back and leave the cycle's head unrecorded (the plan's figure).
+    executed = "2026-01-02 00:00:00"
     conn.execute(
-        "UPDATE index_run SET status = 'complete', completed_at = "
-        "datetime('now') WHERE index_run_id = ?",
-        (run_id,),
+        "UPDATE index_run SET status = 'complete', completed_at = ? "
+        "WHERE index_run_id = ?",
+        (executed, run_id),
     )
     conn.commit()
     pipeline_id = conn.execute("SELECT pipeline_id FROM pipeline").fetchone()[0]
     hulls = costing.hull_cost(
         conn, ref, store.get_settings(conn), run_id, pipeline_id
     )
-    # 6 installed + the 2 listed against lines that were busy.
-    assert (hulls.hulls_per_cycle, hulls.hulls_planned) == (8, 8)
+    # No job record yet: the plan's figure — 6 installed + the 2 listed
+    # against lines that were busy.
+    assert (hulls.hulls_per_cycle, hulls.hulls_planned, hulls.hulls_from_esi) == (8, 8, False)
+    # The record says 6 Hulk jobs started this cycle: Units read 6.
+    store.save_industry_jobs(conn, [
+        {"job_id": 500 + i, "type_id": hulk, "activity_id": config.ACTIVITY_MANUFACTURING,
+         "start_date": AFTER_CUT, "runs": 1, "units": 1, "status": "active"}
+        for i in range(6)
+    ], pulled_at=executed)
+    hulls = costing.hull_cost(
+        conn, ref, store.get_settings(conn), run_id, pipeline_id
+    )
+    assert (hulls.hulls_per_cycle, hulls.hulls_planned, hulls.hulls_from_esi) == (6, 8, True)
 
 
 def test_a_delivered_wave_still_counts(conn, ref):

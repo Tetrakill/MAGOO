@@ -569,13 +569,18 @@ class CostLine:
 @dataclass
 class HullCost:
     pipeline_id: int
-    # The hulls this cycle STARTS: on an executed run, this pipeline's
-    # share of what the install check let the user start (v1.27.1 — the
-    # jobs the Plan tab told them to run; the plan's own count on runs
-    # planned before the check) plus the units already installed this
-    # cycle when the plan was made (revision 7, 2026-09-29: a plan
-    # re-made after the installs sizes only the rest); on the
-    # current-prices view, the request.
+    # The hulls this cycle INSTALLED: on an executed run, this pipeline's
+    # share of the final units whose jobs ESI shows started inside the
+    # run's buying cycle (user ruling 2026-10-24 — the durable job
+    # record, store.installed_units; hulls_from_esi True), pro rata where
+    # another pipeline consumes the final and NOT capped at the plan's
+    # count (a whole-copy batch or jobs the user added count as built).
+    # Where the logged ESI pulls do not cover the run's whole cycle
+    # (store.jobs_covered; hulls_from_esi False) it is the older started
+    # figure: this pipeline's share of
+    # what the install check let the user start (v1.27.1) plus the units
+    # already installed this cycle when the plan was made (revision 7,
+    # 2026-09-29). On the current-prices view, the request.
     hulls_per_cycle: int
     lines: list
     # Set for the lagged (executed-run) view; None for the current-prices
@@ -588,6 +593,10 @@ class HullCost:
     # lowers both (review 2026-09-10). Installed units count here too
     # (revision 7). None on the current-prices view.
     hulls_planned: int | None = None
+    # True when hulls_per_cycle was read from the ESI job record (schema
+    # 13); False on the fallback to the plan's started figure, and on the
+    # current-prices view. The Profit tab's Units tooltip says which.
+    hulls_from_esi: bool = False
 
     @property
     def total(self) -> float:
@@ -2623,19 +2632,16 @@ def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
     # cycle that built them all. share() still caps both at the hulls
     # this pipeline was attributed.
     #
-    # Two known limits of the started count (review of revision 7,
-    # 2026-09-29), both awaiting the user's ruling rather than guessed
-    # around here:
-    # - The remainder's install_runs is the install check's, rationed
-    #   against the CONFIGURED pools (ruling R2, 2026-09-28: running jobs
-    #   are never subtracted). When the installs already fill every line
-    #   (a slot-limited final: 6 slots, 8 requested, 6 installed) the
-    #   re-plan still lists the rest (2) as jobs to run now, and started
-    #   counts them — it assumes the listed remainder was installable.
-    # - Finals installed after Mark executed (the cut's known limit,
-    #   engine._installed_this_cycle) count in the NEXT run's
-    #   installed_qty while this run's last plan still holds them as
-    #   runs, so both executed runs count the same hulls.
+    # The started figure's two known limits (review of revision 7,
+    # 2026-09-29) are why it is now the FALLBACK only: the remainder's
+    # install_runs is the install check's, rationed against the
+    # CONFIGURED pools and counting the plan's own buys as available, so
+    # a job the page listed counted as started whether or not it was
+    # installed (a material shortfall never lowered it, and after the
+    # installs filled every line the re-plan's relisted rest counted
+    # too); and a final installed after Mark executed counted on both
+    # executed runs. The user's ruling (2026-10-24): the Profit tab
+    # reflects the jobs ACTUALLY installed — the ESI job record below.
     installed = (
         int(final["installed_qty"] or 0)
         if "installed_qty" in final.keys()
@@ -2649,7 +2655,51 @@ def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
         else runs_built
     ) + installed
     planned_hulls = share(built)
+
+    def share_installed(total: int) -> int:
+        """This pipeline's share of units ESI shows INSTALLED: pro rata
+        to the cycle demand where another pipeline consumes the final
+        too (rounded up, as share()), but never capped at the demand —
+        the user ruled (2026-10-24) that installs beyond the plan's
+        figure count as built (a whole-copy batch of 10 against 8
+        requested, or jobs added by hand, are 10 hulls at this per-hull
+        cost)."""
+        if total <= 0:
+            return 0
+        if not whole or whole <= attributed:
+            return total
+        return -(-total * attributed // whole)
+
+    # User ruling 2026-10-24: the hulls an executed run's cycle installed
+    # are the final jobs ESI shows STARTED inside its buying window —
+    # (lo, hi], the window its purchases are filed under
+    # (buying.run_window), from the durable job record (schema 13,
+    # store.installed_units: active / paused / ready / delivered jobs,
+    # never cancelled or reverted ones). A job started after Mark executed
+    # belongs to the next cycle's window, so no hull counts twice. The
+    # record is used only where the logged ESI pulls cover the whole
+    # window (store.jobs_covered — each pull reports the jobs started in
+    # the 90 days before it): a run executed before the record existed
+    # whose cycle the first pull's history did not reach (or reached only
+    # in part), a cycle straddling an idle gap longer than the history,
+    # a window the last pull has not closed yet, and a legacy inverted
+    # window all keep the plan's started figure, and the tab says so.
+    from . import buying  # buying imports costing; resolved at call time
+
+    hulls_from_esi = False
     hulls = min(planned_hulls, share(started))
+    window = buying.run_window(conn, index_run_id)
+    if (
+        window is not None
+        and window.hi is not None
+        and store.jobs_covered(conn, window.lo, window.hi)
+    ):
+        hulls_from_esi = True
+        hulls = share_installed(
+            store.installed_units(
+                conn, pipeline["final_product_type_id"], window.lo, window.hi
+            )
+        )
 
     snapshots: dict[int, dict] = {}
 
@@ -2848,6 +2898,7 @@ def hull_cost(conn, ref, settings, index_run_id: int, pipeline_id: int):
         run_number=run_number,
         hulls_per_cycle=hulls,
         hulls_planned=planned_hulls,
+        hulls_from_esi=hulls_from_esi,
         lines=lines,
     )
 

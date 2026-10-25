@@ -32,7 +32,28 @@ were actually bought at; for a what-if at today's prices see
   sales tax {{ "%.2f"|format(sales_tax * 100) }}% ·
   freight {{ settings.freight_out_isk_per_m3|isk }}/m³. A
   <span class="badge warn">spin-up</span> badge means history is
-  shallower than the chain and some inputs are costed off the priming run.</p>
+  shallower than the chain and some inputs are costed off the priming run.
+  {# Units (user ruling 2026-10-24): what ESI shows installed, not what
+     the plan listed. One sentence either way, so the user knows which
+     figure the cycle totals multiply. The flag is per RUN (the logged
+     pulls either cover its cycle or not), so the first card speaks for
+     all of them. #}
+  {% if cards and cards[0].cost.hulls_from_esi %}
+  Units are the hulls whose jobs ESI shows started inside this run's
+  buying cycle — from the cycle's open (the previous run's Mark executed)
+  up to this one's — as of the last ESI update{% if jobs_as_of %}
+  ({{ jobs_as_of|age }} ago){% endif %}, cancelled jobs excluded; a job
+  installed after that update counts once the next one records it. Where
+  that differs from what the plan sized, the plan's count is on hover and
+  a <span class="badge warn">short</span> badge marks fewer.
+  {% elif cards %}
+  Units are the plan's started figure: the ESI job record does not reach
+  back over this run's whole cycle — no chain of ESI updates covers it
+  from its open to Mark executed (each update records the jobs of the 90
+  days before it; the record began with the first update after the
+  upgrade, and a run executed since the last update needs one more) — so
+  what was actually installed is not on file.
+  {% endif %}</p>
 </details>
 
 {% include "_cycle_totals.html" %}

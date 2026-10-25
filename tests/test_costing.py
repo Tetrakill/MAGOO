@@ -1190,7 +1190,12 @@ def test_executed_hulls_count_the_wave_installed_before_the_last_plan(conn, ref)
     once all 8 Hulks are in. Their installed_qty counts as planned AND
     started, or the Profit tab's Units and cycle_totals would read 0
     hulls for a cycle that built them all. A row planned before the
-    column (NULL) counts runs only, as before."""
+    column (NULL) counts runs only, as before.
+
+    Since the user's ruling of 2026-10-24 this started figure is the
+    FALLBACK — Units come from the ESI job record where it reaches the
+    run's cycle (tests/test_installed_hulls.py); with no job recorded,
+    as here, the figure below is what the Profit tab shows."""
     pid = add_pipeline(conn, ref, "Hulk", 8)
     hulk = ref.type_id("Hulk")
     settings = store.get_settings(conn)

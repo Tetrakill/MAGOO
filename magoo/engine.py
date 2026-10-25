@@ -4245,11 +4245,14 @@ def _installed_this_cycle(job_starts, cycle_cut) -> dict[int, int]:
     the NEW cycle's wave, which then plans that many fewer (the Industry
     Jobs page shows the installed count); and on the first cycle, finals
     installed before the run was first planned (opened_at) are ignored
-    and planned again. Unlikely, not impossible. The late install also
-    counts TWICE on the Profit tab: the executed run's last plan (made
-    before the installs) still holds those finals as runs, and the new
-    run stamps them as installed_qty, so costing.hull_cost counts the
-    same hulls on both executed runs (review 2026-09-29)."""
+    and planned again. Unlikely, not impossible. The planning side of
+    the limit stands; on the Profit tab a late install counts once, on
+    the run whose buying window holds its start — since the user's
+    ruling of 2026-10-24 costing.hull_cost reads the durable industry_job
+    record over the window, and the plan's started figure (which did
+    count such hulls on both executed runs, review 2026-09-29) survives
+    only as the fallback where the logged pulls do not cover the
+    cycle."""
     cut = costing._when(cycle_cut)
     if cut is None:
         if cycle_cut is not None:
@@ -4762,6 +4765,24 @@ def plan_index_run(
         ),
         "structure_market_id": settings_.structure_market(),
     }
+    # User ruling 2026-10-24: a NEW run freezes what its opening plan asks
+    # the user to buy — the Index Runs list's Buy total — as the same sum
+    # the list computed live until then (recommended_buy_qty ×
+    # price_snapshot over every persisted row, an unpriced row counting
+    # 0 and counted). Only the INSERT writes it: an in-place re-plan
+    # keeps the opening figure while the live sum shrinks as bought
+    # stock lands.
+    opening = {
+        "opening_buy_total_isk": sum(
+            (item.recommended_buy_qty or 0) * (item.price_snapshot or 0.0)
+            for item in merged.values()
+        ),
+        "opening_buys_unpriced": sum(
+            1
+            for item in merged.values()
+            if (item.recommended_buy_qty or 0) > 0 and item.price_snapshot is None
+        ),
+    }
     # ONE transaction from the run row to the commit. Any failure rolls
     # every write back and re-raises: left open, a half-written (or, on
     # a replace, half-deleted) run would be committed by the next writer
@@ -4771,7 +4792,7 @@ def plan_index_run(
     try:
         if replace_index_run_id is None:
             index_run_id, run_number = _insert_run_row(
-                conn, run_values, stock_at=snapshot.fetched_at
+                conn, {**run_values, **opening}, stock_at=snapshot.fetched_at
             )
         else:
             index_run_id, run_number = _replace_run_row(

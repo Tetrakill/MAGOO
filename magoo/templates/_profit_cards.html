@@ -26,8 +26,16 @@
     <td>{{ card.name }}</td>
     <td class="num" title="{{ card.cost.total|isk }}">{{ card.cost.total|isk_short }}</td>
     <td class="num" title="{{ card.price|isk }}">{{ card.price|isk_short }}</td>
+    {# Units on an executed run (user ruling 2026-10-24): the hulls whose
+       jobs ESI shows STARTED inside the run's buying cycle
+       (HullCost.hulls_from_esi), the plan's own count on hover where they
+       differ; `short` where fewer were installed than the plan sized, and
+       installs beyond the plan count too. A run the job record does not
+       reach (hulls_from_esi false) keeps the plan's started figure and
+       the older wording. #}
     {% set cut = lagged and card.cost.hulls_planned is not none and card.cost.hulls_per_cycle < card.cost.hulls_planned %}
-    <td class="num {% if cut %}{{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}{% endif %}"{% if cut %} title="the plan wanted {{ card.cost.hulls_planned|qty }} this cycle; stock on hand, in-flight jobs and the buys fed the jobs for {{ card.cost.hulls_per_cycle|qty }} — this pipeline's share of the hulls the Industry Jobs tab told you to start (rounded up where another pipeline shares the final)"{% endif %}>{{ card.cost.hulls_per_cycle|qty }}</td>
+    {% set over = lagged and card.cost.hulls_planned is not none and card.cost.hulls_per_cycle > card.cost.hulls_planned %}
+    <td class="num {% if cut %}{{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}{% endif %}"{% if cut and card.cost.hulls_from_esi %} title="the plan sized {{ card.cost.hulls_planned|qty }} this cycle; ESI shows jobs for {{ card.cost.hulls_per_cycle|qty }} started inside it (from the cycle's open — the previous run's Mark executed — up to this one's, as of the last ESI update), this pipeline's share where another pipeline shares the final — cost per unit is unchanged"{% elif over %} title="the plan sized {{ card.cost.hulls_planned|qty }} this cycle; ESI shows jobs for {{ card.cost.hulls_per_cycle|qty }} started inside it as of the last ESI update — more than the plan sized (a whole-copy batch, or jobs you added): every one counts at this cost per unit"{% elif cut %} title="the plan wanted {{ card.cost.hulls_planned|qty }} this cycle; stock on hand, in-flight jobs and the buys fed the jobs for {{ card.cost.hulls_per_cycle|qty }} — this pipeline's share of the hulls the Industry Jobs tab told you to start (rounded up where another pipeline shares the final). The ESI job record does not reach back to this run's cycle, so this is the plan's figure, not what was installed"{% endif %}>{{ card.cost.hulls_per_cycle|qty }}</td>
     <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}"
         title="{{ card.margin|isk }}">{{ card.margin|isk_short }}</td>
     <td class="num {% if neg %}bad{% elif card.margin %}good{% endif %}">
@@ -61,7 +69,9 @@
       {% elif neg %}
         <span class="badge fill bad" title="net proceeds after sell fees fall below the {{ 'lagged' if lagged else 'current' }} chain cost — see margin / unit">negative margin</span>
       {% endif %}
-      {% if cut %}
+      {% if cut and card.cost.hulls_from_esi %}
+        <span class="badge {{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}" title="fewer installed than the plan sized: ESI shows jobs for {{ card.cost.hulls_per_cycle|qty }} of the {{ card.cost.hulls_planned|qty }} planned hulls started this cycle, as of the last ESI update — Units and the cycle figures count those; cost per unit is unchanged">short</span>
+      {% elif cut %}
         <span class="badge {{ 'bad' if not card.cost.hulls_per_cycle else 'warn' }}" title="short on stock when this run was planned: {{ card.cost.hulls_per_cycle|qty }} of the {{ card.cost.hulls_planned|qty }} planned hulls could start — Units and the cycle figures count those; cost per unit is unchanged">short</span>
       {% endif %}</span></td>
     <td><button type="button" class="mini"

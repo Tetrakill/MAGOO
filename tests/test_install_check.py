@@ -811,7 +811,7 @@ def test_install_columns_persist_and_migrate(conn, ref):
         (plan.index_run_id, hulk.install_limited_by),
     ).fetchone()
     assert bound["install_short_qty"] > 0
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 13
 
 
 def test_schema_9_database_gains_the_columns(tmp_path, monkeypatch):

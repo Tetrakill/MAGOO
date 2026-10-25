@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -574,6 +574,44 @@ CREATE TABLE IF NOT EXISTS run_purchase_refine (
     contract_k   REAL,
     PRIMARY KEY (index_run_id, esi_kind, esi_id, via_type_id, type_id)
 );
+
+-- ESI industry jobs as a durable record (user ruling 2026-10-24, schema
+-- 13): one row per manufacturing / reaction job ESI has reported, with
+-- the status it last carried, upserted on every ESI update and never
+-- pruned. ESI's own job history is 90 days (include_completed), so this
+-- is what lets an executed run's Profit tab count the final jobs that
+-- STARTED inside its buying cycle after that — the plan is advisory,
+-- ESI is the ledger. A job later seen cancelled or reverted keeps its
+-- row with that status and stops counting. No run FK: the buying window
+-- decides which run a job belongs to, as it does for purchases.
+-- start_date is UTC 'YYYY-MM-DD HH:MM:SS' (ESI's ISO text normalised at
+-- write time, store.utc_text) so a window test is a plain text compare
+-- against index_run.completed_at. units = runs x portion, as the
+-- planner's in_progress credit and job_starts count them.
+CREATE TABLE IF NOT EXISTS industry_job (
+    job_id      INTEGER PRIMARY KEY,
+    type_id     INTEGER NOT NULL,
+    activity_id INTEGER NOT NULL,
+    start_date  TEXT NOT NULL,
+    runs        INTEGER NOT NULL,
+    units       INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    seen_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS industry_job_type_start
+    ON industry_job (type_id, start_date);
+
+-- One row per ESI update that refreshed industry_job (schema 13, review
+-- 2026-10-24): a pull at P reports every manufacturing / reaction job
+-- started in [P - 90 days, P] (ESI's completed-job history is 90 days;
+-- a job started inside that span either still runs at P or completed
+-- after its start), so the pulls' intervals, chained without a gap, are
+-- the eras the record can speak for (store.jobs_covered). A pull that
+-- saw no job is logged too: it still establishes what ESI could report.
+CREATE TABLE IF NOT EXISTS industry_job_pull (
+    pull_id   INTEGER PRIMARY KEY,
+    pulled_at TEXT NOT NULL
+);
 """
 
 # Columns added after the original schema; applied idempotently.
@@ -1094,6 +1132,17 @@ _MIGRATIONS = (
     # target_stock_qty).
     "ALTER TABLE index_run_item ADD COLUMN requested_qty INTEGER",
     "ALTER TABLE index_run_item ADD COLUMN wave_qty INTEGER",
+    # User ruling 2026-10-24 (ALTERs under the unreleased schema 13, no
+    # bump): the Buy total the Index Runs list shows is what the plan
+    # asked the user to buy when the run was FIRST planned — the sum of
+    # recommended_buy_qty × price_snapshot over its opening plan, and the
+    # count of its unpriced buy rows — written by the engine's INSERT
+    # only; an in-place re-plan never touches them (the live sum shrinks
+    # as bought stock lands, which is what the run's own pages show).
+    # NULL on runs opened before the columns: the list falls back to the
+    # last plan's live sum and says so.
+    "ALTER TABLE index_run ADD COLUMN opening_buy_total_isk REAL",
+    "ALTER TABLE index_run ADD COLUMN opening_buys_unpriced INTEGER",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -2644,6 +2693,184 @@ def save_esi_snapshot(
     )
     conn.commit()
     return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# ESI industry jobs (durable; schema 13)
+# ---------------------------------------------------------------------------
+
+# A job in one of these statuses was (or is being) built: its units count
+# as installed. cancelled / reverted never do, whatever an earlier update
+# saw.
+JOB_STATUSES_INSTALLED = frozenset({"active", "paused", "ready", "delivered"})
+# How far back a job pull reaches: ESI's include_completed returns the jobs
+# of the past 90 days (plus every job still running, whatever its age).
+ESI_JOB_HISTORY_DAYS = 90
+
+
+def _utc_datetime(value):
+    """`value` — an aware or naive datetime, or either timestamp text
+    shape (ESI '2026-09-25T09:30:00Z', SQLite '2026-09-25 09:30:00', a
+    bare date) — as an aware UTC datetime; None for an empty value or
+    text that does not parse. A naive datetime or text without an offset
+    is taken as UTC (what both ESI and SQLite's datetime('now') write)."""
+    from datetime import datetime, timezone
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace(" ", "T", 1)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def utc_text(value) -> str | None:
+    """`value` (any shape _utc_datetime reads) as UTC 'YYYY-MM-DD
+    HH:MM:SS', the shape index_run's timestamps are written in, so the
+    two compare as text; None where it does not parse."""
+    parsed = _utc_datetime(value)
+    return None if parsed is None else parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def save_industry_jobs(
+    conn: sqlite3.Connection, rows: Iterable[Mapping], pulled_at=None
+) -> int:
+    """Upsert the jobs an ESI update reported: each row has job_id,
+    type_id (the product), activity_id (config.ACTIVITY_MANUFACTURING /
+    ACTIVITY_REACTION), start_date (any shape utc_text reads), runs,
+    units (runs x portion) and status. A row whose start does not parse,
+    or whose job_id is missing, is skipped (logged) — a job with no start
+    belongs to no cycle. Existing rows are replaced wholesale, so a job
+    seen active one update and cancelled the next carries 'cancelled'.
+    Rows ESI no longer reports (older than its 90-day history) are left
+    as they were — that is the point of the table.
+
+    Every call logs the pull (industry_job_pull) at `pulled_at` (any
+    shape utc_text reads; now when None or unparseable) — a pull that
+    saw no job still establishes the era ESI could report, which is
+    what jobs_covered reads. Returns the rows written; commits."""
+    conn.execute(
+        "INSERT INTO industry_job_pull (pulled_at) "
+        "VALUES (COALESCE(?, datetime('now')))",
+        (utc_text(pulled_at),),
+    )
+    written = 0
+    for row in rows:
+        job_id = row.get("job_id")
+        started = utc_text(row.get("start_date"))
+        if job_id is None:
+            log.warning(
+                "industry job of type %r (start %r) has no job_id — not recorded",
+                row.get("type_id"), row.get("start_date"),
+            )
+            continue
+        if started is None:
+            log.warning(
+                "industry job %r of type %r has no usable start_date (%r) — not recorded",
+                job_id, row.get("type_id"), row.get("start_date"),
+            )
+            continue
+        conn.execute(
+            "INSERT INTO industry_job (job_id, type_id, activity_id, start_date, "
+            "runs, units, status, seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(job_id) DO UPDATE SET "
+            "type_id = excluded.type_id, activity_id = excluded.activity_id, "
+            "start_date = excluded.start_date, runs = excluded.runs, "
+            "units = excluded.units, status = excluded.status, "
+            "seen_at = excluded.seen_at",
+            (
+                int(job_id),
+                int(row["type_id"]),
+                int(row["activity_id"]),
+                started,
+                int(row.get("runs") or 0),
+                int(row.get("units") or 0),
+                str(row.get("status") or ""),
+            ),
+        )
+        written += 1
+    conn.commit()
+    return written
+
+
+def installed_units(conn: sqlite3.Connection, type_id: int, lo, hi) -> int:
+    """Units of `type_id` whose recorded jobs STARTED inside (lo, hi] —
+    the buying-window rule purchases follow (buying.BuyWindow.contains):
+    strictly after the cycle opened, up to and including the moment it
+    was marked executed — in a status that counts
+    (JOB_STATUSES_INSTALLED). lo / hi take any shape utc_text reads; a
+    bound that does not parse makes the window empty (0), never
+    everything."""
+    lo_text, hi_text = utc_text(lo), utc_text(hi)
+    if lo_text is None or hi_text is None:
+        return 0
+    marks = ",".join("?" * len(JOB_STATUSES_INSTALLED))
+    row = conn.execute(
+        "SELECT COALESCE(SUM(units), 0) FROM industry_job "
+        f"WHERE type_id = ? AND start_date > ? AND start_date <= ? AND status IN ({marks})",
+        (int(type_id), lo_text, hi_text, *sorted(JOB_STATUSES_INSTALLED)),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def jobs_covered(conn: sqlite3.Connection, lo, hi) -> bool:
+    """Whether the job record can speak for every job started in the
+    window (lo, hi]. A pull at P reports every manufacturing / reaction
+    job started in [P − ESI_JOB_HISTORY_DAYS, P]: one started in that
+    span either still runs at P (reported whatever its age) or completed
+    after its start, inside the history. So the window is covered when
+    the logged pulls' intervals, chained without a gap, run from lo to
+    hi — the first pull's reach at or before lo, each next pull's reach
+    at or before the previous pull, the last pull at or after hi. False
+    on an empty log (ESI never pulled since the table existed), on a run
+    whose cycle predates the first pull's reach (its jobs had aged out
+    of ESI's history — review 2026-10-24: judging coverage by any job on
+    file read a straddling cycle as whole), on a gap (the app idle for
+    longer than the history), on an inverted or unparseable window, and
+    on a window that runs past the last pull (jobs installed since are
+    not on file yet). The reader then falls back to what the plan
+    recorded rather than reading "nothing installed"."""
+    from datetime import timedelta
+
+    lo_dt, hi_dt = _utc_datetime(lo), _utc_datetime(hi)
+    if lo_dt is None or hi_dt is None or lo_dt >= hi_dt:
+        return False
+    span = timedelta(days=ESI_JOB_HISTORY_DAYS)
+    reached = lo_dt
+    for (pulled_at,) in conn.execute(
+        "SELECT pulled_at FROM industry_job_pull WHERE pulled_at > ? "
+        "ORDER BY pulled_at",
+        (utc_text(lo_dt),),
+    ):
+        pulled = _utc_datetime(pulled_at)
+        if pulled is None:
+            continue
+        if pulled - span > reached:
+            return False  # an era no pull reported
+        reached = max(reached, pulled)
+        if reached >= hi_dt:
+            return True
+    return False
+
+
+def last_job_pull(conn: sqlite3.Connection) -> str | None:
+    """When the job record was last refreshed (UTC 'YYYY-MM-DD HH:MM:SS'),
+    None before the first pull — what an executed run's Units are "as of"."""
+    row = conn.execute("SELECT MAX(pulled_at) FROM industry_job_pull").fetchone()
+    return row[0] if row and row[0] else None
 
 
 def latest_esi_snapshot(conn: sqlite3.Connection):
