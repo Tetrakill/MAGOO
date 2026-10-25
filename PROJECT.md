@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.29.1 built and live (the Profit tab counts the hulls ESI shows installed, and the Index Runs list carries the opening Buy total with revenue and profit per run; the Buy tab — purchases recorded from ESI, realized cost at what was paid, one live run per buying cycle; engine, MILP allocation, sizing feedback
+Status: v1.30.0 built and live (the Profit tab counts the hulls ESI shows installed, and the Index Runs list carries the opening Buy total with revenue and profit per run; the Buy tab — purchases recorded from ESI, realized cost at what was paid, one live run per buying cycle; engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -4446,7 +4446,7 @@ Tests 555 → 560 (`test_pinned_type_lets_another_ore_cover_the_rest`,
 `test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct`,
 `test_thin_structure_book_splits_the_multibuy_like_the_venue_cell`).
 
-### v1.29.1 (2026-10-24): the Profit tab counts the hulls ESI shows installed; the Index Runs list carries the opening Buy total, revenue and profit per run — commit 5e726d2
+### v1.30.0 (2026-10-24): the Profit tab counts the hulls ESI shows installed; the Index Runs list carries the opening Buy total, revenue and profit per run — commit 5e726d2 (stamped v1.29.1 as 7b3df6e, re-stamped v1.30.0: a one-way schema takes a minor bump, as v1.28.0 and v1.29.0 did)
 
 The user, material-limited on a cycle, found the executed run's Profit
 tab still counting the plan's full job list — the install check counted
@@ -4485,7 +4485,7 @@ for a superseded plan, a run with nothing attributable and a run whose
 costing raised (logged; the list never fails as a whole).
 
 Schema 13 (one-way: v1.29.0 refuses a migrated database; the pre-upgrade
-backup lands as `magoo-pre-1.29.1.sqlite`). The job record fills on the
+backup lands as `magoo-pre-1.30.0.sqlite`). The job record fills on the
 first ⟳ Update from ESI after the upgrade — until then an executed run
 keeps the plan's figure and says so. 1175 tests.
 
