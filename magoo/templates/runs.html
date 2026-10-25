@@ -18,8 +18,18 @@
 {% if runs %}
 <div class="tablewrap">
 <table>
+  {# User ruling 2026-10-24: Buy total is the OPENING plan's figure
+     (frozen when the run was first planned; the run's own pages show the
+     current plan's, which shrinks as bought stock lands), and every run
+     shows revenue and profit per cycle — realized on an executed run
+     (its Profit tab's cycle totals), the today's-prices estimate on the
+     open run (Planning → Profit's), none on a superseded plan. #}
   <thead><tr><th class="num">#</th><th>Planned</th><th>Status</th>
-      <th class="num">Items</th><th class="num">Buy total</th><th></th></tr></thead>
+      <th class="num">Items</th>
+      <th class="num" title="what the plan asked you to buy when the run was first planned — the run's own pages show the current plan's figure, which shrinks as bought stock lands">Buy total</th>
+      <th class="num" title="net proceeds per cycle, after sell fees — the Profit tab's 'Net proceeds / cycle' on an executed run, Planning → Profit's estimate on the open run; not the Ledger's gross Revenue (price × units before fees)">Revenue</th>
+      <th class="num" title="profit per cycle: net proceeds less the chain cost of the units — the Profit tab's 'Profit / cycle' on an executed run, Planning → Profit's estimate on the open run">Profit</th>
+      <th></th></tr></thead>
   {% for r in runs %}
   <tr{% if r.superseded %} class="superseded"{% endif %}>
     <td class="num">{{ r.run_number }}</td>
@@ -28,8 +38,22 @@
           title="a newer run exists — this plan is out of date">superseded</span>
         {% else %}<span class="badge {% if r.status == 'complete' %}good{% else %}accent{% endif %}">{{ r.status }}</span>{% endif %}</td>
     <td class="num">{{ r['items']|qty }}</td>
-    <td class="num" title="{{ r.buy_total|isk }}">{{ r.buy_total|isk_short }}{% if r.buys_unpriced %}
+    <td class="num" title="{{ r.buy_total|isk }} ISK{% if r.buy_total_opening %} — what the plan asked you to buy when this run was first planned{% else %} — the buy total of this run's last plan{% endif %}">{{ r.buy_total|isk_short }}{% if not r.buy_total_opening %}
+      <span class="badge" title="opened before the opening figure was recorded — this is the buy total of its last plan, which an in-place re-plan may have shrunk">latest</span>{% endif %}{% if r.buys_unpriced %}
       <span class="badge warn" title="unpriced buy items count as 0 ISK here">{{ r.buys_unpriced }} unpriced</span>{% endif %}</td>
+    {% set f = r.figures %}
+    {% if f %}
+    {# Realized tooltips say where the units came from (the Profit tab's
+       own rule): the ESI job record where the logged pulls cover the
+       cycle, else the plan's started figure. #}
+    <td class="num" title="{{ f.revenue|isk }} ISK — {% if f.kind == 'realized' %}the Profit tab's Net proceeds / cycle: net proceeds at today's quotes, after sell fees, for {% if f.hulls_from_esi %}the hulls ESI shows started inside this cycle{% else %}the hulls the plan started (the ESI job record does not cover this cycle){% endif %}{% else %}Planning → Profit's estimate: net proceeds at today's cached prices for the active pipelines' requested units{% endif %} — not the Ledger's gross Revenue">{{ f.revenue|isk_short }}{% if f.kind == 'estimate' %}
+      <span class="badge" title="estimate at today's prices — realized figures appear once the run is marked executed">est.</span>{% endif %}{% if f.unquoted %}
+      <span class="badge warn" title="{{ f.unquoted }} pipeline final(s) have no sell quote and are left out of both figures">{{ f.unquoted }} unquoted</span>{% endif %}</td>
+    <td class="num {% if f.profit < 0 %}bad{% elif f.profit > 0 %}good{% endif %}" title="{{ f.profit|isk }} ISK — {% if f.kind == 'realized' %}the Profit tab's Profit / cycle: net proceeds less the lagged chain cost of {% if f.hulls_from_esi %}the hulls ESI shows started inside this cycle{% else %}the hulls the plan started{% endif %}{% else %}Planning → Profit's estimate: net proceeds less the chain cost at today's prices{% endif %}">{{ f.profit|isk_short }}</td>
+    {% else %}
+    <td class="num muted" title="{% if r.figures_failed %}could not be costed — open the run's Profit tab for the error{% elif r.superseded %}a superseded plan has no figures{% elif r.status == 'complete' %}nothing to cost: no pipeline is attributable to this run{% else %}no estimate yet — the open run's estimate needs the game data imported and at least one active pipeline{% endif %}">—</td>
+    <td class="num muted">—</td>
+    {% endif %}
     <td><a href="{{ url_for('run_detail', index_run_id=r.index_run_id) }}">view</a>
       {% if r.status != 'complete' %}
       <form class="inline" method="post"

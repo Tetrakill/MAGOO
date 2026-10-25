@@ -157,7 +157,11 @@ _ACTIVE_JOB_STATUSES = {"active", "paused", "ready"}
 # was DELIVERED before Mark executed still belongs to this cycle's wave.
 # Such a job records its start in job_starts only — its output is on hand,
 # so it never credits in_progress, the active-job counts or job_ends.
-# cancelled / reverted jobs record nothing anywhere.
+# cancelled / reverted jobs credit nothing in the snapshot maps
+# (job_starts, in_progress, active_jobs, job_ends) but are still upserted
+# into the durable industry_job record with their status (schema 13), so a
+# job one update saw active stops counting as installed once ESI reports
+# it cancelled — refresh_state's add_jobs keeps them past the status gate.
 _DELIVERED_JOB_STATUS = "delivered"
 _JOB_FEED_PARAMS = {"include_completed": "true"}
 
@@ -884,6 +888,16 @@ def refresh_state(conn, ref) -> dict:
       Old format: revision 6 stored {type_id: latest start_date text};
       store.latest_esi_snapshot reads that scalar format as None (not
       recorded — the plan sizes the full wave), never as a start.
+    - industry_job (user ruling 2026-10-24, schema 13): every
+      manufacturing / reaction job the feeds report — the same
+      tracked-system filter and job_id dedup as job_starts, lab jobs
+      never — is upserted into the durable job record
+      (store.save_industry_jobs) with the status it carries NOW,
+      cancelled and reverted included, so a job an earlier update saw
+      active stops counting once it is cancelled. An executed run's
+      Profit tab counts the final jobs recorded as started inside its
+      buying cycle (costing.hull_cost); the record outlives ESI's 90-day
+      history, which the snapshot's job_starts does not.
     - Corp endpoints are tried per endpoint FAMILY across pool characters
       until one holds the role (roles differ per endpoint: Director /
       Factory Manager / Accountant), instead of burning the corp on the
@@ -903,6 +917,7 @@ def refresh_state(conn, ref) -> dict:
         config.ACTIVITY_REACTION: [],
     }
     job_starts: dict[int, list[list]] = {}
+    job_rows: list[dict] = []
     character_isk = 0.0
     corporation_isk = 0.0
     seen_job_ids: set[int] = set()
@@ -923,10 +938,13 @@ def refresh_state(conn, ref) -> dict:
             # Delivered jobs (completed history, v1.29 revision 7) pass the
             # dedup, the tracked-system filter and the lab exclusion but
             # record their start only; every other non-active status
-            # (cancelled, reverted) records nothing.
-            delivered = job.get("status") == _DELIVERED_JOB_STATUS
-            if job.get("status") not in _ACTIVE_JOB_STATUSES and not delivered:
-                continue
+            # (cancelled, reverted — `dead`) credits nothing in any map,
+            # yet since schema 13 still reaches the durable job record at
+            # the bottom, so a job an earlier update saw active stops
+            # counting as installed once ESI reports it cancelled.
+            status = job.get("status")
+            delivered = status == _DELIVERED_JOB_STATUS
+            dead = status not in _ACTIVE_JOB_STATUSES and not delivered
             if job.get("job_id") in seen_job_ids:
                 continue  # same job visible via character AND corp endpoints
             seen_job_ids.add(job.get("job_id"))
@@ -940,7 +958,7 @@ def refresh_state(conn, ref) -> dict:
             lab = job["activity_id"] in _LAB_JOB_ACTIVITIES
             if activity is None and not lab:
                 continue  # research (3/4): not tracked at all
-            if delivered and lab:
+            if lab and (delivered or dead):
                 continue  # delivered lab output is stock; no start kept
             # Slot counting is location-blind: the line is busy wherever
             # the job runs. The corp feed (processed first, so it claims
@@ -949,7 +967,7 @@ def refresh_state(conn, ref) -> dict:
             # suffices (2026-08-25). Character feeds count only their
             # slot-flagged installer's remaining (personal) jobs. Lab
             # jobs never touch the pools ("T2 invention chain" decision).
-            if not delivered and activity is not None and (
+            if not delivered and not dead and activity is not None and (
                 count_all_slots or job.get("installer_id") in slot_ids
             ):
                 active_jobs[activity] += 1
@@ -1006,17 +1024,31 @@ def refresh_state(conn, ref) -> dict:
             elif job["activity_id"] == config.ACTIVITY_COPYING:
                 portion = max(1, int(job.get("licensed_runs") or 1))
             units = job.get("runs", 0) * portion
-            if not delivered:
+            if not delivered and not dead:
                 in_progress[product_id] = (
                     in_progress.get(product_id, 0) + units
                 )
             started = job.get("start_date")
             if activity is not None and started:
-                # One entry per job, the same units as the in_progress
-                # credit (a delivered job's units are on hand instead).
-                # ESI's ISO text kept verbatim; the engine parses it.
-                job_starts.setdefault(product_id, []).append(
-                    [str(started), units]
+                if not dead:
+                    # One entry per job, the same units as the in_progress
+                    # credit (a delivered job's units are on hand instead).
+                    # ESI's ISO text kept verbatim; the engine parses it.
+                    job_starts.setdefault(product_id, []).append(
+                        [str(started), units]
+                    )
+                # The durable record takes every status: the row's status
+                # is what decides whether it counts (store.installed_units).
+                job_rows.append(
+                    {
+                        "job_id": job.get("job_id"),
+                        "type_id": product_id,
+                        "activity_id": activity,
+                        "start_date": str(started),
+                        "runs": job.get("runs", 0),
+                        "units": units,
+                        "status": status,
+                    }
                 )
 
     # Corporation data FIRST: per distinct corp, each endpoint family
@@ -1114,6 +1146,9 @@ def refresh_state(conn, ref) -> dict:
             )
         add_jobs(fetch_industry_jobs(conn, character_id), character_id)
 
+    # The durable job record first (schema 13), then the snapshot: a
+    # snapshot is superseded by the next pull, the record is for good.
+    store.save_industry_jobs(conn, job_rows)
     store.save_esi_snapshot(
         conn,
         on_hand,

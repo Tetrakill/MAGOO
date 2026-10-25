@@ -45,20 +45,25 @@ def _seed_run(conn, run_number=1) -> int:
 # ---------------------------------------------------------------------------
 
 
-def test_fresh_database_reaches_schema_12(tmp_path, monkeypatch):
+def test_fresh_database_reaches_schema_13(tmp_path, monkeypatch):
+    """Schema 12 shipped with v1.29.0 (2026-09-30); 13 adds the durable
+    industry_job record (user ruling 2026-10-24) and the v1.29 tables
+    and columns are still there."""
     conn = _db(tmp_path, monkeypatch)
-    assert store.SCHEMA_VERSION == 12
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert store.SCHEMA_VERSION == 13
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
     tables = {
         r["name"]
         for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     assert "run_purchase" in tables
+    assert "industry_job" in tables
     indexes = {
         r["name"]
         for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
     }
     assert "run_purchase_run" in indexes
+    assert "industry_job_type_start" in indexes
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(index_run_item)")}
     assert {
         "compressed_alloc",
@@ -72,8 +77,9 @@ def test_fresh_database_reaches_schema_12(tmp_path, monkeypatch):
 def test_schema_11_database_gains_the_table_and_columns(tmp_path, monkeypatch):
     """An upgraded database: the run_purchase table and the four new
     index_run_item columns arrive on the next ensure_schema, rows planned
-    before carry NULLs, and the stamp moves to 12. The pre-upgrade backup
-    lands in THIS temp dir."""
+    before carry NULLs, and the stamp moves to the current version (12
+    when this was written; 13 since the industry_job record). The
+    pre-upgrade backup lands in THIS temp dir."""
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "old.sqlite")
     conn = sqlite3.connect(tmp_path / "old.sqlite")
@@ -101,7 +107,7 @@ def test_schema_11_database_gains_the_table_and_columns(tmp_path, monkeypatch):
     store.ensure_schema(conn)
 
     assert list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))  # landed HERE
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 13
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(index_run_item)")}
     assert {
         "compressed_alloc",
@@ -500,13 +506,13 @@ _RUN_PURCHASE_ESI_COLUMNS = {
 }
 
 
-def test_fresh_database_has_the_buy_side_tables_at_12(tmp_path, monkeypatch):
+def test_fresh_database_has_the_buy_side_tables(tmp_path, monkeypatch):
     """Schema 12 had not shipped when revision 3 arrived: the three tables
-    are CREATE IF NOT EXISTS, the stamp stays 12, and the retired choice
-    table is gone."""
+    are CREATE IF NOT EXISTS (no migration entry of their own), and the
+    retired choice table is gone. The stamp is the current version."""
     conn = _db(tmp_path, monkeypatch)
-    assert store.SCHEMA_VERSION == 12
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert store.SCHEMA_VERSION == 13
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
     tables = _tables(conn)
     assert {"buy_transaction", "buy_contract", "buy_contract_item"} <= tables
     assert "run_buy_choice" not in tables
@@ -716,9 +722,10 @@ def _wind_back_to_revision_2(conn) -> None:
 
 
 def test_a_revision_2_database_at_12_gains_revision_3(tmp_path, monkeypatch):
-    """A dev database already stamped 12 gains the tables, the six
-    run_purchase columns, the index and count_buys on the next open, with
-    no version bump and no pre-migration backup. Its existing purchase
+    """A dev database already at the current stamp gains the tables, the
+    six run_purchase columns, the index and count_buys on the next open,
+    with no version bump and no pre-migration backup (12 when written;
+    the stamp is read from store.SCHEMA_VERSION). Its existing purchase
     lines survive as non-derived rows (esi_kind NULL), and the orphaned
     choice table is dropped so its rows can no longer block a run delete
     through the foreign key."""
@@ -739,7 +746,7 @@ def test_a_revision_2_database_at_12_gains_revision_3(tmp_path, monkeypatch):
 
     store.ensure_schema(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     assert not list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))
     tables = _tables(conn)
     assert {"buy_transaction", "buy_contract", "buy_contract_item"} <= tables
@@ -797,8 +804,9 @@ def test_the_revision_6_columns_are_migrations_not_state_schema():
 
 
 def test_a_database_at_12_without_them_gains_them(tmp_path, monkeypatch):
-    """No version bump (schema 12 is unshipped): a revision-5 database at
-    12 gains both columns on the next open with no backup, its rows
+    """No version bump of their own (schema 12 was unshipped): a
+    revision-5 database at the current stamp gains both columns on the
+    next open with no backup, its rows
     carrying NULL, and the open is idempotent afterwards."""
     conn = _db(tmp_path, monkeypatch)
     run_id = _seed_run(conn)
@@ -816,7 +824,7 @@ def test_a_database_at_12_without_them_gains_them(tmp_path, monkeypatch):
     store.ensure_schema(conn)
     store.ensure_schema(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     assert not list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))
     row = conn.execute(
         "SELECT i.on_hand_qty, i.on_hand_from_ore_qty, r.opened_at, r.planned_start "
@@ -917,7 +925,7 @@ def test_a_fresh_database_opens_without_a_rewalk(tmp_path, monkeypatch):
 
 def test_a_schema_11_database_rewalks_on_upgrade(tmp_path, monkeypatch):
     """The production path: a v1.28.1 database (schema 11, no buy side,
-    no run_purchase) upgrades to 12 in one open — pre-migration backup in
+    no run_purchase) upgrades to the current stamp in one open — pre-migration backup in
     THIS temp dir, cursors reset, run_purchase complete with the esi_*
     columns and index."""
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
@@ -938,7 +946,7 @@ def test_a_schema_11_database_rewalks_on_upgrade(tmp_path, monkeypatch):
     store.ensure_schema(conn)
 
     assert list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     assert _cursors(conn) == {("character", 1, "transactions", 0): (None, None, 0)}
     assert _RUN_PURCHASE_ESI_COLUMNS <= _cols(conn, "run_purchase")
     assert "run_purchase_esi" in _indexes(conn)
@@ -1591,7 +1599,7 @@ def test_a_revision_3_database_at_12_gets_the_other_venue_check(
 
     store.ensure_schema(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     assert not list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))
     sql = _run_purchase_sql(conn)
     assert "('hub','structure','delivered','other')" in sql
@@ -1786,7 +1794,7 @@ def test_the_refine_freeze_table_and_structure_market_column_exist(tmp_path, mon
     conn = _db(tmp_path, monkeypatch)
     assert "run_purchase_refine" in _tables(conn)
     assert "structure_market_id" in _cols(conn, "index_run")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     run = _seed_run(conn)
     assert conn.execute(
         "SELECT structure_market_id FROM index_run WHERE index_run_id = ?", (run,)
@@ -1855,10 +1863,11 @@ def test_delete_run_purchases_clears_the_runs_frozen_conversions(tmp_path, monke
 
 
 def test_installed_qty_is_a_migration_defaulting_to_null(tmp_path, monkeypatch):
-    """Schema 12 is unreleased, so installed_qty rides _MIGRATIONS with no
-    bump (amendment 10); a row inserted without it reads NULL (planned
-    before the column), which every reader treats as 0."""
-    assert store.SCHEMA_VERSION == 12
+    """Schema 12 was unreleased when installed_qty arrived, so it rides
+    _MIGRATIONS with no bump of its own (amendment 10); a row inserted
+    without it reads NULL (planned before the column), which every reader
+    treats as 0."""
+    assert store.SCHEMA_VERSION >= 12
     assert "installed_qty" not in store.STATE_SCHEMA
     assert (
         "ALTER TABLE index_run_item ADD COLUMN installed_qty INTEGER"
@@ -1877,8 +1886,8 @@ def test_installed_qty_is_a_migration_defaulting_to_null(tmp_path, monkeypatch):
 
 
 def test_a_database_at_12_without_installed_qty_gains_it(tmp_path, monkeypatch):
-    """A revision-6 dev database already stamped 12 gains the column on
-    the next open — no backup, older rows NULL, idempotent."""
+    """A revision-6 dev database already at the current stamp gains the
+    column on the next open — no backup, older rows NULL, idempotent."""
     conn = _db(tmp_path, monkeypatch)
     run_id = _seed_run(conn)
     conn.execute(
@@ -1894,7 +1903,7 @@ def test_a_database_at_12_without_installed_qty_gains_it(tmp_path, monkeypatch):
     store.ensure_schema(conn)
     store.ensure_schema(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     assert not list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))
     row = conn.execute(
         "SELECT on_hand_qty, installed_qty FROM index_run_item"
@@ -1907,10 +1916,10 @@ def test_requested_and_wave_qty_are_migrations_a_12_database_gains(
     tmp_path, monkeypatch
 ):
     """Revision 7 fix pass: a final's request and the wave the engine
-    sized against ride _MIGRATIONS under the unreleased schema 12 like
-    installed_qty — a dev database already at 12 gains them on the next
+    sized against ride _MIGRATIONS under the then-unreleased schema 12 like
+    installed_qty — a dev database already at 12 gained them on the next
     open, no backup, older rows NULL (readers fall back to the target)."""
-    assert store.SCHEMA_VERSION == 12
+    assert store.SCHEMA_VERSION >= 12
     for col in ("requested_qty", "wave_qty"):
         assert col not in store.STATE_SCHEMA
         assert (
@@ -1931,7 +1940,7 @@ def test_requested_and_wave_qty_are_migrations_a_12_database_gains(
     store.ensure_schema(conn)
     store.ensure_schema(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     assert not list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))
     row = conn.execute(
         "SELECT requested_qty, wave_qty FROM index_run_item"
