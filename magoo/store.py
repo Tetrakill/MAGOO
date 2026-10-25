@@ -2770,7 +2770,13 @@ def save_industry_jobs(
     for row in rows:
         job_id = row.get("job_id")
         started = utc_text(row.get("start_date"))
-        if job_id is None or started is None:
+        if job_id is None:
+            log.warning(
+                "industry job of type %r (start %r) has no job_id — not recorded",
+                row.get("type_id"), row.get("start_date"),
+            )
+            continue
+        if started is None:
             log.warning(
                 "industry job %r of type %r has no usable start_date (%r) — not recorded",
                 job_id, row.get("type_id"), row.get("start_date"),

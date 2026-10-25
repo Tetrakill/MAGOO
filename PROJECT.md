@@ -1956,7 +1956,13 @@ by "any job on file at or before Mark executed" (the first cut) read a
 cycle that straddled the first pull's horizon as whole and undercounted
 it under ESI wording; the pull log makes the straddle, the idle gap and
 the not-yet-pulled tail all fall back to the plan's figure instead.
-`store.last_job_pull` is the "as of" the Profit tab shows.
+`store.last_job_pull` is the "as of" the Profit tab shows. Coverage is
+about ESI's horizon over the feeds the pool can read: a pull is logged
+whenever the update completes, so jobs installed by a character outside
+the pool in a corporation whose jobs feed no pool character can read
+(no Factory Manager, or *Count jobs* off) are not on file and never
+count — the same blind spot `job_starts` and the in-progress credit have
+(pre-release review 2026-10-25, accepted).
 
 ### Sales ledger (v1.27.0)
 
@@ -4446,7 +4452,7 @@ Tests 555 → 560 (`test_pinned_type_lets_another_ore_cover_the_rest`,
 `test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct`,
 `test_thin_structure_book_splits_the_multibuy_like_the_venue_cell`).
 
-### v1.30.0 (2026-10-24): the Profit tab counts the hulls ESI shows installed; the Index Runs list carries the opening Buy total, revenue and profit per run — commit 5e726d2 (stamped v1.29.1 as 7b3df6e, re-stamped v1.30.0: a one-way schema takes a minor bump, as v1.28.0 and v1.29.0 did)
+### v1.30.0 (2026-10-24): the Profit tab counts the hulls ESI shows installed; the Index Runs list carries the opening Buy total, revenue and profit per run — commit 5e726d2 (stamped v1.29.1 as 7b3df6e, re-stamped v1.30.0 as dc9a0be: a one-way schema takes a minor bump, as v1.28.0 and v1.29.0 did; then the pre-release fixes commit — the Mark executed flash, a log message, DESIGN.md, a coverage note)
 
 The user, material-limited on a cycle, found the executed run's Profit
 tab still counting the plan's full job list — the install check counted

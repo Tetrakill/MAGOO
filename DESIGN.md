@@ -472,8 +472,9 @@ and hover with the teal Hover Wash.
   not an input, stopped the job: the plan lists more jobs than the pool
   after the slot backfill, and those wait for a slot. No separate column. The Mfg / Reaction slots
   stats count the same jobs against the pool the run was planned against
-  (the settings' pools less multi-cycle overhang, persisted on the run
-  since schema 11; the tooltip says so when they differ), with a dim
+  (the settings' pools as entered, persisted on the run since schema 11
+  — nothing subtracted since v1.29 revision 6, user ruling R2 2026-09-28;
+  the tooltip says so when Settings now differs), with a dim
   "· plan N" sub where the plan's count differs — stock feeds fewer, or the plan lists more jobs than the
   pool because the slots of jobs stock cannot start went to others and
   those jobs wait (the tooltip says which); the alert-warn panel is itself a

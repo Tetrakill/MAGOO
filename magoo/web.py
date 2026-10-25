@@ -5374,13 +5374,17 @@ def create_app() -> Flask:
             "▶ Plan index run opens the next cycle"
         )
         # The Profit tab's Units read the ESI job record, which only an
-        # update refreshes (review 2026-10-24): say what it is as of, so
-        # jobs installed since are not mistaken for jobs never started.
+        # update refreshes (review 2026-10-24): the run's cycle has just
+        # closed AFTER every logged pull, so the tab keeps the plan's
+        # started figure until the next update records the jobs installed
+        # through Mark executed (pre-release review 2026-10-25) — say so,
+        # so the plan's figure is not mistaken for ESI's.
         jobs_as_of = store.last_job_pull(c)
         if jobs_as_of:
             message += (
-                f" — Profit-tab Units count the jobs ESI had reported as of "
-                f"{jobs_as_of}; ⟳ Update from ESI to count jobs installed since"
+                f" — Profit-tab Units keep the plan's started figure until the "
+                f"next ⟳ Update from ESI records the jobs installed through Mark "
+                f"executed (the job record is as of {jobs_as_of})"
             )
         match_message, ok = _assign_purchases(c)
         if not ok:
