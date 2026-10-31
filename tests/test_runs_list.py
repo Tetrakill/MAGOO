@@ -333,3 +333,102 @@ def test_an_executed_run_with_nothing_attributable_shows_a_dash(seeded_client):
     tr = _row(resp.get_data(as_text=True), 1)
     assert _cells(tr)[5:7] == ["—", "—"]
     assert "nothing to cost" in tr
+
+
+def _page_stat_isk(html: str) -> int:
+    """The run page's Buy total stat (run_detail.html: the live figure)."""
+    m = re.search(
+        r'<span class="label">Buy total</span>\s*'
+        r'<span class="value[^"]*"\s*title="(-?[\d,]+) ISK',
+        html,
+    )
+    assert m, "run page Buy total stat missing"
+    return int(m.group(1).replace(",", ""))
+
+
+def test_an_esi_update_with_the_purchases_landed_leaves_the_lists_buy_total_frozen(
+    seeded_client, monkeypatch,
+):
+    """The user's own check (2026-10-30): buy everything the plan asked
+    for, the goods land in the hangar, the wallet buys are recorded, and
+    ⟳ Update from ESI re-plans the open run in place — through the real
+    update route, its network steps stubbed as test_web_lifecycle does.
+    The run's own Buy total drops (nothing left to buy); the Index Runs
+    list's Buy total stays the opening figure, with no `latest` badge."""
+    from datetime import datetime, timedelta, timezone
+
+    from magoo import esi, ledger, market
+
+    run_id = _plan(seeded_client)
+    c = sqlite3.connect(config.DB_PATH)
+    c.row_factory = sqlite3.Row
+    bought = {
+        r["type_id"]: (r["recommended_buy_qty"], r["price_snapshot"])
+        for r in c.execute(
+            "SELECT type_id, recommended_buy_qty, price_snapshot FROM index_run_item "
+            "WHERE index_run_id = ? AND recommended_buy_qty > 0",
+            (run_id,),
+        )
+    }
+    assert bought
+    frozen_before = c.execute(
+        "SELECT opening_buy_total_isk FROM index_run WHERE index_run_id = ?", (run_id,)
+    ).fetchone()[0]
+    c.execute(
+        "INSERT INTO pool_character (character_id, character_name, include_assets, "
+        "include_job_slots, count_assets, count_buys) VALUES (2001, 'buyer', 1, 1, 1, 1)"
+    )
+    c.commit()
+    c.close()
+    list_before = _title_isk(_row(seeded_client.get("/runs").get_data(as_text=True), 1), 4)
+    page_before = _page_stat_isk(seeded_client.get(f"/runs/{run_id}").get_data(as_text=True))
+    assert page_before > 0
+
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(market, "refresh_prices", lambda *a, **k: (0, 0, 0))
+    monkeypatch.setattr(market, "fetch_adjusted_prices", lambda: {})
+    monkeypatch.setattr(esi, "character_with_scope", lambda conn, scope: None)
+
+    def fake_state(conn, ref_):
+        on_hand = {t: q for t, (q, _p) in bought.items()}   # the purchases landed
+        store.save_industry_jobs(conn, [])                   # the pull log, as refresh_state does
+        store.save_esi_snapshot(conn, on_hand, {}, {}, 0.0, 0.0, {}, job_starts={})
+        return {"on_hand": on_hand, "in_progress": {}, "active_jobs": {}, "job_ends": {},
+                "character_isk": 0.0, "corporation_isk": 0.0, "job_starts": {}}
+
+    def fake_pull(conn, ref_):
+        when = (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for i, (t, (q, price)) in enumerate(bought.items()):
+            conn.execute(
+                "INSERT INTO buy_transaction (transaction_id, owner_kind, owner_id, "
+                "source_feed, type_id, quantity, unit_price, date, location_id, "
+                "client_id, fetched_at) VALUES (?, 'character', 2001, 'character', "
+                "?, ?, ?, ?, 60003760, NULL, ?)",
+                (500_000 + i, t, q, price or 0.0, when, now.strftime("%Y-%m-%dT%H:%M:%SZ")),
+            )
+        conn.commit()
+        return ledger.PullSummary(new_sales=0, contracts_finished=0, open_orders=0)
+
+    monkeypatch.setattr(esi, "refresh_state", fake_state)
+    monkeypatch.setattr(ledger, "pull_sales", fake_pull)
+
+    resp = seeded_client.post("/esi/refresh", follow_redirects=True)
+    assert resp.status_code == 200
+    assert " re-planned: " in resp.get_data(as_text=True)  # the update's re-plan clause
+
+    tr = _row(seeded_client.get("/runs").get_data(as_text=True), 1)
+    assert _title_isk(tr, 4) == list_before
+    assert ">latest</span>" not in tr
+    page_after = _page_stat_isk(seeded_client.get(f"/runs/{run_id}").get_data(as_text=True))
+    assert page_after < page_before
+    c = sqlite3.connect(config.DB_PATH)
+    c.row_factory = sqlite3.Row
+    row = c.execute(
+        "SELECT opening_buy_total_isk, "
+        "(SELECT COUNT(*) FROM run_purchase WHERE index_run_id = r.index_run_id) AS filed "
+        "FROM index_run r WHERE index_run_id = ?",
+        (run_id,),
+    ).fetchone()
+    c.close()
+    assert row["opening_buy_total_isk"] == frozen_before
+    assert row["filed"] > 0  # the wallet buys were filed on the run
