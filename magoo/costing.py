@@ -659,6 +659,20 @@ class CycleTotals:
     # structure market (Null Sec Market Share = structure ÷ materials).
     materials: float = 0.0
     structure_materials: float = 0.0
+    # User ruling 2026-10-31: alchemy run FOR SALE — composite output the
+    # plan meant for Jita, not for the chain — folded into cost / proceeds
+    # / profit above and kept apart here so the strip can say "incl.".
+    alchemy_cost: float = 0.0
+    alchemy_proceeds: float = 0.0
+    alchemy_profit: float = 0.0
+    alchemy_units: int = 0
+    # User rulings 2026-10-31 (D7, review #17 / #62): composites whose
+    # units were sold without an attributable price or are held with no
+    # quote (their line is an estimate short of those units — badged "N
+    # alchemy unpriced" apart from the hull count above), and the units
+    # an ended hold returned to stock (ruling c: valued at 0, cost kept).
+    alchemy_unpriced: int = 0
+    alchemy_returned_units: int = 0
 
     @property
     def margin_pct(self) -> float | None:
@@ -673,10 +687,27 @@ class CycleTotals:
         return self.structure_materials / self.materials * 100
 
 
-def cycle_totals(cards) -> CycleTotals:
+def cycle_totals(cards, alchemy=None) -> CycleTotals:
     """Sum the per-hull profit cards (dicts with ``cost``, ``net``,
-    ``margin``) across the cycle: per-hull figures × hulls per cycle."""
+    ``margin``) across the cycle: per-hull figures × hulls per cycle.
+    ``alchemy`` (user ruling 2026-10-31): the run's alchemy-for-sale rows
+    (dicts with ``cost``, ``proceeds``, ``profit``, ``units``, and since
+    the 2026-10-31 rulings ``unpriced_units`` / ``no_quote`` /
+    ``returned_units``), added to the cycle's cost / proceeds / profit and
+    kept apart in the ``alchemy_*`` fields; never counted as hulls or
+    pipelines."""
     totals = CycleTotals()
+    for row in alchemy or ():
+        totals.alchemy_cost += row.get("cost") or 0.0
+        totals.alchemy_proceeds += row.get("proceeds") or 0.0
+        totals.alchemy_profit += row.get("profit") or 0.0
+        totals.alchemy_units += int(row.get("units") or 0)
+        if row.get("unpriced_units") or row.get("no_quote"):
+            totals.alchemy_unpriced += 1
+        totals.alchemy_returned_units += int(row.get("returned_units") or 0)
+    totals.cost += totals.alchemy_cost
+    totals.proceeds += totals.alchemy_proceeds
+    totals.profit += totals.alchemy_profit
     for card in cards:
         cost = card["cost"]
         if card.get("net") is None or card.get("margin") is None:

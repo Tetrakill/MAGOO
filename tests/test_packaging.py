@@ -172,7 +172,9 @@ def test_existing_database_is_backed_up_before_migrating(db, tmp_path):
 
     store.ensure_schema(db)
 
-    backup = tmp_path / "backups" / f"magoo-pre-{store.__version__}.sqlite"
+    # Named by the build AND the schema it found (review 2026-10-31), so a
+    # second one-way migration under one version string still snapshots.
+    backup = tmp_path / "backups" / f"magoo-pre-{store.__version__}-s0.sqlite"
     assert backup.exists()
     restored = sqlite3.connect(backup)
     try:
@@ -197,7 +199,7 @@ def test_backup_captures_wal_resident_writes(db, tmp_path):
 
     store.ensure_schema(db)
 
-    backup = tmp_path / "backups" / f"magoo-pre-{store.__version__}.sqlite"
+    backup = tmp_path / "backups" / f"magoo-pre-{store.__version__}-s0.sqlite"
     restored = sqlite3.connect(backup)
     try:
         names = [r[0] for r in restored.execute("SELECT name FROM pipeline")]

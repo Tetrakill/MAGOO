@@ -8,6 +8,7 @@ runs (list + detail with buy/build lists and multibuy export).
 
 import json
 import logging
+import math
 import os
 import secrets as pysecrets
 import sqlite3
@@ -41,6 +42,7 @@ from . import (
     costing,
     engine,
     esi,
+    holds,
     ledger,
     market,
     sdeimport,
@@ -479,6 +481,12 @@ def _steady_rows(ref, plan) -> list[dict]:
                 "alchemy_for_type_id": item.alchemy_for_type_id,
                 "direct_unit_cost": item.direct_unit_cost,
                 "alchemy_unit_cost": item.alchemy_unit_cost,
+                # Schema 14: the steady plan runs no alchemy, so no job is
+                # for sale; the keys exist for one row shape.
+                "alchemy_profit_jobs": 0,
+                "alchemy_sale_net_unit": None,
+                "alchemy_route_unit_cost": None,
+                "held_for_sale_qty": None,
                 # v1.25: the steady-state path never runs the compressed
                 # pass; the keys exist so _buy_context sees one shape.
                 "compressed_outputs": None,
@@ -700,11 +708,34 @@ def _planning_context(ref, plan, settings_) -> dict:
     )
 
 
-def _alchemy_section(ref, settings_, items) -> list[dict]:
+def _alchemy_route_choices(ref) -> list[tuple[int, str]]:
+    """The Settings page's alchemy blacklist grid (schema 14): one entry
+    per data-derived route — (composite id, the unrefined product's name,
+    e.g. "Unrefined Ferrofluid"), by that name (user wording 2026-10-30:
+    the items are called Unrefined X, no secondary label)."""
+    return sorted(
+        (
+            (composite_id, ref.type_info(route.unrefined_id).name)
+            for composite_id, route in ref.alchemy_routes().items()
+        ),
+        key=lambda pair: pair[1],
+    )
+
+
+def _alchemy_section(ref, settings_, items, run_holds=None, quotes=None) -> list[dict]:
     """run_detail's Alchemy section rows: the reaction install plus the
-    manual reprocess step and the cost comparison that justified it."""
+    manual reprocess step and the cost comparison that justified it. A
+    row with jobs added FOR SALE (schema 14) also carries the split: the
+    composite units to sell in Jita, the net proceeds and route cost per
+    unit they were judged against, and the expected profit. `run_holds`
+    (user rulings 2026-10-31): {composite: holds.Hold} of this run — the
+    for-sale figure is what ESI shows installed for sale (the hold) plus,
+    on the open run, what the row's NEW jobs would add; an executed run
+    sells its hold alone, so a Settings change never moves a frozen
+    plan's figure (review #13)."""
     routes = ref.alchemy_routes()
     by_type = {i["type_id"]: i for i in items}
+    run_holds = run_holds or {}
     alchemy = []
     for i in items:
         composite_id = i["alchemy_for_type_id"]
@@ -718,7 +749,63 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
         # the install quantity, not the plan's.
         qty = _build_qty_to_run(i)
         cut = qty < (i["recommended_build_qty"] or 0)
-        yield_ = settings_.alchemy_reprocess_yield
+        hold = run_holds.get(composite_id)
+        # The hold's yield is frozen with it (D1); a row with a hold reads
+        # the same yield for its badge and checklist, so a Settings change
+        # never moves an executed run's figures (review #13 / #76).
+        yield_ = (
+            hold.yield_ if hold is not None and hold.yield_
+            else settings_.alchemy_reprocess_yield
+        )
+        # Schema 14: of the units to run now, the ones for sale are what
+        # the chain's own jobs (the savings moves, placed first) leave —
+        # an install cut therefore trims the for-sale share first
+        # (engine.alchemy_sale_split, the rule the persisted hold uses
+        # too). _row_value, defined below: None on rows that predate the
+        # column and on the render tests' bare dicts.
+        profit_jobs = int(_row_value(i, "alchemy_profit_jobs") or 0)
+        chain_units, sale_units = engine.alchemy_sale_split(
+            i["jobs_allocated"] or 0, profit_jobs, i["max_runs_per_job"] or 0,
+            i["portion_size"] or 1, _row_value(i, "install_runs"),
+        )
+        # Review #35 (2026-10-31): the for-sale jobs that RUN NOW — the
+        # cut trims them first, so the plan's count overstates under one.
+        per_job = int(i["max_runs_per_job"] or 0) * int(i["portion_size"] or 1)
+        sale_jobs = math.ceil(sale_units / per_job) if per_job and sale_units else 0
+        new_sale_qty = int(sale_units * route.composite_qty * yield_) if route else 0
+        # Sell qty is the pile (plus, on the open run, the new jobs' share);
+        # the ACTIVE quantity is what is still to sell — the hold's unsold
+        # remainder while it lives plus the new jobs' share — and is what
+        # the expected profit, the For sale stat and the Total price: a
+        # sold or returned pile earns nothing more here, the row's NEW
+        # jobs still do (review 2026-10-31).
+        held_active = hold.remaining if hold is not None and hold.live else 0
+        if hold is None:
+            sale_qty = new_sale_qty
+            active_qty = new_sale_qty
+        elif hold.run_status == buying.RUN_EXECUTED:
+            sale_qty = hold.for_sale_qty
+            active_qty = held_active  # a frozen plan: nothing new runs
+        else:
+            sale_qty = hold.for_sale_qty + new_sale_qty
+            active_qty = held_active + new_sale_qty
+        sale_net = _row_value(i, "alchemy_sale_net_unit")
+        route_unit = _row_value(i, "alchemy_route_unit_cost")
+        if route_unit is None and hold is not None:
+            route_unit = hold.route_unit_cost
+        profit_today = False
+        if sale_net is None and hold is not None:
+            # No NEW for-sale job this plan — the installed ones dropped
+            # out of the listing — so the row carries no plan-time net:
+            # the held units are priced at today's quote, and the panel
+            # says so (preview 2026-10-31).
+            sale_net = (quotes or {}).get(composite_id)
+            profit_today = sale_net is not None
+        profit_isk = (
+            (sale_net - route_unit) * active_qty
+            if active_qty and sale_net is not None and route_unit is not None
+            else None
+        )
         # What the route's units replace (2026-09-12): a swap replaces the
         # direct reaction, a buy move the composite's landed purchase. The
         # plan does not persist the split, so a composite bought outright
@@ -750,13 +837,16 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
                 # here floors once over the total and can disagree. A
                 # cut row has no persisted figure for its install
                 # quantity, so it takes the recomputation.
+                # The composite units for the CHAIN (for-sale units are
+                # `sale_qty`, below); the persisted figure is the engine's
+                # credit, which never counts the for-sale jobs.
                 "expected_qty": (
                     composite["alchemy_output_qty"]
                     if composite is not None
                     and composite["alchemy_output_qty"]
                     and not cut
                     else (
-                        int(qty * route.composite_qty * yield_)
+                        int(chain_units * route.composite_qty * yield_)
                         if route
                         else 0
                     )
@@ -770,9 +860,195 @@ def _alchemy_section(ref, settings_, items) -> list[dict]:
                 "alchemy_unit": (
                     composite["alchemy_unit_cost"] if composite else None
                 ),
+                # Schema 14: the for-sale share — the plan's job count,
+                # the jobs that run now, the row's jobs to run now, the
+                # units the new jobs add, and the units ESI shows
+                # installed for sale (the hold).
+                "profit_jobs": profit_jobs,
+                "sale_jobs": sale_jobs,
+                "jobs_now": _jobs_to_run(i),
+                "sale_qty": sale_qty,
+                "active_qty": active_qty,
+                "held_active": held_active,
+                "new_sale_qty": new_sale_qty,
+                "hold_qty": hold.for_sale_qty if hold is not None else 0,
+                "hold_plan_figure": hold.plan_figure if hold is not None else False,
+                "hold_status": hold.status if hold is not None else None,
+                "sale_net_unit": sale_net,
+                "route_unit_cost": route_unit,
+                "profit_isk": profit_isk,
+                "profit_today": profit_today,
             }
         )
     return alchemy
+
+
+# The Sell in Jita rows the For sale stat and the panel's Total sum: a
+# pile sold or returned to stock is the Profit tab's figure, not this
+# cycle's (user rulings 2026-10-31, D7) — since the review of the same
+# day a row counts while it has an ACTIVE quantity (the hold's unsold
+# remainder while it lives, plus the open run's new jobs), so a sold
+# pile beside new jobs still counts the new jobs; these statuses are
+# the ones that carry an active quantity.
+_FOR_SALE_COUNTED = frozenset({"in flight", "delivered", "not installed", "plan figure"})
+
+
+def _alchemy_sales(
+    alchemy_rows, run_holds=None, targets=None, quotes=None, names=None, all_live=None
+) -> list[dict]:
+    """run_detail's "Sell in Jita" panel (user rulings 2026-10-31): one row
+    per composite over the UNION of the Alchemy section's for-sale rows
+    and this run's holds — once its jobs are installed a formula row
+    lists only NEW jobs, or none, so the hold alone carries the pile
+    (review #102). Sell qty is the section row's figure (the hold's
+    installed units plus the new jobs' share; a hold-only row the hold's
+    alone), Released = observed sales + by-hand marks, Held = what the
+    hold still hides; the status is the hold's (returned to stock > sold
+    > delivered > in flight > not installed) and `counted` says whether
+    the For sale stat and the Total row sum the row. `run_holds`: this
+    run's holds.Hold rows; `targets`: {composite: [delivered LIVE holds of
+    any run with units left, oldest first]} — what Mark sold releases
+    (D4), giving the form its max and the run it marks; `quotes`:
+    {composite: today's net Jita quote per unit} and `names`: {composite:
+    name} for a hold-only row's expected profit and label."""
+    by_composite = {h.composite_type_id: h for h in (run_holds or ())}
+    targets = targets or {}
+    quotes = quotes or {}
+    names = names or {}
+    all_live = all_live or {}  # {composite: every LIVE hold} — the undo list's reach
+
+    def blank(composite_id, name) -> dict:
+        return {
+            "composite_name": name,
+            "composite_id": composite_id,
+            "sell_qty": 0,
+            "active_qty": 0,
+            "held_active": 0,
+            "net_unit": None,
+            "route_unit": None,
+            "profit_isk": None,
+            "profit_today": False,  # the per-unit figures are today's quote, not the plan's
+            "jobs": 0,
+            "jobs_planned": 0,
+            "hold": False,
+            "hold_qty": 0,
+            "hold_planned": None,
+            "sold": 0,
+            "by_hand": 0,
+            "by_hand_priced": 0,
+            "by_hand_unpriced": 0,
+            "released": 0,
+            "held": 0,
+            "status": None,
+            "live": False,
+            "expires_after": None,
+            "expiry_words": "",
+            "plan_figure": False,
+            "delivered_at": None,
+            "jobs_end": None,
+            "counted": True,
+            "can_mark_sold": False,
+            "mark_sold_max": 0,
+            "mark_sold_runs": [],
+            "mark_sold_run": None,
+            "by_hand_rows": [],
+        }
+
+    sales: dict[int, dict] = {}
+    for a in alchemy_rows:
+        composite_id = a["item"]["alchemy_for_type_id"]
+        if (
+            not a.get("sale_qty") and not a.get("profit_jobs")
+            and composite_id not in by_composite
+        ):
+            continue
+        row = sales.setdefault(composite_id, blank(composite_id, a["composite_name"]))
+        row["sell_qty"] += a["sale_qty"]
+        row["active_qty"] += a.get("active_qty", a["sale_qty"])
+        row["held_active"] += a.get("held_active", 0)
+        row["jobs"] += a.get("sale_jobs", a["profit_jobs"])
+        row["jobs_planned"] += a["profit_jobs"]
+        if row["net_unit"] is None:
+            row["net_unit"] = a.get("sale_net_unit")
+        if row["route_unit"] is None:
+            row["route_unit"] = a.get("route_unit_cost")
+        if a.get("profit_isk") is not None:
+            row["profit_isk"] = (row["profit_isk"] or 0.0) + a["profit_isk"]
+        if a.get("profit_today"):
+            row["profit_today"] = True
+    for composite_id, hold in by_composite.items():
+        row = sales.get(composite_id)
+        if row is None:
+            if hold.for_sale_qty <= 0 and not hold.releases and hold.planned_qty <= 0:
+                continue  # a dropped proposal nothing was installed for (D2 rule 4)
+            row = sales[composite_id] = blank(
+                composite_id, names.get(composite_id, f"type {composite_id}")
+            )
+            row["sell_qty"] = hold.for_sale_qty
+            row["active_qty"] = row["held_active"] = hold.remaining if hold.live else 0
+            row["route_unit"] = hold.route_unit_cost
+            row["net_unit"] = quotes.get(composite_id)
+            if row["active_qty"] and row["net_unit"] is not None and row["route_unit"] is not None:
+                row["profit_isk"] = (row["net_unit"] - row["route_unit"]) * row["active_qty"]
+                row["profit_today"] = True
+        row.update(
+            hold=True,
+            hold_qty=hold.for_sale_qty,
+            hold_planned=hold.planned_qty,
+            sold=hold.observed_qty,
+            by_hand=hold.manual_priced_qty + hold.manual_unpriced_qty,
+            by_hand_priced=hold.manual_priced_qty,
+            by_hand_unpriced=hold.manual_unpriced_qty,
+            released=hold.released_qty,
+            held=hold.remaining,
+            status=hold.status,
+            live=hold.live,
+            expires_after=hold.expires_after,
+            expiry_words=holds.expiry_words(hold),
+            plan_figure=hold.plan_figure,
+            delivered_at=hold.delivered_at,
+            jobs_end=hold.jobs_end,
+            counted=row["active_qty"] > 0 or hold.status in ("not installed",),
+        )
+        if hold.run_status == buying.RUN_EXECUTED:
+            row["jobs"] = 0  # a frozen plan: nothing runs now, the hold alone sells
+        if row["active_qty"] <= 0:
+            row["profit_isk"] = None  # sold or returned, nothing new: the Profit tab's figure
+    for row in sales.values():
+        ts = targets.get(row["composite_id"]) or []
+        if ts:
+            row["can_mark_sold"] = True
+            row["mark_sold_max"] = sum(h.remaining for h in ts)
+            row["mark_sold_runs"] = [h.run_number for h in ts]
+            row["mark_sold_run"] = ts[0].run_number
+        # The by-hand marks the panel lists with an undo: this run's
+        # hold's and the Mark sold targets' (a mark posted here may have
+        # landed on an older run's hold — D4, oldest first).
+        seen: set[int] = set()
+        marks = []
+        for h in [
+            by_composite.get(row["composite_id"]), *ts,
+            *(all_live.get(row["composite_id"]) or ()),  # a mark that emptied an older hold
+        ]:
+            if h is None:
+                continue
+            for x in h.releases:
+                if x["source"] != "manual" or x["release_id"] in seen:
+                    continue
+                seen.add(x["release_id"])
+                marks.append({
+                    "release_id": x["release_id"],
+                    "qty": int(x["qty"]),
+                    "unit_price": x["unit_price"],
+                    "when": x["released_at"],
+                    "run_number": h.run_number,
+                    "live": h.live,
+                })
+        row["by_hand_rows"] = sorted(marks, key=lambda m: (m["when"], m["release_id"]))
+    return sorted(
+        sales.values(),
+        key=lambda r: (not r["counted"], -(r["profit_isk"] or 0.0), r["composite_name"]),
+    )
 
 
 # --- Buy tab (v1.29, revision 3) -------------------------------------------
@@ -1816,6 +2092,10 @@ def _buy_tab_context(
             "from_ore": from_ore,
             "in_jobs": in_jobs,
             "alchemy_credit": int(_row_value(item, "alchemy_credit_qty") or 0),
+            # User rulings 2026-10-31 (review #65): units of this stock a
+            # live for-sale hold hid from the plan — on_hand_qty and
+            # in_progress_qty are persisted NET of them.
+            "held": int(_row_value(item, "held_for_sale_qty") or 0),
             # Remaining: the plan's buy (R4) and why it can differ from
             # Required − On Hand (A14).
             "remaining": remaining,
@@ -2086,9 +2366,12 @@ def _buy_tab_context(
     )
 
 
-def _chain_context(ref, items) -> dict:
+def _chain_context(ref, items, hold_until=None) -> dict:
     """run_detail's Chain-tab derivations: the per-item status rows, their
-    raw/manufactured/reacted/structure groupings, and the status counts."""
+    raw/manufactured/reacted/structure groupings, and the status counts.
+    `hold_until` (user rulings 2026-10-31): {composite type_id: the words
+    for when its live for-sale hold ends — holds.expiry_words}."""
+    hold_until = hold_until or {}
 
     def display_category(item) -> str:
         return _display_category(
@@ -2127,6 +2410,21 @@ def _chain_context(ref, items) -> dict:
                 else 0
             ),
             "in_jobs": i["in_progress_qty"],
+            # User rulings 2026-10-31: units of this composite's stock a
+            # live for-sale hold hid from the plan (NULL before the
+            # column) — and the part of them that came out of the
+            # unrefined credit in flight, so each cell is annotated with
+            # its own share (review #117); the rest came off the hangar.
+            "held_for_sale": (
+                (i["held_for_sale_qty"] or 0)
+                if "held_for_sale_qty" in i.keys()
+                else 0
+            ),
+            "held_from_credit": min(
+                (i["held_for_sale_qty"] or 0) if "held_for_sale_qty" in i.keys() else 0,
+                (i["held_from_credit_qty"] or 0) if "held_from_credit_qty" in i.keys() else 0,
+            ),
+            "held_until": hold_until.get(i["type_id"], ""),
             "deficit": i["deficit_qty"],
             "buildable": i["blueprint_id"] is not None,
             "activity_id": i["activity_id"],
@@ -2285,10 +2583,13 @@ def _form_number(form, key, cast=float):
         raise ValueError(key)
 
 
-def _settings_save(c, form):
+def _settings_save(c, form, alchemy_routes=None):
     """The settings POST body: parse ~40 numeric fields — a ValueError
     (carrying the field name) aborts before commit, so the caller can
-    flash which input was bad and nothing is saved."""
+    flash which input was bad and nothing is saved. `alchemy_routes`
+    (schema 14): the composite ids of the alchemy routes the game data
+    knows, so the blacklist grid can be read back; None (no game data)
+    leaves the stored blacklist alone."""
 
     def pct_field(key: str) -> float:
         """Percentage input -> stored fraction (the form shows
@@ -2300,6 +2601,11 @@ def _settings_save(c, form):
         # integer fields; the ValueError still names the field.
         return _form_number(form, key, int)
 
+    # Review 2026-10-31 #127: switching Alchemy for Profit on, or freeing
+    # a route from Never run, adds routes nobody has priced yet — say so.
+    before = store.get_settings(c)
+    before_profit = before.alchemy_for_profit and before.alchemy_enabled
+    before_blocked = set(store.alchemy_blacklist(c))
     buffer = min(0.1, max(0.001, pct_field("buffer_pct")))
     margin = min(0.5, max(0.0, pct_field("purchase_margin_pct")))
 
@@ -2323,7 +2629,7 @@ def _settings_save(c, form):
         "skill_starship_engineering = ?, skill_science = ?, "
         "default_intermediate_me = ?, default_intermediate_te = ?, "
         "alchemy_enabled = ?, alchemy_reprocess_yield = ?, "
-        "max_alchemy_jobs_per_type = ?, "
+        "max_alchemy_jobs_per_type = ?, alchemy_for_profit = ?, "
         "skill_accounting = ?, skill_broker_relations = ?, "
         "standing_broker_faction = ?, standing_broker_corp = ?, "
         "freight_in_isk_per_m3 = ?, freight_out_isk_per_m3 = ?, "
@@ -2364,6 +2670,7 @@ def _settings_save(c, form):
             1 if form.get("alchemy_enabled") else 0,
             min(1.0, max(0.0, pct_field("alchemy_yield_pct"))),
             max(0, int_field("max_alchemy_jobs")),
+            1 if form.get("alchemy_for_profit") else 0,
             min(5, max(0, int_field("skill_accounting"))),
             min(5, max(0, int_field("skill_broker_relations"))),
             min(10.0, max(-10.0, _form_number(form, "standing_faction"))),
@@ -2449,8 +2756,33 @@ def _settings_save(c, form):
                 cls,
             ),
         )
+    # Schema 14: the alchemy blacklist rides in the same form, one
+    # checkbox per route (`alchemy_block_<composite id>`). Unchecked boxes
+    # never post, so the hidden marker says the grid WAS rendered — a page
+    # served before the game data was downloaded carries none, and must
+    # not clear the list. Ids are kept to the routes that exist.
+    if form.get("alchemy_blacklist_present") and alchemy_routes is not None:
+        store.set_alchemy_blacklist(
+            c,
+            {
+                composite_id
+                for composite_id in alchemy_routes
+                if form.get(f"alchemy_block_{composite_id}")
+            },
+        )
     c.commit()
-    flash("settings saved")
+    after = store.get_settings(c)
+    freed = before_blocked - set(store.alchemy_blacklist(c))
+    if after.alchemy_enabled and after.alchemy_for_profit and (
+        not before_profit or freed
+    ):
+        flash(
+            "settings saved — refresh prices before the next plan: Alchemy for "
+            "Profit prices every route it may run, and a route whose inputs or "
+            "composite have no cached price is skipped until then"
+        )
+    else:
+        flash("settings saved")
     return redirect(url_for("settings"))
 
 
@@ -3652,7 +3984,13 @@ def create_app() -> Flask:
         c = conn()
         if request.method == "POST":
             try:
-                response = _settings_save(c, request.form)
+                response = _settings_save(
+                    c,
+                    request.form,
+                    alchemy_routes=(
+                        set(ref().alchemy_routes()) if sde_ready() else None
+                    ),
+                )
             except ValueError as exc:
                 # One bad field ("1,5b", an emptied autofill) must not
                 # 500 and discard the whole ~40-field save — flash which
@@ -3699,6 +4037,11 @@ def create_app() -> Flask:
             ),
             blacklist_categories=config.BLACKLIST_CATEGORIES,
             blacklist_checked=store.blacklist_categories(c),
+            # Schema 14: the alchemy blacklist grid — one box per route,
+            # labelled "Unrefined X"; empty until the game data is
+            # downloaded.
+            alchemy_routes=_alchemy_route_choices(ref()) if sde_ready() else [],
+            alchemy_blocked=store.alchemy_blacklist(c),
             blacklist_items=(
                 c.execute(
                     "SELECT b.type_id, t.name FROM blacklist_item b "
@@ -4022,30 +4365,34 @@ def create_app() -> Flask:
 
     @app.post("/esi/refresh")
     def esi_refresh():
-        """Five independently guarded steps: the slow snapshot pull
+        """Six independently guarded steps: the slow snapshot pull
         (assets, jobs, wallets), the Ledger's sales pull (v1.27.0 — since
         v1.29 revision 3 it also stores the pool's wallet BUYS and the item
-        exchanges it accepted), the price refresh (user request 2026-09-08
-        — one button keeps the Ledger's quotes, undercut verdicts and
-        contract splits current), the re-plan of the open run in place
-        (v1.29 revision 6, user ruling R1 2026-09-28 — _replan_open_run:
-        one run per buying cycle, kept live; skipped with a note when no
-        run is open, the snapshot did not refresh or there is nothing to
-        plan from — since revision 7 (user ruling 2026-09-29) never
-        because the cycle's final jobs are installing: the plan counts
-        them as this cycle's wave and sizes the rest), then purchase
-        matching
-        (buying.assign_purchases, contract review C1): it runs AFTER the
-        prices so a bought contract's reference prices (R7) come from this
-        refresh, and even when ESI is down, since it reads local rows only.
-        The snapshot has committed before the sales step starts, the sales
-        step never raises for scope, role, token, rate-limit or network
-        trouble (each owner × family records its own status), a price
-        failure only leaves the cache unchanged, a re-plan failure rolls
-        back and leaves the run's previous plan, and a matching failure
-        leaves every run's purchases as they were, so no step can lose
-        another's data. One flash carries all five outcomes;
-        `next=ledger` returns to the Ledger tab instead of the dashboard."""
+        exchanges it accepted), the alchemy settle (user rulings
+        2026-10-31: the sales just pulled are matched against the for-sale
+        holds, which the loader reads from the job rows the snapshot step
+        just wrote — before the re-plan reads the holds), the price
+        refresh (user request 2026-09-08 — one button keeps the Ledger's
+        quotes, undercut verdicts and contract splits current), the
+        re-plan of the open run in place (v1.29 revision 6, user ruling
+        R1 2026-09-28 — _replan_open_run: one run per buying cycle, kept
+        live; skipped with a note when no run is open, the snapshot did
+        not refresh or there is nothing to plan from — since revision 7
+        (user ruling 2026-09-29) never because the cycle's final jobs are
+        installing: the plan counts them as this cycle's wave and sizes
+        the rest), then purchase matching (buying.assign_purchases,
+        contract review C1): it runs AFTER the prices so a bought
+        contract's reference prices (R7) come from this refresh, and even
+        when ESI is down, since it reads local rows only. The snapshot has
+        committed before the sales step starts, the sales step never
+        raises for scope, role, token, rate-limit or network trouble (each
+        owner × family records its own status), a failed settle rolls
+        back and is said in the flash, a price failure only leaves the
+        cache unchanged, a re-plan failure rolls back and leaves the run's
+        previous plan, and a matching failure leaves every run's purchases
+        as they were, so no step can lose another's data. One flash
+        carries all six outcomes; `next=ledger` returns to the Ledger tab
+        instead of the dashboard."""
         import time as _time
 
         if request.form.get("next") == "ledger":
@@ -4100,6 +4447,12 @@ def create_app() -> Flask:
                 parts.append(
                     f"sales pull failed ({exc}) — the stored ledger is unchanged"
                 )
+        # User rulings 2026-10-31: the sales just pulled release the
+        # for-sale holds before the re-plan below reads them (the loader
+        # sees the snapshot step's job rows); a failed settle is said.
+        _matched, settle_clause = _settle_holds(conn())
+        if settle_clause:
+            parts.append(settle_clause)
         if esi_down:
             parts.append("prices not refreshed — ESI unavailable")
         else:
@@ -4771,6 +5124,12 @@ def create_app() -> Flask:
                 else url_for("dashboard")
             )
         open_id = buying.collecting_run_id(c)
+        # User rulings 2026-10-31: sales observed since the last pull
+        # release the for-sale holds before the plan reads them; a settle
+        # that failed is said, not swallowed (review #34).
+        _matched, settle_clause = _settle_holds(c)
+        if settle_clause:
+            flash(settle_clause)
         try:
             plan = engine.plan_index_run(
                 c, r, snapshot, replace_index_run_id=open_id,
@@ -4962,6 +5321,16 @@ def create_app() -> Flask:
             "priced": totals.priced,
             "kind": kind,
             "hulls_from_esi": hulls_from_esi,
+            # User ruling 2026-10-31: the alchemy-for-sale share inside
+            # the two figures, for the tooltips.
+            "alchemy_revenue": totals.alchemy_proceeds,
+            "alchemy_profit": totals.alchemy_profit,
+            "alchemy_units": totals.alchemy_units,
+            # D7: composites whose units are sold without a price or held
+            # without a quote (badged apart from the hull count), and the
+            # units an ended hold returned to stock (valued at 0).
+            "alchemy_unpriced": totals.alchemy_unpriced,
+            "alchemy_returned_units": totals.alchemy_returned_units,
         }
 
     @app.route("/runs")
@@ -4989,7 +5358,7 @@ def create_app() -> Flask:
                 "GROUP BY r.index_run_id ORDER BY r.index_run_id DESC"
             ).fetchall()
         )
-        estimate = None  # the open run's what-if, built once if needed
+        whatif = None  # the open run's what-if cards, built once if needed
         estimate_failed = False
         for r in all_runs:
             frozen = r.get("opening_buy_total_isk")
@@ -5001,6 +5370,14 @@ def create_app() -> Flask:
             ) or 0
             r["figures"] = None
             r["figures_failed"] = False
+            r["failed_part"] = None
+            # User rulings 2026-10-31 (D2 rule 4): the discard confirm says
+            # when the server will refuse — a for-sale hold with installs
+            # or releases (run_delete).
+            r["discard_blocked"] = (
+                bool(_hold_blockers(c, r["index_run_id"]))
+                if r["status"] != "complete" else False
+            )
             if r["status"] == "complete":
                 # One uncostable run (a final whose type left the SDE, say)
                 # must not take down the page ▶ Plan and discard redirect
@@ -5010,37 +5387,70 @@ def create_app() -> Flask:
                 # dash too — its Profit tab shows no totals, not 0 / 0.
                 try:
                     cards = _profit_cards(c, r["index_run_id"])
+                    # User rulings 2026-10-31: the run's alchemy for sale
+                    # rides in the same figures.
+                    alchemy = _alchemy_profit(c, r["index_run_id"])
                 except Exception:  # noqa: BLE001 — logged; the list stays up
                     log.exception(
                         "Index Runs list: costing run %s failed", r["index_run_id"]
                     )
                     r["figures_failed"] = True
+                    r["failed_part"] = "costing"
                 else:
-                    if cards:
+                    if cards or alchemy:
                         r["figures"] = _run_figures(
-                            costing.cycle_totals(cards),
+                            costing.cycle_totals(cards, alchemy),
                             "realized",
-                            hulls_from_esi=bool(cards[0]["cost"].hulls_from_esi),
+                            hulls_from_esi=(
+                                bool(cards[0]["cost"].hulls_from_esi) if cards else None
+                            ),
                         )
             elif not r["superseded"]:
                 if (
-                    estimate is None
+                    whatif is None
                     and not estimate_failed
                     and sde_ready()
                     and store.active_pipelines(c)
                 ):
                     try:
-                        estimate = _run_figures(
-                            costing.cycle_totals(
-                                _whatif_cards(c, ref(), store.get_settings(c))
-                            ),
-                            "estimate",
-                        )
+                        whatif = _whatif_cards(c, ref(), store.get_settings(c))
                     except Exception:  # noqa: BLE001 — logged; the list stays up
                         log.exception("Index Runs list: the open run's estimate failed")
                         estimate_failed = True
-                r["figures"] = estimate
-                r["figures_failed"] = estimate_failed
+                # The open run's own for-sale hold — the units ESI shows
+                # installed for sale, at today's quote less the route
+                # cost — joins the what-if, computed in its own try so it
+                # stands without an active pipeline and survives a failed
+                # what-if (review #99).
+                alchemy = []
+                alchemy_failed = False
+                if sde_ready():
+                    try:
+                        alchemy = _alchemy_profit(c, r["index_run_id"])
+                    except Exception:  # noqa: BLE001 — logged; the list stays up
+                        log.exception(
+                            "Index Runs list: the open run's alchemy estimate failed"
+                        )
+                        alchemy_failed = True
+                if whatif is not None or alchemy:
+                    r["figures"] = _run_figures(
+                        costing.cycle_totals(whatif or [], alchemy), "estimate",
+                    )
+                    r["figures"]["hulls_missing"] = (
+                        None if whatif is not None
+                        else "the hull what-if failed" if estimate_failed
+                        else "no active pipeline"
+                    )
+                    r["figures"]["alchemy_failed"] = alchemy_failed
+                else:
+                    r["figures_failed"] = estimate_failed or alchemy_failed
+                    r["failed_part"] = (
+                        "the hull what-if and the alchemy estimate"
+                        if estimate_failed and alchemy_failed
+                        else "the hull what-if" if estimate_failed
+                        else "the alchemy estimate" if alchemy_failed
+                        else None
+                    )
         show_all = request.args.get("all") == "1"
         return render_template(
             "runs.html",
@@ -5063,6 +5473,21 @@ def create_app() -> Flask:
         # Executed runs are cost history — never deletable, from any path.
         if run["status"] == "complete":
             abort(400)
+        # User rulings 2026-10-31 (D2 rule 4): a run whose for-sale hold
+        # shows installed jobs or any release is history the next run
+        # builds on — deleting it would drop the sale matches (ON DELETE
+        # CASCADE) and hand the installs to the next run's baseline as
+        # chain stock.
+        blockers = _hold_blockers(c, index_run_id)
+        if blockers:
+            names = ", ".join(
+                sorted({_type_name(ref(), h.composite_type_id) for h in blockers})
+            )
+            flash(
+                f"run {run['run_number']} not discarded — its for-sale hold ({names}) "
+                "shows installed jobs or recorded sales; re-plan it instead"
+            )
+            return redirect(url_for("runs"))
         # v1.29: the run's purchase lines go first — connections open with
         # PRAGMA foreign_keys = ON, and run_purchase references index_run
         # (A29; only planned/active runs ever reach here).
@@ -5143,15 +5568,181 @@ def create_app() -> Flask:
         )
         return cards
 
+    def _alchemy_profit(c, index_run_id) -> list[dict]:
+        """A run's alchemy-for-sale rows (user rulings 2026-10-31, D7), one
+        per hold of the run with installs or releases, from the loader
+        (holds.load — the job record, never the plan's proposal; review
+        #1): Planned = the composite units ESI vouches for (badged "plan
+        figure" where the record cannot cover an executed window); Sold =
+        observed units, the by-hand marks apart, so Planned = Sold + By
+        hand + Still held; Realized = Σ observed priced releases' net at
+        the sale's venue + Σ priced by-hand price × qty (ruling d: as
+        entered, no fee or freight term — the Ledger books the same);
+        Est. net = units sold in contracts with no attributable price at
+        today's net quote (live or not: the sale happened) + the
+        remainder at today's quote while the hold is live, 0 once it
+        ended (ruling c: "returned to stock"); Cost = the route cost on
+        every unit except by-hand marks without a price and, for a live
+        hold with no quote, the unsold remainder (a missing quote must
+        not read as a loss — review #17); Profit = Realized + Est −
+        Cost. Shape for costing.cycle_totals(alchemy=…): cost / proceeds
+        / profit / units plus unpriced_units / no_quote /
+        returned_units."""
+        settings_ = store.get_settings(c)
+        r = ref()
+        rows = []
+        for hold in holds.load(c, r, settings_, run_id=index_run_id):
+            if hold.for_sale_qty <= 0 and not hold.releases:
+                continue  # a proposal nothing was installed for: no line yet
+            type_id = hold.composite_type_id
+            info = r.type_info(type_id)
+            realized = 0.0
+            unpriced_units = 0
+            for x in hold.releases:
+                qty = int(x["qty"])
+                if x["source"] == "manual":
+                    if x["unit_price"] is not None:
+                        realized += x["unit_price"] * qty
+                    continue
+                if x["unit_price"] is None:
+                    unpriced_units += qty
+                    continue
+                realized += costing.net_proceeds_at_venue(
+                    x["unit_price"], info.freight_volume, settings_,
+                    costing.sale_venue(x["location_id"]),
+                    capital=False, freight_exempt=costing.freight_out_exempt(type_id),
+                ) * qty
+            price, net_unit, _capital = sell_quote(c, settings_, type_id)
+            remaining = hold.remaining
+            live = hold.live
+            no_quote = live and remaining > 0 and net_unit is None
+            returned_units = remaining if (not live and remaining > 0) else 0
+            if net_unit is None:
+                est_unpriced = None if unpriced_units else 0.0
+                est_held = None if no_quote else 0.0
+            else:
+                est_unpriced = unpriced_units * net_unit
+                est_held = remaining * net_unit if live else 0.0
+            estimate = (
+                est_unpriced + est_held
+                if est_unpriced is not None and est_held is not None else None
+            )
+            costed_units = hold.for_sale_qty - hold.manual_unpriced_qty
+            if no_quote:
+                costed_units -= remaining
+            if net_unit is None and unpriced_units:
+                # No quote values them either: their cost comes out as the
+                # held remainder's does (review 2026-10-31).
+                costed_units -= unpriced_units
+            costed_units = max(0, costed_units)
+            cost = (
+                costed_units * hold.route_unit_cost
+                if hold.route_unit_cost is not None else None
+            )
+            proceeds = realized + (estimate or 0.0)
+            rows.append({
+                "type_id": type_id,
+                "name": info.name,
+                "run_number": hold.run_number,
+                "units": hold.for_sale_qty,
+                "plan_figure": hold.plan_figure,
+                "sold": hold.observed_qty,
+                "manual_priced": hold.manual_priced_qty,
+                "manual_unpriced": hold.manual_unpriced_qty,
+                "manual": hold.manual_priced_qty + hold.manual_unpriced_qty,
+                "remaining": remaining,
+                "unpriced_units": unpriced_units,
+                "realized": realized,
+                "quote": price,
+                "net_unit": net_unit,
+                "est_unpriced": est_unpriced,
+                "estimate": estimate,
+                "route_unit": hold.route_unit_cost,
+                "costed_units": costed_units,
+                "cost": cost,
+                "proceeds": proceeds,
+                "profit": proceeds - cost if cost is not None else None,
+                "no_quote": no_quote,
+                "returned": returned_units > 0,
+                "returned_units": returned_units,
+                "expires_after": hold.expires_after,
+                "expiry_words": holds.expiry_words(hold),
+                "delivered_at": hold.delivered_at,
+                "jobs_end": hold.jobs_end,
+                "live": live,
+                "status": hold.status,
+            })
+        rows.sort(key=lambda row: -(row["profit"] or 0.0))
+        return rows
+
+    def _settle_holds(c) -> tuple[int | None, str | None]:
+        """Account observed sales against the for-sale holds
+        (ledger.settle_alchemy_holds) — after a sales pull, before a plan,
+        before Mark executed and before Mark sold; GET pages never settle
+        (review #95: a page must not sit out the write lock). Returns
+        (units matched, flash clause): the clause names the matches, or
+        the failure — None matched — so a stale hold is visible rather
+        than silent (reviews #34, #96: the connection is rolled back
+        first, so no partial release row survives in an open write
+        transaction). Never raises."""
+        if not sde_ready():
+            return 0, None
+        try:
+            matched = ledger.settle_alchemy_holds(c, ref(), store.get_settings(c))
+        except Exception as exc:  # noqa: BLE001 — logged; the page or plan goes on
+            log.exception("settling the alchemy holds failed")
+            try:
+                c.rollback()
+            except sqlite3.Error:
+                pass
+            return None, (
+                f"alchemy holds not settled ({exc}) — hold figures lag until the "
+                "next update"
+            )
+        if matched:
+            return matched, (
+                f"alchemy: {matched:,} units sold matched against the for-sale holds"
+            )
+        return 0, None
+
+    def _live_holds(c) -> list:
+        """The live for-sale holds (holds.live), oldest run first; [] without
+        game data or on a failure — a flash clause must never cost the
+        page."""
+        if not sde_ready():
+            return []
+        try:
+            return holds.live(c, ref(), store.get_settings(c))
+        except Exception:  # noqa: BLE001 — logged
+            log.exception("reading the alchemy holds failed")
+            return []
+
+    def _hold_blockers(c, index_run_id) -> list:
+        """The run's holds that refuse a Discard (holds.holds_blocking_delete);
+        [] without game data or on a failure."""
+        if not sde_ready():
+            return []
+        try:
+            return holds.holds_blocking_delete(
+                c, ref(), store.get_settings(c), index_run_id
+            )
+        except Exception:  # noqa: BLE001 — logged
+            log.exception("reading run %s's alchemy holds failed", index_run_id)
+            return []
+
     def _run_profit_context(run, index_run_id) -> dict:
         """run_detail's Profit-view context: realized cost cards for an
-        executed run (planned runs show an empty list)."""
+        executed run (planned runs show an empty list), plus the run's
+        alchemy-for-sale rows (user ruling 2026-10-31)."""
         c = conn()
         settings_ = store.get_settings(c)
-        cards = _profit_cards(c, index_run_id) if run["status"] == "complete" else []
+        complete = run["status"] == "complete"
+        cards = _profit_cards(c, index_run_id) if complete else []
+        alchemy = _alchemy_profit(c, index_run_id) if complete else []
         return dict(
             cards=cards,
-            totals=costing.cycle_totals(cards),
+            alchemy=alchemy,
+            totals=costing.cycle_totals(cards, alchemy),
             completed_history=len(costing.completed_sequence(c)),
             broker_rate=costing.broker_fee_rate(settings_),
             sales_tax=costing.sales_tax_rate(settings_),
@@ -5217,9 +5808,55 @@ def create_app() -> Flask:
             )
         unmet = [i for i in items if _unmet_row(i)]
         unmet_qty = {i["type_id"]: _unmet_qty(i) for i in unmet}
-        alchemy = _alchemy_section(ref(), settings_, items)
+        # User rulings 2026-10-31: this run's for-sale holds as the job
+        # record shows them (holds.load — read, never settled on a GET:
+        # review #95) and the live holds of every run — what a Mark sold
+        # releases (delivered, units left), which composites' stock is
+        # hidden and until when, which holds this run's Mark executed
+        # would end (expires_after == this run's number).
+        r = ref()
+        run_holds = holds.load(c, r, settings_, run_id=index_run_id)
+        all_live = _live_holds(c)
+        targets: dict[int, list] = {}
+        # The Stockpile note names the latest-ending live hold of each
+        # composite (an in-flight one outlasts a delivered one), and only
+        # on the open run: an executed plan's hide has no current end.
+        hold_until = {
+            composite: holds.expiry_words(h)
+            for composite, h in holds.latest_ending(all_live).items()
+        }
+        for h in all_live:
+            if h.delivered_at is not None and h.remaining > 0:
+                targets.setdefault(h.composite_type_id, []).append(h)
+        hold_quotes = {
+            h.composite_type_id: sell_quote(c, settings_, h.composite_type_id)[1]
+            for h in run_holds
+        }
+        alchemy = _alchemy_section(
+            r, settings_, items, {h.composite_type_id: h for h in run_holds},
+            quotes=hold_quotes,
+        )
+        live_by_composite: dict[int, list] = {}
+        for h in all_live:
+            live_by_composite.setdefault(h.composite_type_id, []).append(h)
+        alchemy_sales = _alchemy_sales(
+            alchemy, run_holds, targets=targets, quotes=hold_quotes,
+            names={h.composite_type_id: _type_name(r, h.composite_type_id) for h in run_holds},
+            all_live=live_by_composite,
+        )
+        counted = [s for s in alchemy_sales if s["counted"]]
+        ending_holds = [
+            {
+                "run_number": h.run_number,
+                "remaining": h.remaining,
+                "name": _type_name(r, h.composite_type_id),
+                "plan_figure": h.plan_figure,
+            }
+            for h in all_live
+            if h.remaining > 0 and h.expires_after == run["run_number"]
+        ] if run["status"] != "complete" else []
         final_ids, final_net_margin = _final_margin_badges(
-            c, ref(), settings_, items
+            c, r, settings_, items
         )
         # Revision 7 (contract review amendment 9): a final whose whole
         # wave is installed this cycle builds nothing, so it would drop
@@ -5256,9 +5893,14 @@ def create_app() -> Flask:
             struct_buys=bc["struct_buys"],
             struct_slots=bc["struct_slots"],
             alchemy=alchemy,
-            alchemy_yield=settings_.alchemy_reprocess_yield,
-            **_chain_context(ref(), items),
-            **_install_context(ref(), settings_, items),
+            # The run's holds carry the yield the figures were frozen at
+            # (D1); the intro's percentage follows them (test writers
+            # 2026-10-31), the Settings value only where no hold exists.
+            alchemy_yield=next(
+                (h.yield_ for h in run_holds if h.yield_), settings_.alchemy_reprocess_yield
+            ),
+            **_chain_context(r, items, hold_until if run["status"] != "complete" else None),
+            **_install_context(r, settings_, items),
             unmet=unmet,
             low_stock=[i for i in items if i["low_stock"]],
             buy_total=bc["buy_total"],
@@ -5281,6 +5923,25 @@ def create_app() -> Flask:
             alchemy_slots_planned=sum(
                 a["item"]["jobs_allocated"] or 0 for a in alchemy
             ),
+            # Schema 14: the for-sale alchemy — the "Sell in Jita" panel
+            # and the For sale stat (both absent without for-sale jobs or
+            # a hold). The stat and the Total sum only the rows in
+            # flight, delivered or not installed (D7); the job count is
+            # the cut-adjusted one, the plan's beside it on hover (#35).
+            alchemy_sales=alchemy_sales,
+            # The stat: what is still to sell (active quantities); the Total
+            # row: the counted rows' Sell qty (pile + new jobs).
+            for_sale_qty=sum(s["active_qty"] for s in counted),
+            for_sale_total_qty=sum(s["sell_qty"] for s in counted),
+            for_sale_profit=sum(s["profit_isk"] or 0.0 for s in counted),
+            for_sale_unquoted=any(
+                s["active_qty"] > 0 and s["profit_isk"] is None for s in counted
+            ),
+            for_sale_jobs=sum(s["jobs"] for s in counted),
+            for_sale_jobs_planned=sum(s["jobs_planned"] for s in counted),
+            for_sale_hold_qty=sum(s["held_active"] for s in counted),
+            for_sale_plan_figure=any(s.get("plan_figure") for s in counted),
+            ending_holds=ending_holds,
         )
 
     def sell_quote(c, settings_, type_id):
@@ -5334,6 +5995,173 @@ def create_app() -> Flask:
         (2026-08-24); this endpoint stays as a redirect for bookmarks."""
         return redirect(url_for("planning"))
 
+    @app.post("/runs/<int:index_run_id>/alchemy/<int:composite_id>/sold")
+    def alchemy_hold_sold(index_run_id, composite_id):
+        """Mark units of a composite's for-sale pile sold by hand (user
+        rulings 2026-10-31, D4): a sale ESI cannot see (a direct trade, a
+        hand-over). The quantity is spread oldest run first over the
+        composite's LIVE holds whose jobs have DELIVERED and still have
+        units — the pile that exists, whichever run's page posted it
+        (review #101) — one 'manual' row per hold touched, after a settle
+        so a sale already pulled is never marked twice (review #33). An
+        optional price (ISK received per unit, ruling d) books the units
+        as revenue as entered, with no fee or freight term; blank books
+        neither revenue nor cost. Every row can be undone
+        (alchemy_release_undo)."""
+        c = conn()
+        run = c.execute(
+            "SELECT run_number FROM index_run WHERE index_run_id = ?", (index_run_id,)
+        ).fetchone()
+        if run is None:
+            abort(404)
+        back = redirect(url_for("run_detail", index_run_id=index_run_id))
+        if not sde_ready():
+            flash("download the game data first — the holds read the game's routes")
+            return back
+        r = ref()
+        settings_ = store.get_settings(c)
+        name = _type_name(r, composite_id)
+        raw_qty = (request.form.get("qty") or "").strip().replace(",", "")
+        raw_price = (request.form.get("price") or "").strip().replace(",", "")
+        try:
+            qty = int(raw_qty) if raw_qty else None
+            price = float(raw_price) if raw_price else None
+        except ValueError:
+            flash(f"{name}: invalid number in qty or price — nothing changed")
+            return back
+        if price is not None and (not math.isfinite(price) or price < 0):
+            flash(f"{name}: the price is ISK received per unit, 0 or more — nothing changed")
+            return back
+        _matched, settle_clause = _settle_holds(c)
+        if settle_clause:
+            flash(settle_clause)
+        # The room is read and the marks are written under ONE write lock
+        # (ledger._begin, as the settle does — review 2026-10-31): two
+        # overlapping submits, or an ESI update's settle in between, can
+        # otherwise both mark the same pile.
+        ledger._begin(c)
+        try:
+            composite_holds = [
+                h for h in holds.load(c, r, settings_) if h.composite_type_id == composite_id
+            ]
+            live_ = [h for h in composite_holds if h.live]
+            targets = [h for h in live_ if h.delivered_at is not None and h.remaining > 0]
+            if not targets:
+                c.rollback()
+                # D4's refusals, by what the record shows.
+                running = [h for h in live_ if h.delivered_at is None and h.installed]
+                standing = [h for h in live_ if h.plan_figure]
+                if not live_:
+                    flash(f"no live for-sale hold of {name} — nothing changed")
+                elif running:
+                    h = running[0]
+                    end = (
+                        f"run {h.run_number}'s jobs end {h.jobs_end:%Y-%m-%d %H:%M}"
+                        if h.jobs_end else f"run {h.run_number}'s jobs are still running"
+                    )
+                    if h.delivered_units:
+                        # Staggered batches: Mark sold waits for the last job
+                        # (delivered_at is set only once none is in flight).
+                        flash(
+                            f"{name}: run {h.run_number}'s for-sale jobs are still "
+                            f"delivering — mark sold once the last one lands ({end})"
+                        )
+                    else:
+                        flash(f"{name}: nothing delivered to mark sold yet — {end}")
+                elif standing:
+                    # A live hold is for_sale_qty > 0; with no job installed it
+                    # can only be the plan's figure standing in for an
+                    # uncovered executed window.
+                    h = standing[0]
+                    flash(
+                        f"{name}: run {h.run_number}'s hold stands at the plan's figure — "
+                        "nothing to mark sold until an ESI update shows its jobs delivered"
+                    )
+                else:
+                    flash(
+                        f"{name}: nothing left to mark sold — every delivered unit is "
+                        "accounted for"
+                    )
+                return back
+            room = sum(h.remaining for h in targets)
+            if qty is None or qty < 1:
+                c.rollback()
+                flash(f"{name}: enter at least 1 — {room:,} still held")
+                return back
+            applied: list[tuple[int, int]] = []
+            left = qty
+            for h in targets:  # oldest run first (holds.live's order)
+                take = min(h.remaining, left)
+                if take <= 0:
+                    continue
+                store.add_alchemy_release(
+                    c, h.index_run_id, composite_id, take, "manual",
+                    unit_price=price, unit_cost=h.route_unit_cost,
+                )
+                applied.append((h.run_number, take))
+                left -= take
+                if left <= 0:
+                    break
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
+        words = "; ".join(f"{take:,} marked sold — run {n}'s hold" for n, take in applied)
+        message = f"{name}: {words}"
+        if left > 0:
+            message += f"; {left:,} not applied: nothing else delivered"
+        message += (
+            f" (booked as revenue at {price:,.2f} ISK per unit, as entered — no fees "
+            "deducted)"
+            if price is not None
+            else " (no price: these units book neither revenue nor cost)"
+        )
+        flash(message)
+        return back
+
+    @app.post("/runs/<int:index_run_id>/alchemy/release/<int:release_id>/undo")
+    def alchemy_release_undo(index_run_id, release_id):
+        """Undo one by-hand mark (user rulings 2026-10-31, D4): the units
+        are held for sale again. Only a 'manual' row on a LIVE hold — an
+        observed sale stays matched, and an ended hold's history stays
+        as it was."""
+        c = conn()
+        back = redirect(url_for("run_detail", index_run_id=index_run_id))
+        row = c.execute(
+            "SELECT * FROM alchemy_hold_release WHERE release_id = ?", (release_id,)
+        ).fetchone()
+        if row is None:
+            flash("that by-hand mark is already gone — nothing changed")
+            return back
+        if row["source"] != "manual":
+            flash("only a by-hand mark can be undone — an observed sale stays matched")
+            return back
+        if not sde_ready():
+            flash("download the game data first — the holds read the game's routes")
+            return back
+        r = ref()
+        hold = next(
+            (
+                h for h in holds.load(c, r, store.get_settings(c), run_id=row["index_run_id"])
+                if h.composite_type_id == row["composite_type_id"]
+            ),
+            None,
+        )
+        if hold is None or not hold.live:
+            flash(
+                "that hold is no longer live — its by-hand mark stays as history; "
+                "nothing changed"
+            )
+            return back
+        store.delete_release(c, release_id)
+        c.commit()
+        flash(
+            f"{_type_name(r, row['composite_type_id'])}: the by-hand mark of "
+            f"{int(row['qty']):,} on run {hold.run_number}'s hold is undone — "
+            f"{hold.remaining + int(row['qty']):,} held for sale again"
+        )
+        return back
+
     @app.post("/runs/<int:index_run_id>/complete")
     def run_complete(index_run_id):
         c = conn()
@@ -5342,6 +6170,13 @@ def create_app() -> Flask:
         ).fetchone()
         if run is None:
             abort(404)
+        # A second POST (a stale page, a second window) would move
+        # completed_at — the open run's buying window — and with it every
+        # hold the window anchors (review 2026-10-31): refuse it, and a run
+        # that is not the newest (a superseded plan) with it.
+        if run["status"] == "complete":
+            flash(f"run {run['run_number']} is already executed — nothing changed")
+            return redirect(url_for("run_detail", index_run_id=index_run_id))
         # costing.completed_sequence orders by run_number: completing a
         # run OLDER than an already-executed one would splice it mid-
         # cost-history and silently reprice every later completed run's
@@ -5359,6 +6194,22 @@ def create_app() -> Flask:
                 "runs first if that is really the intent)"
             )
             return redirect(url_for("run_detail", index_run_id=index_run_id))
+        # A newer PLANNED run (a superseded plan beside the open one): only
+        # the newest run can be marked executed (review 2026-10-31).
+        newest = c.execute("SELECT MAX(run_number) FROM index_run").fetchone()[0]
+        if newest is not None and run["run_number"] < newest:
+            flash(
+                f"run {run['run_number']} is not the newest run — only the newest run "
+                f"can be marked executed (discard or execute run {newest} first)"
+            )
+            return redirect(url_for("run_detail", index_run_id=index_run_id))
+        # User rulings 2026-10-31 (D4): settle BEFORE the status change,
+        # so a sale pulled late lands on this run's hold while its window
+        # is still open; then name the holds this Mark executed ends
+        # (ruling b: a hold lives one full run after its jobs deliver —
+        # review #125).
+        _matched, settle_clause = _settle_holds(c)
+        before = _live_holds(c)
         c.execute(
             "UPDATE index_run SET status = 'complete', "
             "completed_at = datetime('now'), "
@@ -5367,6 +6218,7 @@ def create_app() -> Flask:
             (index_run_id,),
         )
         c.commit()
+        after = _live_holds(c)
         # Executing closes this run's buying cycle at completed_at (R2):
         # re-file the purchases now, not at the next ESI update (C1).
         message = (
@@ -5386,6 +6238,10 @@ def create_app() -> Flask:
                 f"next ⟳ Update from ESI records the jobs installed through Mark "
                 f"executed (the job record is as of {jobs_as_of})"
             )
+        for words in holds.changed_words(ref(), before, after):
+            message += f" — {words}"
+        if settle_clause:
+            message += f" — {settle_clause}"
         match_message, ok = _assign_purchases(c)
         if not ok:
             message += f" — {match_message}"
@@ -5420,12 +6276,32 @@ def create_app() -> Flask:
                 return redirect(
                     url_for("run_detail", index_run_id=index_run_id)
                 )
+            # User rulings 2026-10-31 (the plan's forced consequence): a
+            # reopened run that is not the newest has no buying window, so
+            # its for-sale hold could neither be read from the job record
+            # nor expire — the newer plan goes first.
+            newer_planned = c.execute(
+                "SELECT run_number FROM index_run WHERE status != 'complete' "
+                "AND run_number > ? ORDER BY run_number LIMIT 1",
+                (run["run_number"],),
+            ).fetchone()
+            if newer_planned is not None:
+                flash(
+                    f"discard run {newer_planned['run_number']} first — a reopened "
+                    "run that is not the newest has no buying window, so its "
+                    "for-sale hold could neither be read from ESI nor expire"
+                )
+                return redirect(
+                    url_for("run_detail", index_run_id=index_run_id)
+                )
+        before = _live_holds(c)
         c.execute(
             "UPDATE index_run SET status = 'planned', completed_at = NULL "
             "WHERE index_run_id = ?",
             (index_run_id,),
         )
         c.commit()
+        after = _live_holds(c)
         # Reopening moves the window bound back (R2): re-file now (C1).
         message = "run reopened — excluded from cost history"
         # v1.29 revision 6 (contract review A6): reopening the newest run
@@ -5436,6 +6312,10 @@ def create_app() -> Flask:
                 "; it is the open run again — the next ESI update re-plans "
                 "it from current stock"
             )
+        # User rulings 2026-10-31: a hold the ending run's Mark executed
+        # dropped is live again (ruling b) — say so (review #125).
+        for words in holds.changed_words(ref(), before, after, reopened=index_run_id):
+            message += f" — {words}"
         match_message, ok = _assign_purchases(c)
         if not ok:
             message += f" — {match_message}"

@@ -320,22 +320,34 @@ def test_first_run_profile_skips_a_database_seeded_without_it(conn):
 def test_prune_backups_takes_sidecars_and_orphans(tmp_path):
     """Pruning an old backup also removes its -wal/-shm sidecars, and
     sidecars whose backup is already gone are swept (a read-only open of a
-    WAL backup leaves them behind)."""
+    WAL backup leaves them behind). Only the snapshots the store writes
+    itself are pruned — a version number with or without the schema
+    suffix added 2026-10-31 (magoo-pre-1.31.0-s13.sqlite) — so the user's
+    hand-named magoo-pre-cleanup-2026-09-30.sqlite in the same folder
+    survives however old it is (review 2026-10-31)."""
     import os
     import time
 
-    for i, name in enumerate(("1.20.0", "1.21.0", "1.23.0", "1.24.0", "1.26.0")):
+    def dated(path, age):
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+
+    by_hand = tmp_path / "magoo-pre-cleanup-2026-09-30.sqlite"
+    by_hand.write_bytes(b"x")
+    dated(by_hand, 10_000)  # the oldest file of all
+    # Oldest first; two of the five carry the -s<schema> suffix.
+    for i, name in enumerate(("1.20.0", "1.21.0-s9", "1.23.0", "1.24.0-s12", "1.26.0")):
         f = tmp_path / f"magoo-pre-{name}.sqlite"
         f.write_bytes(b"x")
         (tmp_path / f"magoo-pre-{name}.sqlite-wal").write_bytes(b"")
         (tmp_path / f"magoo-pre-{name}.sqlite-shm").write_bytes(b"")
-        stamp = time.time() - (10 - i) * 100
-        os.utime(f, (stamp, stamp))
+        dated(f, (10 - i) * 100)
     (tmp_path / "magoo-pre-1.19.0.sqlite-shm").write_bytes(b"")  # orphan
     store._prune_backups(tmp_path, keep=3)
     left = sorted(p.name for p in tmp_path.iterdir())
     assert left == [
         "magoo-pre-1.23.0.sqlite", "magoo-pre-1.23.0.sqlite-shm", "magoo-pre-1.23.0.sqlite-wal",
-        "magoo-pre-1.24.0.sqlite", "magoo-pre-1.24.0.sqlite-shm", "magoo-pre-1.24.0.sqlite-wal",
+        "magoo-pre-1.24.0-s12.sqlite", "magoo-pre-1.24.0-s12.sqlite-shm", "magoo-pre-1.24.0-s12.sqlite-wal",
         "magoo-pre-1.26.0.sqlite", "magoo-pre-1.26.0.sqlite-shm", "magoo-pre-1.26.0.sqlite-wal",
+        "magoo-pre-cleanup-2026-09-30.sqlite",
     ]

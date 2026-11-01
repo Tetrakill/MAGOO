@@ -27,8 +27,8 @@
   <thead><tr><th class="num">#</th><th>Planned</th><th>Status</th>
       <th class="num">Items</th>
       <th class="num" title="what the plan asked you to buy when the run was first planned — the run's own pages show the current plan's figure, which shrinks as bought stock lands">Buy total</th>
-      <th class="num" title="net proceeds per cycle, after sell fees — the Profit tab's 'Net proceeds / cycle' on an executed run, Planning → Profit's estimate on the open run; not the Ledger's gross Revenue (price × units before fees)">Revenue</th>
-      <th class="num" title="profit per cycle: net proceeds less the chain cost of the units — the Profit tab's 'Profit / cycle' on an executed run, Planning → Profit's estimate on the open run">Profit</th>
+      <th class="num" title="net proceeds per cycle, after sell fees — the Profit tab's 'Net proceeds / cycle' on an executed run; on the open run Planning → Profit's estimate for the hulls plus its own for-sale alchemy hold at today's quote; not the Ledger's gross Revenue (price × units before fees)">Revenue</th>
+      <th class="num" title="profit per cycle: net proceeds less the chain cost of the units — the Profit tab's 'Profit / cycle' on an executed run; on the open run Planning → Profit's estimate for the hulls plus its own for-sale alchemy hold at today's quote, less the route's cost">Profit</th>
       <th></th></tr></thead>
   {% for r in runs %}
   <tr{% if r.superseded %} class="superseded"{% endif %}>
@@ -46,19 +46,22 @@
     {# Realized tooltips say where the units came from (the Profit tab's
        own rule): the ESI job record where the logged pulls cover the
        cycle, else the plan's started figure. #}
-    <td class="num" title="{{ f.revenue|isk }} ISK — {% if f.kind == 'realized' %}the Profit tab's Net proceeds / cycle: net proceeds at today's quotes, after sell fees, for {% if f.hulls_from_esi %}the hulls ESI shows started inside this cycle{% else %}the hulls the plan started (the ESI job record does not cover this cycle){% endif %}{% else %}Planning → Profit's estimate: net proceeds at today's cached prices for the active pipelines' requested units{% endif %} — not the Ledger's gross Revenue">{{ f.revenue|isk_short }}{% if f.kind == 'estimate' %}
+    {% set hulls_missing = f.hulls_missing if f.hulls_missing is defined else none %}
+    <td class="num" title="{{ f.revenue|isk }} ISK — {% if f.kind == 'realized' %}the Profit tab's Net proceeds / cycle: net proceeds at today's quotes, after sell fees, for {% if f.hulls_from_esi %}the hulls ESI shows started inside this cycle{% elif f.hulls_from_esi is none %}no hulls (nothing attributable){% else %}the hulls the plan started (the ESI job record does not cover this cycle){% endif %}{% elif hulls_missing %}no hull figure ({{ hulls_missing }}) — the open run's for-sale alchemy hold alone{% else %}Planning → Profit's estimate: net proceeds at today's cached prices for the active pipelines' requested units{% endif %}{% if f.alchemy_units %}; incl. {{ f.alchemy_revenue|isk }} ISK from {{ f.alchemy_units|qty }} units of alchemy run for sale (realized where sold, today's quote for units still held or sold without an attributable price, nothing for units returned to stock){% endif %} — not the Ledger's gross Revenue">{{ f.revenue|isk_short }}{% if f.kind == 'estimate' %}
       <span class="badge" title="estimate at today's prices — realized figures appear once the run is marked executed">est.</span>{% endif %}{% if f.unquoted %}
-      <span class="badge warn" title="{{ f.unquoted }} pipeline final(s) have no sell quote and are left out of both figures">{{ f.unquoted }} unquoted</span>{% endif %}</td>
-    <td class="num {% if f.profit < 0 %}bad{% elif f.profit > 0 %}good{% endif %}" title="{{ f.profit|isk }} ISK — {% if f.kind == 'realized' %}the Profit tab's Profit / cycle: net proceeds less the lagged chain cost of {% if f.hulls_from_esi %}the hulls ESI shows started inside this cycle{% else %}the hulls the plan started{% endif %}{% else %}Planning → Profit's estimate: net proceeds less the chain cost at today's prices{% endif %}">{{ f.profit|isk_short }}</td>
+      <span class="badge warn" title="{{ f.unquoted }} pipeline final(s) have no sell quote and are left out of both figures">{{ f.unquoted }} unquoted</span>{% endif %}{% if f.alchemy_unpriced is defined and f.alchemy_unpriced %}
+      <span class="badge warn" title="{{ f.alchemy_unpriced }} alchemy composite(s) with units sold without an attributable price (estimated at today's quote where one is cached, else left out with their route cost) or still held with no quote (left out, their route cost too)">{{ f.alchemy_unpriced }} alchemy unpriced</span>{% endif %}{% if f.alchemy_failed is defined and f.alchemy_failed %}
+      <span class="badge warn" title="the open run's for-sale hold could not be valued (see the log) — these figures leave it out">alchemy failed</span>{% endif %}</td>
+    <td class="num {% if f.profit < 0 %}bad{% elif f.profit > 0 %}good{% endif %}" title="{{ f.profit|isk }} ISK — {% if f.kind == 'realized' %}the Profit tab's Profit / cycle: net proceeds less the lagged chain cost of {% if f.hulls_from_esi %}the hulls ESI shows started inside this cycle{% elif f.hulls_from_esi is none %}no hulls (nothing attributable){% else %}the hulls the plan started{% endif %}{% elif hulls_missing %}no hull figure ({{ hulls_missing }}) — the open run's for-sale alchemy hold alone{% else %}Planning → Profit's estimate: net proceeds less the chain cost at today's prices{% endif %}{% if f.alchemy_units %}; incl. {{ f.alchemy_profit|isk }} ISK from alchemy run for sale, net of its route cost{% endif %}">{{ f.profit|isk_short }}</td>
     {% else %}
-    <td class="num muted" title="{% if r.figures_failed %}could not be costed — open the run's Profit tab for the error{% elif r.superseded %}a superseded plan has no figures{% elif r.status == 'complete' %}nothing to cost: no pipeline is attributable to this run{% else %}no estimate yet — the open run's estimate needs the game data imported and at least one active pipeline{% endif %}">—</td>
+    <td class="num muted" title="{% if r.figures_failed %}could not be costed{% if r.failed_part is defined and r.failed_part %} ({{ r.failed_part }} failed){% endif %} — {% if r.status == 'complete' %}open the run's Profit tab for the error{% else %}see the log{% endif %}{% elif r.superseded %}a superseded plan has no figures{% elif r.status == 'complete' %}nothing to cost: no pipeline is attributable to this run and it holds no alchemy for sale{% else %}no estimate yet — the open run's estimate needs the game data imported and at least one active pipeline (the hulls' what-if), or for-sale alchemy jobs ESI shows installed (its hold){% endif %}">—</td>
     <td class="num muted">—</td>
     {% endif %}
     <td><a href="{{ url_for('run_detail', index_run_id=r.index_run_id) }}">view</a>
       {% if r.status != 'complete' %}
       <form class="inline" method="post"
             action="{{ url_for('run_delete', index_run_id=r.index_run_id) }}"
-            data-confirm="Discard run {{ r.run_number }}? It was never executed — its plan is deleted permanently.">
+            data-confirm="Discard run {{ r.run_number }}? It was never executed — its plan is deleted permanently.{% if r.discard_blocked is defined and r.discard_blocked %} Its for-sale hold shows installed jobs or recorded sales, so the discard will be refused — re-plan it instead.{% endif %}">
         <button class="mini danger">discard</button>
       </form>
       {% endif %}</td>

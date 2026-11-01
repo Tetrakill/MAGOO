@@ -254,6 +254,27 @@ class PlanItem:
     alchemy_unit_cost: float | None = None
     alchemy_output_qty: int = 0
     alchemy_credit_qty: int = 0
+    # Alchemy for profit (schema 14). On an unrefined-formula row: how
+    # many of its jobs were added FOR SALE after the savings moves (their
+    # output is never credited to a deficit or a purchase), the net Jita
+    # proceeds per composite unit they were judged against and the
+    # route's cost per composite unit as the profit pass priced it — the
+    # composite need not be a plan row at all.
+    alchemy_profit_jobs: int = 0
+    alchemy_sale_net_unit: float | None = None
+    alchemy_route_unit_cost: float | None = None
+    # User rulings 2026-10-31: on a composite row, the units of its stock
+    # a live for-sale hold hid from this plan (the sale pile is not chain
+    # stock) — the formula's unrefined pool first (on hand + in flight
+    # at the Settings yield; only the credited part comes off In jobs),
+    # then the hangar — and the part of that figure that came out of the credit (the
+    # Stockpile tab annotates each cell). None where no hold applied.
+    held_for_sale_qty: int | None = None
+    held_from_credit_qty: int | None = None
+    # Transient (never persisted): the re-stamp priced an input of this
+    # for-sale row at a fill — holds.write_plan_holds keeps a stored cost
+    # across a plan that bought nothing of the route (ruling (f)).
+    alchemy_cost_from_fills: bool = False
     # Compressed sourcing (v1.25). On a compressed buy row (a synthetic
     # raw the pass injects): what the purchase is FOR — ((material_id,
     # units out at the yield, units used to cover demand), …) — plus the
@@ -480,7 +501,11 @@ def _apply_targets(
     merged: dict[int, PlanItem],
     snapshot: Snapshot,
     alchemy: bool = True,
+    holds: dict | None = None,
 ):
+    """... `holds`: {composite type_id: holds.Bite} — what the live
+    for-sale holds hide of each composite (holds.bites), None when the
+    caller plans with alchemy off (steady state)."""
     settings = store.get_settings(conn)
     class_settings = store.get_class_settings(conn)
     buffer_mult = 1.0 + settings.stockpile_buffer
@@ -524,6 +549,49 @@ def _apply_targets(
     # a stocked unrefined item can never fake credits there.
     if alchemy:
         _apply_unrefined_credits(conn, ref, merged, snapshot)
+
+    # User rulings 2026-10-31 (rebuilt after the review of the same day):
+    # a live for-sale hold's remaining units are the sale pile, not chain
+    # stock. holds.bites gives, per composite, the live holds' remaining
+    # less the units already listed on the market or sitting in
+    # outstanding contracts — those have left ESI assets. The pile cannot
+    # be told from the chain's own units, so the hide comes first out of
+    # the formula's unrefined pool (on hand + in flight at the Settings
+    # yield — the credit's own conversion; only the CREDITED part reduces
+    # the row, so with alchemy off the unrefined pile bites nothing that
+    # is counted), then out of the hangar. The remaining is anchored to
+    # the jobs ESI shows installed (holds.py): an open run's hold hides
+    # nothing before its jobs exist, and nothing this plan computes
+    # changes what is hidden. Never the recovered goo, which does go to
+    # the chain; never more than is there. Every later reader (the
+    # deficit below, the feedback loop, availability, the install check)
+    # sees the row figures, so this is the one place.
+    if holds:
+        pool_yield = (
+            settings.alchemy_reprocess_yield
+            if settings.alchemy_reprocess_yield > 0 else 0.55
+        )
+        for composite_id, bite in holds.items():
+            item = merged.get(composite_id)
+            if item is None or bite.hide <= 0:
+                continue
+            pool = math.floor(
+                (
+                    snapshot.on_hand.get(bite.unrefined_type_id, 0)
+                    + snapshot.in_progress.get(bite.unrefined_type_id, 0)
+                )
+                * bite.composite_qty * pool_yield
+            )
+            from_pool = min(bite.hide, max(0, pool))
+            from_credit = min(from_pool, item.alchemy_credit_qty)
+            from_hangar = min(bite.hide - from_pool, item.on_hand_qty)
+            if from_hangar + from_credit <= 0:
+                continue
+            item.on_hand_qty -= from_hangar
+            item.in_progress_qty -= from_credit
+            item.alchemy_credit_qty -= from_credit
+            item.held_for_sale_qty = from_hangar + from_credit
+            item.held_from_credit_qty = from_credit
 
     for item in merged.values():
         if item.type_id in final_products:
@@ -592,6 +660,15 @@ def _composite_extra_targets(
             consumers_with_jobs_only
             and item.runs_allocated <= 0
             and item.installed_qty <= 0
+        ):
+            continue
+        # A row whose jobs are all FOR SALE (alchemy for profit) is not a
+        # chain composite reaction — its output is sold — so its fuel
+        # block gets no stockpile adder; a mixed row keeps the adder for
+        # its savings jobs (review 2026-10-31, #89).
+        if (
+            item.alchemy_for_type_id is not None
+            and item.alchemy_profit_jobs >= item.jobs_allocated > 0
         ):
             continue
         mat_mult = industry.build_multiplier(
@@ -1720,8 +1797,174 @@ def _allocate_slots(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot, 
 # ---------------------------------------------------------------------------
 
 
-def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
+def alchemy_sale_split(
+    jobs_allocated: int,
+    profit_jobs: int,
+    max_runs_per_job: int,
+    portion_size: int,
+    install_runs: int | None = None,
+) -> tuple[int, int]:
+    """(units for the chain, units for sale) of an unrefined row's output
+    to run now — unrefined units, before the reprocess. The savings jobs
+    come first and the for-sale jobs are the rest, so an install cut
+    (`install_runs` below the plan's runs) trims the for-sale share
+    first. Shared by the run page's Alchemy section and the hold the plan
+    persists (user ruling 2026-10-31), so the two never disagree."""
+    jobs_allocated = int(jobs_allocated or 0)
+    profit_jobs = min(int(profit_jobs or 0), jobs_allocated)
+    per_job = int(max_runs_per_job or 0) * int(portion_size or 1)
+    planned = jobs_allocated * per_job
+    to_run = planned if install_runs is None else int(install_runs) * int(portion_size or 1)
+    to_run = max(0, min(planned, to_run))
+    chain = (jobs_allocated - profit_jobs) * per_job
+    sale = max(0, to_run - chain) if profit_jobs else 0
+    return to_run - sale, sale
+
+
+def _sale_net_unit(ref, settings, snapshot: Snapshot, type_id: int) -> float | None:
+    """What one unit banks sold in Jita: the hub quote at the configured
+    basis (the Profit tab's and the Ledger's sell reference — user ruling
+    2026-10-30) less sales tax, broker fee, the SCC surcharge and
+    freight-out per m³ (costing.net_proceeds_per_hull). None when Jita
+    has no quote; the structure venue's price never stands in."""
+    price = snapshot.hub_prices.get(type_id)
+    if price is None and snapshot.venue(type_id) == store.BUY_VENUE_HUB:
+        price = snapshot.price(type_id)
+    if price is None or price <= 0:
+        return None
+    return costing.net_proceeds_per_hull(
+        price,
+        ref.type_info(type_id).freight_volume,
+        settings,
+        capital=False,
+        freight_exempt=costing.freight_out_exempt(type_id),
+    )
+
+
+def _route_unit_cost(
+    ref, settings, snapshot: Snapshot, merged: dict[int, PlanItem], route, max_runs: int,
+    setting, price_of,
+) -> float | None:
+    """The route's cost per composite unit at `price_of` for its inputs:
+    (Σ inputs + install at `max_runs` runs − Σ recovered × yield × value)
+    / (composite_qty × yield). A recovered input the chain BUYS offsets
+    next cycle's purchase — priced like the inputs; one the chain never
+    draws would have to be sold: its net Jita proceeds, 0 when unpriced
+    (Decision Log, Alchemy for profit). None when the formula has no
+    priced output, and None when an input the plan would have to BUY is
+    unpriced at `price_of` (review 2026-10-31 #27): a cost that counted
+    it at 0 would invent a profit, so the route waits for a price
+    refresh. An input the chain BUILDS (a fuel block with a build row)
+    is exempt — unquoted, it counts 0 as it always has, and its blocks
+    are the stock the fuel gate rations."""
+    yield_ = settings.alchemy_reprocess_yield
+    if yield_ <= 0 or route.composite_qty <= 0 or max_runs <= 0:
+        return None
+    for m, _qty in ref.materials(route.formula.blueprint_id, route.formula.activity_id):
+        if price_of(m):
+            continue
+        row = merged.get(m)
+        built = (
+            row is not None and row.buildable and row.recommended_action != "buy"
+        )
+        if not built:
+            return None
+    unrefined_cost = _unit_build_cost(
+        ref, route.formula.blueprint_id, route.formula.activity_id,
+        route.formula.portion_size, setting, 0, snapshot, runs=max_runs,
+        scc_surcharge=settings.industry_scc_surcharge, price_of=price_of,
+    )
+
+    def recovered_value(m: int) -> float:
+        row = merged.get(m)
+        if row is not None and (row.merged_min_qty or 0) > 0:
+            return price_of(m) or 0.0
+        return _sale_net_unit(ref, settings, snapshot, m) or 0.0
+
+    recovered = sum(qty * yield_ * recovered_value(m) for m, qty in route.recovered)
+    return (unrefined_cost - recovered) / (route.composite_qty * yield_)
+
+
+def _restamp_route_costs(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot) -> None:
+    """Ruling (f), 2026-10-31: the for-sale jobs were chosen and ranked at
+    the Phase 1 landed quote (that stays); once Phase 7.5 has fill-priced
+    the purchases, re-stamp each for-sale row's `alchemy_route_unit_cost`
+    with every input the plan BUYS outright priced at its row's
+    fill-priced landed average — what the plan actually pays — so the
+    hold's cost of goods, the Sell in Jita panel, the Profit tab and the
+    Ledger agree with the Buy tab. A built row (a fuel block) keeps the
+    Phase 1 landed quote, as the savings comparison prices it: its
+    fallback buy's fill covers a shortfall, not the blocks the jobs
+    burn."""
+    settings = store.get_settings(conn)
+    rows = [
+        item for item in merged.values()
+        if item.alchemy_for_type_id is not None and item.alchemy_profit_jobs > 0
+    ]
+    if not rows:
+        return
+    routes = ref.alchemy_routes()
+    setting = store.get_class_settings(conn).get("reactions", industry.NPC_STATION)
+    hub_rate = settings.freight_in_rate(store.BUY_VENUE_HUB)
+    structure_rate = settings.freight_in_rate(store.BUY_VENUE_STRUCTURE)
+
+    hit = {"fill": False}  # did this row's cost touch a bought input?
+
+    def fill_landed(type_id: int) -> float | None:
+        row = merged.get(type_id)
+        # A row the compressed ore covers exactly has no direct buy left
+        # (recommended_buy_qty 0) yet is bought all the same — its
+        # effective_unit_cost is what the plan pays (review 2026-10-31).
+        bought = (
+            row is not None
+            and (row.recommended_buy_qty > 0 or (row.compressed_covered_qty or 0) > 0)
+            and row.price_snapshot is not None
+            and (not row.buildable or row.recommended_action == "buy")
+        )
+        if not bought:
+            return _landed_price(ref, settings, snapshot, type_id)
+        hit["fill"] = True
+        view = {
+            "recommended_buy_qty": row.recommended_buy_qty,
+            "price_snapshot": row.price_snapshot,
+            "buy_venue": row.buy_venue,
+            "hub_buy_qty": row.hub_buy_qty,
+            "structure_buy_qty": row.structure_buy_qty,
+            "hub_fill_price": row.hub_fill_price,
+            "structure_fill_price": row.structure_fill_price,
+            "unfilled_qty": row.unfilled_qty,
+            "effective_unit_cost": row.effective_unit_cost,
+        }
+        landed = costing.ladder_landed_unit(
+            view, hub_rate=hub_rate, structure_rate=structure_rate,
+            m3=ref.type_info(type_id).freight_volume,
+        )
+        return landed if landed is not None else _landed_price(ref, settings, snapshot, type_id)
+
+    for item in rows:
+        route = routes.get(item.alchemy_for_type_id)
+        if route is None:
+            continue
+        hit["fill"] = False
+        cost = _route_unit_cost(
+            ref, settings, snapshot, merged, route, item.max_runs_per_job, setting, fill_landed,
+        )
+        if cost is not None:
+            item.alchemy_route_unit_cost = cost
+            item.alchemy_cost_from_fills = hit["fill"]
+
+
+def _alchemy_pass(
+    conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot, *,
+    running_reactions: int = 0, installed_jobs: dict[int, int] | None = None,
+):
     """Substitute alchemy for direct composite reactions in spare slots.
+
+    `running_reactions`: reaction jobs started this cycle that still hold
+    a line — the profit tail's capacity is the spare less these (ruling
+    (a), 2026-10-31); `installed_jobs`: {unrefined type: jobs of that
+    formula started this cycle}, counted against the shared cap so an
+    installed for-sale job is never listed again.
 
     Direct planning is untouched; alchemy only ever converts existing
     coverage. When reaction slots are left over and a composite's alchemy
@@ -1753,8 +1996,18 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         or settings.max_alchemy_jobs_per_type <= 0
     ):
         return
+    # Schema 14: routes the user never wants run — no savings move, no
+    # profit job. Unrefined stock already on hand still credits its
+    # composite (_apply_targets): that is stock, not a job.
+    blocked = store.alchemy_blacklist(conn)
     slots = snapshot.slots_available.get(config.ACTIVITY_REACTION, 0)
     finals = {p["final_product_type_id"] for p in store.active_pipelines(conn)}
+    # Every pipeline's final, active or not — the Ledger's finals set
+    # (ledger.finals): a final's sales are the finals' Ledger's, so no
+    # for-sale hold may ever claim them (review 2026-10-31 #18 / #123).
+    sale_finals = {
+        row[0] for row in conn.execute("SELECT final_product_type_id FROM pipeline")
+    }
     # The slots that count are the ones STARTABLE direct jobs hold — a
     # direct job stock cannot feed this cycle holds no slot — so alchemy
     # runs in the rest by the original rules, ranked by savings: a swap
@@ -1835,11 +2088,75 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         # carried freight too.
         return _landed_price(ref, settings, snapshot, type_id)
 
+    def route_figures(route, item: PlanItem | None) -> dict:
+        """What one job of the route's unrefined formula is: its run time,
+        the runs a job holds, the unrefined route's single-stage cost at
+        that job scale (recovered credit NOT yet deducted), the composite
+        units a job yields after the reprocess, and a probe row for its
+        draw. Shared by the savings candidates and the profit tail."""
+        # Reactions have no ME; the reactions class setting governs both
+        # routes, so structure/rig bonuses cancel where equal.
+        time_per_run = industry.job_time_seconds(
+            route.formula.base_time,
+            1,
+            0,
+            industry.build_multiplier(
+                ref, setting, config.ACTIVITY_REACTION, "time"
+            ),
+        ) * industry.skill_time_multiplier(
+            ref, route.formula.blueprint_id, config.ACTIVITY_REACTION, skills
+        )
+        # _floor: the same ulp guard as _size_jobs (review 2026-09-05,
+        # finding A5); the formula's maxProductionLimit no longer caps
+        # (ruling R2).
+        max_runs = min(
+            max(1, _floor(window_seconds / time_per_run)),
+            _game_job_run_cap(time_per_run),
+        )
+        # Each route is costed at its own job scale so once-per-job
+        # rounding amortizes as it will in the installed jobs.
+        unrefined_cost = _unit_build_cost(
+            ref,
+            route.formula.blueprint_id,
+            route.formula.activity_id,
+            route.formula.portion_size,
+            setting,
+            0,
+            snapshot,
+            runs=max_runs,
+            scc_surcharge=settings.industry_scc_surcharge,
+            price_of=landed,
+        )
+        # A for-sale route's composite may be no plan row: its unrefined
+        # row then sits one level under the finals, like any reaction.
+        depth = item.depth if item is not None else 1
+        return {
+            "route": route,
+            "time_per_run": time_per_run,
+            "max_runs": max_runs,
+            "unrefined_cost": unrefined_cost,
+            "out_per_job": math.floor(max_runs * route.composite_qty * yield_),
+            "depth": depth,
+            # A probe row for the unrefined formula's draw (its fuel
+            # block is the one input stock must hold — or, where the
+            # chain builds it and a market prices it, Phase 7 buys).
+            "probe": PlanItem(
+                type_id=route.unrefined_id,
+                name=ref.type_info(route.unrefined_id).name,
+                item_class="reactions",
+                depth=depth,
+                blueprint_id=route.formula.blueprint_id,
+                activity_id=config.ACTIVITY_REACTION,
+                portion_size=route.formula.portion_size,
+            ),
+        }
+
     candidates = []
     for composite_id, route in ref.alchemy_routes().items():
         item = merged.get(composite_id)
         if (
-            item is None
+            composite_id in blocked
+            or item is None
             or item.activity_id != config.ACTIVITY_REACTION
             # Direct jobs to displace, or units the plan means to BUY
             # that the route could supply instead (user ruling
@@ -1864,27 +2181,9 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
             or route.unrefined_id in merged
         ):
             continue
-        # Reactions have no ME; the reactions class setting governs both
-        # routes, so structure/rig bonuses cancel where equal.
-        time_per_run = industry.job_time_seconds(
-            route.formula.base_time,
-            1,
-            0,
-            industry.build_multiplier(
-                ref, setting, config.ACTIVITY_REACTION, "time"
-            ),
-        ) * industry.skill_time_multiplier(
-            ref, route.formula.blueprint_id, config.ACTIVITY_REACTION, skills
-        )
-        # _floor: the same ulp guard as _size_jobs (review 2026-09-05,
-        # finding A5); the formula's maxProductionLimit no longer caps
-        # (ruling R2).
-        max_runs = min(
-            max(1, _floor(window_seconds / time_per_run)),
-            _game_job_run_cap(time_per_run),
-        )
-        # Each route is costed at its own job scale so once-per-job
-        # rounding amortizes as it will in the installed jobs.
+        figures = route_figures(route, item)
+        # The direct route is costed at ITS job scale, like the unrefined
+        # one in route_figures.
         direct_unit = _unit_build_cost(
             ref,
             item.blueprint_id,
@@ -1897,23 +2196,11 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
             scc_surcharge=settings.industry_scc_surcharge,
             price_of=landed,
         )
-        unrefined_cost = _unit_build_cost(
-            ref,
-            route.formula.blueprint_id,
-            route.formula.activity_id,
-            route.formula.portion_size,
-            setting,
-            0,
-            snapshot,
-            runs=max_runs,
-            scc_surcharge=settings.industry_scc_surcharge,
-            price_of=landed,
-        )
         recovered_credit = sum(
             qty * yield_ * (landed(m) or 0.0)
             for m, qty in route.recovered
         )
-        alchemy_unit = (unrefined_cost - recovered_credit) / (
+        alchemy_unit = (figures["unrefined_cost"] - recovered_credit) / (
             route.composite_qty * yield_
         )
         item.direct_unit_cost = direct_unit
@@ -1941,32 +2228,16 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         )
         if swap_saving is None and buy_saving is None:
             continue
-        out_per_job = math.floor(max_runs * route.composite_qty * yield_)
-        if out_per_job <= 0:
+        if figures["out_per_job"] <= 0:
             continue
         candidates.append(
-            {
-                "item": item,
-                "route": route,
-                "time_per_run": time_per_run,
-                "max_runs": max_runs,
-                "out_per_job": out_per_job,
-                "outright": outright,
-                "swap_saving": swap_saving,
-                "buy_saving": buy_saving,
-                # A probe row for the unrefined formula's draw (its fuel
-                # block is the one input stock must hold — or, where the
-                # chain builds it and a market prices it, Phase 7 buys).
-                "probe": PlanItem(
-                    type_id=route.unrefined_id,
-                    name=ref.type_info(route.unrefined_id).name,
-                    item_class="reactions",
-                    depth=item.depth,
-                    blueprint_id=route.formula.blueprint_id,
-                    activity_id=config.ACTIVITY_REACTION,
-                    portion_size=route.formula.portion_size,
-                ),
-            }
+            dict(
+                figures,
+                item=item,
+                outright=outright,
+                swap_saving=swap_saving,
+                buy_saving=buy_saving,
+            )
         )
 
     def fuel_need(cand, jobs: int) -> dict[int, int]:
@@ -2063,6 +2334,35 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
                 "drops_unstartable": False, "market_left": market_left}
 
     alchemy_items: dict[int, PlanItem] = {}
+
+    def add_jobs(cand, jobs: int) -> PlanItem:
+        """The unrefined formula's plan row (created on its first jobs),
+        `jobs` more jobs on it. Savings moves and for-sale jobs share one
+        row per formula — and the per-type cap."""
+        route = cand["route"]
+        alch = alchemy_items.get(route.unrefined_id)
+        if alch is None:
+            alch = alchemy_items[route.unrefined_id] = PlanItem(
+                type_id=route.unrefined_id,
+                name=ref.type_info(route.unrefined_id).name,
+                item_class="reactions",
+                depth=cand["depth"],
+                blueprint_id=route.formula.blueprint_id,
+                activity_id=config.ACTIVITY_REACTION,
+                portion_size=route.formula.portion_size,
+                alchemy_for_type_id=route.composite_id,
+                time_per_run=cand["time_per_run"],
+                max_runs_per_job=cand["max_runs"],
+                on_hand_qty=snapshot.on_hand.get(route.unrefined_id, 0),
+                in_progress_qty=snapshot.in_progress.get(route.unrefined_id, 0),
+                recommended_action="build",
+            )
+            _stamp_price(alch, snapshot)
+        alch.jobs_allocated += jobs
+        alch.total_runs_needed = alch.jobs_allocated * alch.max_runs_per_job
+        alch.jobs_needed_unconstrained = alch.jobs_allocated
+        return alch
+
     while True:
         best = None
         for cand in candidates:
@@ -2113,27 +2413,102 @@ def _alchemy_pass(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
                     leftover[m] = left(m) + q
         for m, q in best["need"].items():
             leftover[m] = left(m) - q
-        alch = alchemy_items.get(route.unrefined_id)
-        if alch is None:
-            alch = alchemy_items[route.unrefined_id] = PlanItem(
-                type_id=route.unrefined_id,
-                name=ref.type_info(route.unrefined_id).name,
-                item_class="reactions",
-                depth=item.depth,
-                blueprint_id=route.formula.blueprint_id,
-                activity_id=config.ACTIVITY_REACTION,
-                portion_size=route.formula.portion_size,
-                alchemy_for_type_id=route.composite_id,
-                time_per_run=cand["time_per_run"],
-                max_runs_per_job=cand["max_runs"],
-                on_hand_qty=snapshot.on_hand.get(route.unrefined_id, 0),
-                in_progress_qty=snapshot.in_progress.get(route.unrefined_id, 0),
-                recommended_action="build",
+        add_jobs(cand, best["jobs"])
+
+    # --- Alchemy for profit (schema 14) ----------------------------------
+    # With every savings move placed, the reaction lines STILL free fill
+    # with unrefined reactions whose composite sells in Jita for more than
+    # the route costs, most profitable per slot first. These jobs are
+    # added for sale: the composite row (if the chain has one) is never
+    # credited, so no deficit, purchase or low-stock test sees them. They
+    # share the per-type cap and the fuel in stock with the savings jobs,
+    # and never take a slot a startable direct job holds (`spare`). Unlike
+    # every other slot consumer they have no deficit to drop out through
+    # once installed, so their capacity is also net of the reaction jobs
+    # this cycle already started (ruling (a), 2026-10-31 — R2's configured
+    # pools stand for the deficit-bounded consumers), and the formula's
+    # installed jobs count toward the shared cap.
+    installed_jobs = installed_jobs or {}
+    spare_tail = max(0, spare - int(running_reactions))
+    if settings.alchemy_for_profit and spare_tail > 0:
+        production_blocked = _blacklist_checker(conn, ref)
+
+        def net_sale(type_id: int) -> float | None:
+            return _sale_net_unit(ref, settings, snapshot, type_id)
+
+        for_sale = []
+        for composite_id, route in ref.alchemy_routes().items():
+            if (
+                composite_id in blocked
+                or route.unrefined_id in merged  # the overwrite guard above
+                or ref.type_info(composite_id).group_id
+                in config.NON_SATURATING_REACTION_GROUPS
+                # A pipeline's own final is sold as a final, never twice
+                # (review 2026-10-31, #18) — any pipeline's, active or not.
+                or composite_id in sale_finals
+                # The Production Blacklist also stops a for-sale route
+                # (ruling (h), 2026-10-31): a type the user buys, not
+                # builds, gets no reaction job of any kind.
+                or (
+                    production_blocked is not None
+                    and (production_blocked(route.unrefined_id) or production_blocked(composite_id))
+                )
+            ):
+                continue
+            net_unit = net_sale(composite_id)
+            if net_unit is None or net_unit <= 0:
+                continue
+            figures = route_figures(route, merged.get(composite_id))
+            if figures["out_per_job"] <= 0:
+                continue
+            route_unit = _route_unit_cost(
+                ref, settings, snapshot, merged, route, figures["max_runs"], setting, landed,
             )
-            _stamp_price(alch, snapshot)
-        alch.jobs_allocated += best["jobs"]
-        alch.total_runs_needed = alch.jobs_allocated * alch.max_runs_per_job
-        alch.jobs_needed_unconstrained = alch.jobs_allocated
+            if route_unit is None or net_unit <= route_unit:
+                continue
+            for_sale.append(
+                dict(
+                    figures,
+                    net_unit=net_unit,
+                    route_unit=route_unit,
+                    # One slot per job, so profit per slot is per job.
+                    profit_per_slot=(net_unit - route_unit) * figures["out_per_job"],
+                )
+            )
+
+        while spare_tail > 0 and for_sale:
+            best = None
+            for cand in for_sale:
+                unrefined_id = cand["route"].unrefined_id
+                existing = alchemy_items.get(unrefined_id)
+                so_far = (existing.jobs_allocated if existing else 0) + installed_jobs.get(
+                    unrefined_id, 0
+                )
+                room = min(cap - so_far, spare_tail)
+                if room < 1:
+                    continue
+                # The most jobs the fuel block left in stock can start
+                # (the goo is bought just in time, as for every move).
+                lo, hi = 0, room
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if fed(fuel_need(cand, mid)):
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                if lo < 1:
+                    continue
+                if best is None or cand["profit_per_slot"] > best["profit_per_slot"]:
+                    best = dict(cand, jobs=lo)
+            if best is None:
+                break
+            spare_tail -= best["jobs"]
+            for m, q in fuel_need(best, best["jobs"]).items():
+                leftover[m] = left(m) - q
+            alch = add_jobs(best, best["jobs"])
+            alch.alchemy_profit_jobs += best["jobs"]
+            alch.alchemy_sale_net_unit = best["net_unit"]
+            alch.alchemy_route_unit_cost = best["route_unit"]
 
     # Alchemy inputs the chain doesn't otherwise demand (e.g. Cadmium when
     # only Dysprosium chains are active) must exist as plan items so the
@@ -2555,6 +2930,13 @@ def _ration(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot, availabl
     # run; before it (allocation time) the runs its jobs will carry.
     R: dict[int, int] = {}
     J: dict[int, int] = {}
+    # Ruling (g), 2026-10-31: an alchemy row's FOR-SALE jobs are optional,
+    # so they are rationed after every chain consumer — the row's savings
+    # jobs stay a chain consumer here, its for-sale jobs form a third pass
+    # over what the chain left (below). alchemy_sale_split reads any cut
+    # as the for-sale share first, so install_runs keeps one meaning.
+    sale_R: dict[int, int] = {}
+    sale_J: dict[int, int] = {}
     for item in merged.values():
         if not item.buildable or not _type_known(ref, item.type_id):
             continue
@@ -2569,10 +2951,18 @@ def _ration(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot, availabl
             )
         else:
             continue
-        if runs > 0:
-            R[item.type_id], J[item.type_id] = runs, max(1, jobs)
+        if runs <= 0:
+            continue
+        if item.alchemy_for_type_id is not None and item.alchemy_profit_jobs > 0:
+            sale_jobs = min(jobs, item.alchemy_profit_jobs)
+            sale_runs = min(runs, sale_jobs * max(1, item.max_runs_per_job))
+            sale_R[item.type_id], sale_J[item.type_id] = sale_runs, max(1, sale_jobs)
+            runs, jobs = runs - sale_runs, jobs - sale_jobs
+            if runs <= 0:
+                continue
+        R[item.type_id], J[item.type_id] = runs, max(1, jobs)
     consumers = [merged[t] for t in R]
-    if not consumers:
+    if not consumers and not sale_R:
         return out
 
     def per_job(item: PlanItem) -> int:
@@ -2788,6 +3178,109 @@ def _ration(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot, availabl
         )
         for m, qty in draw(c, runs).items():
             remaining[m] -= qty
+
+    # --- for-sale alchemy jobs: what the chain left (ruling (g)) --------
+    # The same progressive filling as the intermediates, over the for-sale
+    # runs alone, against the stock the chain consumers left. A row's
+    # chain part and for-sale part add up on the row (install_per_job stays
+    # the formula's runs per job: a saturating reaction installs full jobs
+    # plus one short one); a mixed row names the for-sale part's binding
+    # material only when its chain part installed whole.
+    if sale_R:
+        sale_items = [merged[t] for t in sale_R]
+
+        def sale_draw(item: PlanItem, runs: int) -> dict[int, int]:
+            full = sale_R[item.type_id]
+            if runs >= full:
+                return draw_of(item, full, sale_J[item.type_id])
+            return _packed_draw(draw_of, item, runs, max(1, item.max_runs_per_job))
+
+        sale_planned = {c.type_id: sale_draw(c, sale_R[c.type_id]) for c in sale_items}
+        for d in sale_planned.values():
+            for m, qty in d.items():
+                if m not in out.available:
+                    out.available[m] = available_of(m)
+                    remaining[m] = out.available[m]
+                out.draw[m] = out.draw.get(m, 0) + qty
+        sale_frac: dict[int, float] = {}
+        sale_limited: dict[int, int | None] = {}
+        active = {c.type_id: c for c in sale_items}
+        while active:
+            best_f, best_m = 1.0, None
+            for m in {m for d in sale_planned.values() for m in d}:
+                weight = sum(sale_planned[t].get(m, 0) for t in active)
+                if weight <= 0:
+                    continue
+                taken = sum(sale_planned[t].get(m, 0) * f for t, f in sale_frac.items())
+                f = max(0.0, (remaining.get(m, 0) - taken) / weight)
+                if f < best_f:
+                    best_f, best_m = f, m
+            if best_m is None:
+                for t in list(active):
+                    sale_frac[t], sale_limited[t] = 1.0, None
+                break
+            for t in [t for t in active if sale_planned[t].get(best_m, 0) > 0]:
+                sale_frac[t], sale_limited[t] = best_f, best_m
+                del active[t]
+        sale_runs = {t: min(sale_R[t], _floor(sale_frac[t] * sale_R[t])) for t in sale_R}
+        while True:
+            exact: dict[int, int] = {}
+            for c in sale_items:
+                for m, qty in sale_draw(c, sale_runs[c.type_id]).items():
+                    exact[m] = exact.get(m, 0) + qty
+            over = [
+                (exact[m] - remaining.get(m, 0), m)
+                for m in exact if exact[m] > remaining.get(m, 0)
+            ]
+            if not over:
+                break
+            _excess, m = max(over)
+            drawers = [
+                c for c in sale_items
+                if sale_runs[c.type_id] > 0 and sale_draw(c, sale_runs[c.type_id]).get(m, 0) > 0
+            ]
+            if not drawers:
+                break
+            victim = max(drawers, key=lambda c: sale_draw(c, sale_runs[c.type_id]).get(m, 0))
+            sale_runs[victim.type_id] -= 1
+            sale_limited[victim.type_id] = m
+        # Flooring left slack: hand whole runs back, the most-cut share
+        # first, while they fit — the same progressive filling as the
+        # intermediates, so the figure is maximal, not just safe
+        # (review 2026-10-31).
+        while True:
+            added = False
+            for c in sorted(
+                sale_items,
+                key=lambda c: (sale_runs[c.type_id] / sale_R[c.type_id], c.name),
+            ):
+                runs = sale_runs[c.type_id]
+                if runs >= sale_R[c.type_id]:
+                    continue
+                before = sale_draw(c, runs)
+                after = sale_draw(c, runs + 1)
+                if all(
+                    exact.get(m, 0) - before.get(m, 0) + qty <= remaining.get(m, 0)
+                    for m, qty in after.items()
+                ):
+                    for m, qty in after.items():
+                        exact[m] = exact.get(m, 0) - before.get(m, 0) + qty
+                    sale_runs[c.type_id] = runs + 1
+                    added = True
+            if not added:
+                break
+        for c in sale_items:
+            t = c.type_id
+            runs = sale_runs[t]
+            total = out.startable_runs.get(t, 0) + runs
+            per = max(1, c.max_runs_per_job)
+            out.startable_runs[t] = total
+            out.startable_jobs[t] = -(-total // per) if total > 0 else 0
+            out.per_job[t] = per
+            if runs < sale_R[t] and out.limited_by.get(t) is None:
+                out.limited_by[t] = sale_limited.get(t)
+            for m, qty in sale_draw(c, runs).items():
+                remaining[m] -= qty
     out.remaining = remaining
     return out
 
@@ -2856,6 +3349,48 @@ def _install_check(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         finals = {
             p["final_product_type_id"] for p in store.active_pipelines(conn)
         }
+        def cut(item: PlanItem) -> None:
+            last = item.install_runs - (item.install_jobs - 1) * item.install_per_job
+            item.install_runs -= max(1, last)
+            item.install_jobs -= 1
+            # Only claim the pool where nothing else already bound the
+            # row: overwriting a short input's type id lost the one
+            # thing the user could act on (buy it), and blamed the
+            # pool for a row stock had already cut (review
+            # 2026-09-10). A row cut by both keeps the input.
+            if item.install_limited_by is None:
+                item.install_limited_by = _LIMITED_BY_SLOTS
+
+        # Ruling (g), 2026-10-31: for-sale alchemy jobs are optional, so
+        # they yield their lines first — the row still holding for-sale
+        # jobs with the least profit per slot loses one job at a time —
+        # before the classes below. alchemy_sale_split reads a cut as the
+        # for-sale share first, so the hold and the Sell in Jita panel
+        # follow.
+        if any(i.alchemy_profit_jobs > 0 for i in rows):
+            routes = ref.alchemy_routes()
+            yield_ = store.get_settings(conn).alchemy_reprocess_yield
+
+            def sale_jobs_left(i: PlanItem) -> int:
+                return (i.install_jobs or 0) - max(0, i.jobs_allocated - i.alchemy_profit_jobs)
+
+            def profit_per_slot(i: PlanItem) -> float:
+                route = routes.get(i.alchemy_for_type_id)
+                out_per_job = (
+                    math.floor(i.max_runs_per_job * route.composite_qty * yield_) if route else 0
+                )
+                return (
+                    (i.alchemy_sale_net_unit or 0.0) - (i.alchemy_route_unit_cost or 0.0)
+                ) * out_per_job
+
+            while over > 0:
+                candidates = [
+                    i for i in rows if i.alchemy_profit_jobs > 0 and sale_jobs_left(i) > 0
+                ]
+                if not candidates:
+                    break
+                cut(min(candidates, key=lambda i: (profit_per_slot(i), i.name)))
+                over -= 1
         order = sorted(
             rows,
             key=lambda i: (
@@ -2866,16 +3401,7 @@ def _install_check(conn, ref, merged: dict[int, PlanItem], snapshot: Snapshot):
         )
         for item in order:
             while over > 0 and (item.install_jobs or 0) > 0:
-                last = item.install_runs - (item.install_jobs - 1) * item.install_per_job
-                item.install_runs -= max(1, last)
-                item.install_jobs -= 1
-                # Only claim the pool where nothing else already bound the
-                # row: overwriting a short input's type id lost the one
-                # thing the user could act on (buy it), and blamed the
-                # pool for a row stock had already cut (review
-                # 2026-09-10). A row cut by both keeps the input.
-                if item.install_limited_by is None:
-                    item.install_limited_by = _LIMITED_BY_SLOTS
+                cut(item)
                 over -= 1
             if over <= 0:
                 break
@@ -4089,11 +4615,19 @@ def _invention_price_ids(conn, ref) -> tuple[set[int], set[int]]:
 
 def _add_alchemy_ids(conn, ref, ids: set[int]) -> None:
     """With alchemy enabled, routes feeding a demanded composite add their
-    formula inputs, unrefined product, and recovered outputs."""
-    if store.get_settings(conn).alchemy_enabled:
+    formula inputs, unrefined product, and recovered outputs; a
+    blacklisted route adds nothing (schema 14). With alchemy for profit
+    on, EVERY unblocked route joins — its composite too, whose Jita quote
+    is the sale reference the profit tail judges it by."""
+    settings = store.get_settings(conn)
+    if settings.alchemy_enabled:
+        blocked = store.alchemy_blacklist(conn)
         for route in ref.alchemy_routes().values():
-            if route.composite_id not in ids:
+            if route.composite_id in blocked:
                 continue
+            if route.composite_id not in ids and not settings.alchemy_for_profit:
+                continue
+            ids.add(route.composite_id)
             ids.add(route.unrefined_id)
             ids.update(m for m, _qty in route.recovered)
             ids.update(
@@ -4102,6 +4636,18 @@ def _add_alchemy_ids(conn, ref, ids: set[int]) -> None:
                     route.formula.blueprint_id, route.formula.activity_id
                 )
             )
+    # A composite a for-sale hold still values — live, or with units
+    # released without an attributable price — stays in the set whatever
+    # the flags say now (review 2026-10-31 #16): the Profit tab and the
+    # Ledger price those units at "today's" quote, so the quote must be
+    # today's. Nothing else of the route is needed for that.
+    from . import holds as _holds  # local: holds -> buying -> ledger -> engine
+
+    for hold in _holds.load(conn, ref, settings):
+        if hold.live or hold.manual_unpriced_qty or any(
+            r["unit_price"] is None and r["source"] != "manual" for r in hold.releases
+        ):
+            ids.add(hold.composite_type_id)
 
 
 def _add_compressed_ids(conn, ref, ids: set[int]) -> set[int]:
@@ -4407,7 +4953,10 @@ def _replace_run_row(
     3. the items, then the invention vintage.
 
     The index_run row is UPDATEd, never deleted, so run_purchase,
-    run_purchase_refine, job_link, cost_lot and finished_batch keep
+    run_purchase_refine, job_link, cost_lot, finished_batch and the
+    alchemy_hold rows (ON DELETE CASCADE, with their releases behind
+    them — the installed for-sale pile would otherwise become chain
+    stock on the next plan, review 2026-10-31 #86) keep
     pointing at it; nothing but index_run_item_pipeline references
     index_run_item_id. Written inline here (the engine owns this persist
     SQL), not as a store helper. The caller inserts the new rows under
@@ -4526,11 +5075,38 @@ def plan_index_run(
     steady_shares = _cycle_need(conn, ref, merged)
     for item in merged.values():
         item.installed_qty = installed.get(item.type_id, 0)
-    _apply_targets(conn, ref, merged, snapshot, alchemy)
+    # User rulings 2026-10-31: the live for-sale holds hide the sale pile
+    # from the composites' stock (holds.bites, anchored to the jobs ESI
+    # shows installed), the profit tail's capacity is net of the reaction
+    # jobs this cycle already started, and the formula's installed jobs
+    # count toward the shared cap. Steady state plans with alchemy off and
+    # reads none of it.
+    from . import holds as _holds
+
+    settings_ = store.get_settings(conn)
+    running_reactions = 0
+    installed_jobs: dict[int, int] = {}
+    if alchemy and settings_.alchemy_enabled:
+        running_reactions = store.running_jobs_started_after(
+            conn, config.ACTIVITY_REACTION, cycle_cut
+        )
+        installed_jobs = {
+            route.unrefined_id: store.installed_jobs_started_after(
+                conn, route.unrefined_id, cycle_cut
+            )
+            for route in ref.alchemy_routes().values()
+        }
+    _apply_targets(
+        conn, ref, merged, snapshot, alchemy,
+        holds=_holds.bites(conn, ref, settings_) if alchemy else None,
+    )
     _size_jobs(conn, ref, merged)
     _allocate_slots(conn, ref, merged, snapshot, backfill=backfill)
     if alchemy:
-        _alchemy_pass(conn, ref, merged, snapshot)
+        _alchemy_pass(
+            conn, ref, merged, snapshot,
+            running_reactions=running_reactions, installed_jobs=installed_jobs,
+        )
     _finalize(conn, ref, merged, snapshot)
 
     # Sizing feedback loop (decision 2026-08-21; iterated to convergence
@@ -4680,7 +5256,10 @@ def plan_index_run(
         _size_jobs(conn, ref, merged)
         _allocate_slots(conn, ref, merged, snapshot, backfill=backfill)
         if alchemy:
-            _alchemy_pass(conn, ref, merged, snapshot)
+            _alchemy_pass(
+                conn, ref, merged, snapshot,
+                running_reactions=running_reactions, installed_jobs=installed_jobs,
+            )
         _finalize(conn, ref, merged, snapshot)
 
     # v1.25, Phase 7.5: with the allocation converged and every buy
@@ -4691,6 +5270,12 @@ def plan_index_run(
     compressed_saving = (
         _sourcing_pass(conn, ref, merged, snapshot) if sourcing else None
     )
+    # Ruling (f), 2026-10-31: the for-sale rows' cost of goods follows the
+    # fills just priced; their choice and ranking stood at the Phase 1
+    # quote. Before the install check, so the hold and the Sell in Jita
+    # panel carry the re-stamped figure.
+    if alchemy and sourcing:
+        _restamp_route_costs(conn, ref, merged, snapshot)
 
     # v1.27.1, Phase 7.6: with the jobs and every buy final, check what
     # stock on hand, in-flight output and this cycle's buys can actually
@@ -4827,10 +5412,11 @@ def plan_index_run(
                     compressed_alloc, compressed_landed_isk,
                     compressed_tax_isk, direct_landed_isk,
                     on_hand_from_ore_qty, installed_qty, requested_qty,
-                    wave_qty
+                    wave_qty, alchemy_profit_jobs, alchemy_sale_net_unit,
+                    alchemy_route_unit_cost, held_for_sale_qty, held_from_credit_qty
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                           ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     index_run_id,
@@ -4889,6 +5475,9 @@ def plan_index_run(
                     item.compressed_wanted_qty,
                     item.market_buy_qty,
                     item.market_fallback_qty,
+                    # ... the install check, cycle need, compressed
+                    # figures, ore stock, installed/requested/wave, then
+                    # the schema-14 for-sale columns at the end.
                     item.install_runs,
                     item.install_jobs,
                     item.install_limited_by,
@@ -4912,6 +5501,11 @@ def plan_index_run(
                     item.installed_qty,
                     item.requested_qty,
                     item.wave_qty,
+                    item.alchemy_profit_jobs,
+                    item.alchemy_sale_net_unit,
+                    item.alchemy_route_unit_cost,
+                    item.held_for_sale_qty,
+                    item.held_from_credit_qty,
                 ),
             )
             item_id = cur.lastrowid
@@ -4929,6 +5523,11 @@ def plan_index_run(
                     for pipeline_id, qty in item.pipeline_share.items()
                 ],
             )
+        # User rulings 2026-10-31: this plan's for-sale holds — the
+        # proposal and the savings share while no job of the formula is
+        # installed beyond the row's baseline, frozen once one is, never
+        # deleted (holds.write_plan_holds).
+        _holds.write_plan_holds(conn, ref, store.get_settings(conn), index_run_id, merged)
         conn.executemany(
             "INSERT INTO index_run_invention (index_run_id, pipeline_id, "
             "t1_blueprint_id, decryptor_type_id, probability, invented_me, "

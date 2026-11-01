@@ -21,12 +21,17 @@
     {% if show_category %}<td class="cat muted">{{ x.group }}</td>{% endif %}
     <td class="num">{{ x.cycle_need|qty }}</td>
     <td class="num">{{ x.target|qty }}</td>
-    <td class="num"{% if x.on_hand_from_ore %}
-        title="incl. {{ x.on_hand_from_ore|qty }} from hangar compressed ore — what it reprocesses into at your asserted yields; {{ (x.on_hand - x.on_hand_from_ore)|qty }} in the hangar itself"{% endif %}>
-      {{ x.on_hand|qty }}{% if x.on_hand_from_ore %}<span class="muted">*</span>{% endif %}</td>
-    <td class="num"{% if x.alchemy_credit %}
-        title="incl. {{ x.alchemy_credit|qty }} expected from unrefined stock/jobs at the reprocess yield"{% endif %}>
-      {{ x.in_jobs|qty }}{% if x.alchemy_credit %}<span class="muted">*</span>{% endif %}</td>
+    {% set held = x.held_for_sale if x.held_for_sale is defined else 0 %}
+    {% set held_credit = x.held_from_credit if x.held_from_credit is defined else 0 %}
+    {% set held_hangar = held - held_credit %}
+    {% set until = x.held_until if x.held_until is defined else '' %}
+    {% set hold_note = " held for sale (alchemy run for profit) are left out of On hand / In jobs and so stay in the deficit" ~ (", " ~ until if until else "") %}
+    <td class="num"{% if x.on_hand_from_ore or held_hangar %}
+        title="{% if x.on_hand_from_ore %}incl. {{ x.on_hand_from_ore|qty }} from hangar compressed ore — what it reprocesses into at your asserted yields; {{ (x.on_hand - x.on_hand_from_ore)|qty }} in the hangar itself{% endif %}{% if held_hangar %}{% if x.on_hand_from_ore %}; {% endif %}{{ held_hangar|qty }} more units in the hangar{{ hold_note }}{% endif %}"{% endif %}>
+      {{ x.on_hand|qty }}{% if x.on_hand_from_ore or held_hangar %}<span class="muted">*</span>{% endif %}</td>
+    <td class="num"{% if x.alchemy_credit or held_credit %}
+        title="{% if x.alchemy_credit %}incl. {{ x.alchemy_credit|qty }} expected from unrefined stock/jobs at the reprocess yield{% endif %}{% if held_credit %}{% if x.alchemy_credit %}; {% endif %}{{ held_credit|qty }} more units expected from the formula's unrefined stock or jobs{{ hold_note }}{% endif %}"{% endif %}>
+      {{ x.in_jobs|qty }}{% if x.alchemy_credit or held_credit %}<span class="muted">*</span>{% endif %}</td>
     <td class="num">{{ x.deficit|qty }}</td>
     <td class="flags">
       <span class="badge {% if x.status == 'covered' %}good{% elif x.status == 'buy' %}warn{% elif x.status == 'unmet' %}bad{% elif x.status == 'alchemy' %}accent{% endif %}"

@@ -180,9 +180,9 @@ def test_jobs_covered_chains_the_pulls_ninety_day_reach_over_the_window(conn):
 
 def test_schema_12_database_gains_the_job_record(tmp_path, monkeypatch):
     """The upgrade: a database stamped 12 gains industry_job and its index
-    on the next ensure_schema, the stamp moves to 13 and the pre-upgrade
-    backup lands (in THIS temp dir). Everything the old stamp protected
-    is still there."""
+    on the next ensure_schema, the stamp moves to the current version and
+    the pre-upgrade backup lands (in THIS temp dir). Everything the old
+    stamp protected is still there."""
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "old.sqlite")
     c = sqlite3.connect(tmp_path / "old.sqlite")
@@ -198,7 +198,7 @@ def test_schema_12_database_gains_the_job_record(tmp_path, monkeypatch):
     store.ensure_schema(c)
 
     assert list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))
-    assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 13
+    assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     tables = {r["name"] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     indexes = {r["name"] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     assert {"industry_job", "industry_job_pull", "run_purchase", "esi_snapshot"} <= tables

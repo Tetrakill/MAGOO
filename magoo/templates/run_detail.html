@@ -38,7 +38,7 @@
     {% if run.status != 'complete' %}
     <form method="post"
           action="{{ url_for('run_complete', index_run_id=run.index_run_id) }}"
-          data-confirm="Mark run {{ run.run_number }} executed? The {{ buy_total|isk_short }} ISK buy list and installed jobs enter cost history.">
+          data-confirm="Mark run {{ run.run_number }} executed? The {{ buy_total|isk_short }} ISK buy list and installed jobs enter cost history.{% if ending_holds is defined and ending_holds %} It also ends {% for e in ending_holds %}{% if e.plan_figure %}run {{ e.run_number }}'s plan-figure hold — {{ e.remaining|qty }} {{ e.name }} count as stock again{% else %}run {{ e.run_number }}'s for-sale hold — {{ e.remaining|qty }} {{ e.name }} unsold now count as stock{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}.{% endif %}">
       <button class="primary">✓ Mark executed</button>
     </form>
     {% else %}
@@ -87,6 +87,20 @@
     <span class="label">Low stock</span>
     <span class="value {% if low_stock %}warn{% endif %}" title="won't sustain the next run">{{ low_stock|length }}</span>
   </div>
+  {# Schema 14 / user rulings 2026-10-31: alchemy run FOR SALE — the
+     composite units ESI shows installed for sale (the run's hold) plus what
+     the listed jobs would add, and what selling them in Jita should net
+     over the route's cost. Rows sold or returned to stock are the Profit
+     tab's and are not summed here (D7); the job count is the cut-adjusted
+     one, the plan's on hover (review #35). Absent without either. #}
+  {% if for_sale_qty is defined and for_sale_qty %}
+  {% set fs_jobs_planned = for_sale_jobs_planned if for_sale_jobs_planned is defined else for_sale_jobs %}
+  {% set fs_hold = for_sale_hold_qty if for_sale_hold_qty is defined else 0 %}
+  <div class="stat">
+    <span class="label">For sale</span>
+    <span class="value{% if for_sale_profit > 0 %} good{% elif for_sale_profit < 0 %} bad{% endif %}" title="{{ for_sale_qty|qty }} composite units still to sell: {% if fs_hold %}{{ fs_hold|qty }} {% if for_sale_plan_figure is defined and for_sale_plan_figure %}at the plan's figure (the job record does not cover this run's buying window yet){% else %}still held from the for-sale jobs ESI shows installed{% endif %}{% if for_sale_jobs %} + {% endif %}{% endif %}{% if for_sale_jobs %}~{{ (for_sale_qty - fs_hold)|qty }} from {{ for_sale_jobs }} alchemy job{{ 's' if for_sale_jobs != 1 }} to run now for profit{% if fs_jobs_planned != for_sale_jobs %} (the plan listed {{ fs_jobs_planned }} — an install cut trims the for-sale jobs first){% endif %}{% endif %} — reprocess, then sell in Jita for ~{{ for_sale_profit|isk }} ISK over the route's cost{% if for_sale_unquoted is defined and for_sale_unquoted %} (a row has no Jita quote cached — its profit is not in this figure; refresh prices){% endif %} (the Sell in Jita list; a pile sold or returned to stock is on the Profit tab)">{{ for_sale_qty|qty }}{% if for_sale_unquoted is defined and for_sale_unquoted %} <span class="badge warn" title="no Jita quote cached for a row — refresh prices">no quote</span>{% endif %}<span class="sub">· ~{{ for_sale_profit|isk_short }}</span></span>
+  </div>
+  {% endif %}
   {# v1.29 (ruling 2026-09-24): purchasing left this page, so every badge
      describing the BUY LIST — unpriced, split, unsourced, via compressed,
      via the structure market — moved to the Buy tab's header. What stays
@@ -140,7 +154,9 @@
     drawn on by more jobs than stock on hand, in-flight jobs and this
     cycle's buys can feed. Finals claim a scarce input first, highest
     return on cost first; intermediates that share one each install the
-    same share of their plan. The job tables already show the reduced
+    same share of their plan; for-sale alchemy jobs (Alchemy for Profit)
+    only get what the chain leaves, and are the first jobs a full pool
+    drops. The job tables already show the reduced
     jobs, with the plan's own figures in their tooltips — the buy list
     on the Buy tab still covers the full plan.</p>
   {% if install_finals %}
@@ -214,13 +230,21 @@
 {% else %}<p class="muted">No reaction jobs.</p>{% endif %}
 </details>
 
-{% if alchemy %}
+{% set any_for_sale = alchemy_sales is defined and alchemy_sales %}
+{% if alchemy or any_for_sale %}
 <details class="section" open data-key="alchemy">
-<summary><h2>Alchemy <span class="muted">— {{ alchemy|length }} items,
-  {{ alchemy|map(attribute='item')|list|slots }} slots</span></h2></summary>
+<summary><h2>Alchemy <span class="muted">— {% if alchemy %}{{ alchemy|length }} items,
+  {{ alchemy|map(attribute='item')|list|slots }} slots{% else %}no jobs to run now — the for-sale pile below{% endif %}</span></h2></summary>
+{% if alchemy %}
 <p class="muted">Cheaper than the direct reaction, or than buying the
   composite, at landed prices (venue price + courier); runs in reaction
-  slots no startable direct job holds. Install the unrefined reaction jobs
+  slots no startable direct job holds.{% if any_for_sale %} The for-sale
+  share of a row (its <b>for sale</b> badge says how many jobs) runs for
+  profit in the slots left after that: that composite is sold in Jita and
+  not counted toward the chain while it is held for sale (an unsold
+  remainder returns to stock when the hold ends) —
+  the row's other jobs still are.{% endif %}
+  Install the unrefined reaction jobs
   below, then <b>reprocess the output</b> (expected at
   {{ (alchemy_yield * 100)|round(0)|int }}% yield — scrapmetal rules, so
   reprocessing rigs don't help).</p>
@@ -230,19 +254,32 @@
       <th class="num">Runs/job</th><th class="num">Jobs</th>
       <th class="num">Build qty</th>
       <th class="num">Time/job</th>
-      <th class="num">Savings</th><th class="flags"></th></tr></thead>
+      <th class="num">{{ 'Savings / profit' if any_for_sale else 'Savings' }}</th><th class="flags"></th></tr></thead>
   {% for a in alchemy %}
   {% set i = a.item %}
+  {% set sale_qty = a.sale_qty if a.sale_qty is defined else 0 %}
+  {% set new_sale_qty = a.new_sale_qty if a.new_sale_qty is defined else sale_qty %}
+  {% set hold_qty = a.hold_qty if a.hold_qty is defined else 0 %}
+  {% set profit_jobs = a.profit_jobs if a.profit_jobs is defined else 0 %}
+  {% set sale_jobs = a.sale_jobs if a.sale_jobs is defined else profit_jobs %}
+  {% set jobs_now = a.jobs_now if a.jobs_now is defined else i.jobs_allocated %}
+  {% set profit = (a.profit_isk if a.profit_isk is defined else none) %}
+  {% set active_qty = a.active_qty if a.active_qty is defined else sale_qty %}
   <tr>
     <td>{{ i.name }}</td>
 {{ m.job_cells(i) }}
-    {% if a.benchmark_unit is not none and a.alchemy_unit is not none %}
+    {% if a.benchmark_unit is not none and a.alchemy_unit is not none and a.expected_qty %}
     {% set savings = (a.benchmark_unit - a.alchemy_unit) * a.expected_qty %}
-    <td class="num{% if savings > 0 %} good{% endif %}" data-sort="{{ savings }}"
-        title="{{ a.benchmark_unit|isk }} {{ a.benchmark_label }} vs {{ a.alchemy_unit|isk }} alchemy ISK per {{ a.composite_name }}, × {{ a.expected_qty|qty }} units = {{ savings|isk }}">
-      {{ savings|isk_short }}</td>
+    {% set total = savings + (profit or 0) %}
+    <td class="num{% if total > 0 %} good{% endif %}" data-sort="{{ total }}"
+        title="{{ a.benchmark_unit|isk_unit }} {{ a.benchmark_label }} vs {{ a.alchemy_unit|isk_unit }} alchemy ISK per {{ a.composite_name }}, × {{ a.expected_qty|qty }} units = {{ savings|isk }} saved{% if profit is not none %}; plus {{ active_qty|qty }} units still to sell: {{ a.sale_net_unit|isk_unit }} net in Jita vs {{ a.route_unit_cost|isk_unit }} route ISK per unit = {{ profit|isk }} profit = {{ total|isk }} ISK in all{% endif %}">
+      {{ total|isk_short }}</td>
+    {% elif profit is not none %}
+    <td class="num{% if profit > 0 %} good{% endif %}" data-sort="{{ profit }}"
+        title="sold in Jita: {{ a.sale_net_unit|isk_unit }} net vs {{ a.route_unit_cost|isk_unit }} route ISK per {{ a.composite_name }}, × {{ active_qty|qty }} units still to sell = {{ profit|isk }} profit">
+      {{ profit|isk_short }}</td>
     {% else %}<td class="num">—</td>{% endif %}
-    <td class="flags">{{ m.install_badge(i) }}</td>
+    <td class="flags">{% if profit_jobs or sale_qty %}<span class="badge accent" title="{{ sale_jobs }} of {{ jobs_now }} job{{ 's' if jobs_now != 1 }} run for profit{% if sale_jobs != profit_jobs or jobs_now != i.jobs_allocated %} (the plan listed {{ profit_jobs }} of {{ i.jobs_allocated }} — an install cut trims the for-sale jobs first){% endif %}: {% if run.status != 'complete' and new_sale_qty %}~{{ new_sale_qty|qty }} {{ a.composite_name }} to sell in Jita after the reprocess{% if hold_qty %}; {% endif %}{% endif %}{% if hold_qty %}{{ hold_qty|qty }} {{ a.composite_name }} {% if a.hold_plan_figure is defined and a.hold_plan_figure %}at the plan's figure (the job record does not cover this run's buying window yet){% else %}from the for-sale jobs ESI shows installed (the run's hold{% if a.hold_status is defined and a.hold_status in ('sold', 'returned to stock') %} — {{ a.hold_status }}{% endif %}){% endif %}{% elif run.status == 'complete' %}nothing of it on the ESI job record yet{% endif %}">for sale</span>{% endif %}{{ m.install_badge(i) }}</td>
   </tr>
   {% endfor %}
 </table>
@@ -251,12 +288,79 @@
   <h3 class="subhead" style="margin-top:0">After the jobs deliver — reprocess:</h3>
   <ul style="margin:.4rem 0 0 1.2rem">
     {% for a in alchemy %}
+    {% set sale_qty = a.sale_qty if a.sale_qty is defined else 0 %}
+    {% set new_sale_qty = a.new_sale_qty if a.new_sale_qty is defined else sale_qty %}
     <li>Reprocess <b>{{ (a.build_qty if a.build_qty is defined else a.item.recommended_build_qty)|qty }} {{ a.item.name }}</b>
-        → ~{{ a.expected_qty|qty }} {{ a.composite_name }}{% for name, qty in a.recovered %}
-        (+{{ qty|qty }} {{ name }} back){% endfor %}</li>
+        → ~{{ (a.expected_qty + new_sale_qty)|qty }} {{ a.composite_name }}{% for name, qty in a.recovered %}
+        (+{{ qty|qty }} {{ name }} back){% endfor %}{% if new_sale_qty %}
+        — {% if a.expected_qty %}{{ new_sale_qty|qty }} of them{% else %}all{% endif %} for sale{% endif %}</li>
     {% endfor %}
   </ul>
 </div>
+{% endif %}
+{% if any_for_sale %}
+<div class="panel" id="sell-in-jita">
+  <h3 class="subhead" style="margin-top:0">Sell in Jita</h3>
+  <p class="muted" style="margin:.2rem 0 .6rem">Composite from the
+    for-profit jobs, after the reprocess. Sell qty follows the for-sale
+    jobs ESI shows installed{% if run.status != 'complete' %} plus what the
+    jobs listed above would add{% endif %}; expected profit is the Jita
+    quote at your hub pricing basis less sales tax, broker fee, the SCC
+    surcharge and outbound freight, less the route's cost (inputs landed
+    plus the job fee, less what the reprocess gives back) — the per-unit
+    figures are on hover. These units are <b>held for sale</b>: the plan
+    does not count them as stock while the jobs run and for one full run
+    after they deliver, unless the ESI update sees them sold (a market sale
+    or an item-exchange contract you issued) or you mark them sold here
+    (a trade, a hand-over, a want-to-buy contract you accepted, the pile
+    sold unrefined).</p>
+  <div class="tablewrap">
+  <table class="aligned" style="max-width: 64rem">
+    <thead><tr><th>Composite</th><th class="num">Sell qty</th>
+        <th class="num">Released</th><th class="num">Held</th>
+        <th class="num">Expected profit</th><th class="flags">Status</th><th></th></tr></thead>
+    {% for s in alchemy_sales %}
+    {% set status = s.status if s.status is defined else none %}
+    {% set has_hold = s.hold if s.hold is defined else (s.hold_planned is defined and s.hold_planned is not none) %}
+    {% set live = s.live if s.live is defined else false %}
+    {% set until = s.expiry_words if s.expiry_words is defined else '' %}
+    {% set jobs_planned = s.jobs_planned if s.jobs_planned is defined else s.jobs %}
+    {% set hold_qty = s.hold_qty if s.hold_qty is defined else 0 %}
+    <tr>
+      <td>{{ s.composite_name }}</td>
+      <td class="num" title="{% if has_hold and hold_qty %}{{ hold_qty|qty }} from the for-sale jobs ESI shows installed{% if s.plan_figure is defined and s.plan_figure %} (the plan's figure — the job record does not cover this run's buying window){% endif %}{% if s.sell_qty > hold_qty %} + {{ (s.sell_qty - hold_qty)|qty }} from {{ s.jobs }} job{{ 's' if s.jobs != 1 }} to run now{% endif %}{% elif s.jobs %}{{ s.jobs }} job{{ 's' if s.jobs != 1 }} to run now for profit{% if jobs_planned != s.jobs %} (the plan listed {{ jobs_planned }} — an install cut trims the for-sale jobs first){% endif %}{% else %}nothing installed for sale and nothing to run{% endif %}">{{ s.sell_qty|qty }}</td>
+      <td class="num" title="{% if has_hold %}{{ s.sold|qty }} matched from market sales and item-exchange contracts{% if s.by_hand is defined and s.by_hand %} + {{ s.by_hand|qty }} marked sold by hand ({{ s.by_hand_priced|qty }} with a price, {{ s.by_hand_unpriced|qty }} without){% endif %}{% else %}no hold recorded for this run — re-plan to create it{% endif %}">{% if has_hold %}{{ s.released|qty }}{% else %}—{% endif %}</td>
+      <td class="num" title="{% if not has_hold %}—{% elif live and s.held %}hidden from the plan's stock {{ until }}{% elif s.held %}the hold ended — these units count as ordinary stock again (the Profit tab values them at nothing){% elif status == 'not installed' %}nothing installed yet{% else %}every unit is accounted for{% endif %}">{% if has_hold %}{{ s.held|qty }}{% else %}—{% endif %}</td>
+      <td class="num{% if s.profit_isk is not none and s.profit_isk > 0 %} good{% endif %}"
+          title="{% if s.profit_isk is not none %}{{ s.profit_isk|isk }} ISK — {{ s.net_unit|isk_unit }} net in Jita{% if s.profit_today is defined and s.profit_today %} at today's quote{% endif %} − {{ s.route_unit|isk_unit }} route cost = {{ (s.net_unit - s.route_unit)|isk_unit }} ISK per {{ s.composite_name }}, × {{ (s.active_qty if s.active_qty is defined else s.sell_qty)|qty }} units still to sell{% elif status in ('sold', 'returned to stock') %}this pile is {{ status }} — what it earned is {% if run.status == 'complete' %}on the Profit tab{% else %}in the Ledger's Alchemy sales (the Profit tab activates at Mark executed){% endif %}{% elif status == 'not installed' %}nothing installed yet — the figure appears once ESI shows the jobs{% elif s.net_unit is none %}no Jita quote cached — refresh prices{% elif s.route_unit is none %}no route cost recorded on this run{% else %}per-unit figures not recorded on this run{% endif %}">{% if s.profit_isk is not none %}{{ s.profit_isk|isk_short }}{% else %}—{% endif %}</td>
+      <td class="flags">{% if status %}<span class="badge {% if status == 'in flight' %}accent{% elif status == 'delivered' %}good{% elif status == 'returned to stock' %}warn{% endif %}" title="{% if status == 'not installed' %}ESI shows no for-sale job of this route inside the run's buying window yet{% if s.hold_planned %} — the plan listed ~{{ s.hold_planned|qty }} units{% endif %}{% elif status == 'plan figure' %}the ESI job record does not cover this run's buying window yet — the plan's figure stands in until the next ESI update; held {{ until }}{% elif status == 'in flight' %}for-sale jobs are running — held {{ until }}{% elif status == 'delivered' %}every for-sale job has delivered{% if s.delivered_at %} ({{ s.delivered_at.strftime('%Y-%m-%d %H:%M') }}){% endif %} — held {{ until }}{% elif status == 'sold' %}every delivered unit is accounted for — market, contract or by hand{% else %}the hold ended when run {{ s.expires_after }} was marked executed — the {{ s.held|qty }} unsold count as ordinary stock; the Profit tab values them at nothing and keeps their route cost{% endif %}">{{ status }}</span>{% endif %}{% if s.plan_figure is defined and s.plan_figure and status != 'plan figure' %}<span class="badge warn" title="the ESI job record does not cover this run's whole buying window, so Sell qty is the plan's figure, not what was installed">plan figure</span>{% endif %}</td>
+      <td class="end">{% if s.can_mark_sold is defined and s.can_mark_sold and not superseded %}<form class="inline addrow" method="post" action="{{ url_for('alchemy_hold_sold', index_run_id=run.index_run_id, composite_id=s.composite_id) }}"
+          data-confirm="Mark {{ s.composite_name }} sold by hand? The units come off run {{ s.mark_sold_runs|join(' then run ') }}'s delivered hold, oldest first, and the next plan counts them as stock. A blank price books neither revenue nor cost; a price books revenue at that ISK per unit, no fees deducted.">
+          <input name="qty" type="number" min="1" max="{{ s.mark_sold_max }}" placeholder="units" required aria-label="{{ s.composite_name }} units sold by hand" style="width:6.5rem">
+          <input name="price" type="number" min="0" step="any" placeholder="ISK / unit" aria-label="{{ s.composite_name }} ISK received per unit (optional)" style="width:7.5rem">
+          <button aria-label="Mark {{ s.composite_name }} sold" title="a sale the ESI update cannot see (a trade, a hand-over, a want-to-buy contract you accepted, the pile sold unrefined): marks run {{ s.mark_sold_run }}'s delivered units sold, oldest run first; with a price the units book revenue as entered, without one neither revenue nor cost">Mark sold</button></form>{% if s.mark_sold_run != run.run_number %}<div class="muted" style="font-size:.78rem">marks run {{ s.mark_sold_run }}'s delivered units</div>{% endif %}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    <tr class="total"><td><b>Total</b></td>
+      <td class="num" title="the Sell qty of the rows still to sell (in flight, delivered, a plan figure, not installed yet, or new jobs beside a sold pile) — a pile sold or returned to stock with nothing new is the Profit tab's"><b>{{ (for_sale_total_qty if for_sale_total_qty is defined else for_sale_qty)|qty }}</b></td><td></td><td></td>
+      <td class="num{% if for_sale_profit > 0 %} good{% elif for_sale_profit < 0 %} bad{% endif %}" title="{{ for_sale_profit|isk }} ISK"><b>{{ for_sale_profit|isk_short }}</b></td><td></td><td></td></tr>
+  </table>
+  </div>
+  {% set ns = namespace(marks=false) %}
+  {% for s in alchemy_sales %}{% if s.by_hand_rows is defined and s.by_hand_rows %}{% set ns.marks = true %}{% endif %}{% endfor %}
+  {% if ns.marks %}
+  <p class="muted" style="margin:.6rem 0 .2rem">Marked sold by hand — undo puts the units back on hold (live holds only):</p>
+  <ul style="margin:0 0 0 1.2rem">
+    {% for s in alchemy_sales %}{% for x in s.by_hand_rows %}
+    <li>{{ x.qty|qty }} {{ s.composite_name }} on run {{ x.run_number }}'s hold, {{ x.when[:16].replace('T', ' ') }} —
+      {% if x.unit_price is not none %}<span title="{{ x.unit_price|isk_unit }} ISK per unit as entered — booked as revenue, no fees deducted">{{ x.unit_price|isk_short }} ISK / unit</span>{% else %}no price (neither revenue nor cost){% endif %}
+      {% if x.live and not superseded %}<form class="inline" method="post" action="{{ url_for('alchemy_release_undo', index_run_id=run.index_run_id, release_id=x.release_id) }}"
+          data-confirm="Undo the by-hand mark of {{ x.qty|qty }} {{ s.composite_name }} on run {{ x.run_number }}'s hold? The units are held for sale again."><button class="mini" aria-label="undo the by-hand mark of {{ x.qty|qty }} {{ s.composite_name }}">undo</button></form>{% endif %}</li>
+    {% endfor %}{% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% endif %}
 </details>
 {% endif %}
 

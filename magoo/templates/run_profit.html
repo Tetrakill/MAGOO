@@ -64,5 +64,49 @@ were actually bought at; for a what-if at today's prices see
 {% else %}
 <p class="muted">No active pipeline is attributable to this run.</p>
 {% endif %}
+
+{# User rulings 2026-10-31 (D7): alchemy run FOR SALE, apart from the
+   per-hull cards — its line is inside the cycle totals above. Planned is
+   what ESI shows installed for sale (holds.load), never the plan's
+   proposal; Planned = Sold + By hand + Still held. #}
+{% if alchemy is defined and alchemy %}
+<details class="section" open data-key="alchemy-sale">
+<summary><h2>Alchemy for sale <span class="muted">— {{ alchemy|length }} composite{{ 's' if alchemy|length != 1 }}</span></h2></summary>
+<p class="muted">Composite this run's for-profit alchemy jobs made to sell,
+  not for the chain — Planned is what ESI shows installed for sale, after
+  the reprocess. Sold units are the market sales and item-exchange
+  contracts matched to this run's hold (net by where each sold); units
+  marked sold by hand with a price book that price as revenue, no fees
+  deducted. Units still held are valued at today's Jita quote net of fees
+  while the hold is live, an estimate, and at nothing once it has ended
+  (returned to stock). Cost is the plan's route cost per unit — inputs
+  landed plus the job fee, less what the reprocess gave back — on every
+  unit except by-hand marks without a price.</p>
+<div class="tablewrap">
+<table class="sortable aligned">
+  <thead><tr><th>Composite</th><th class="num">Planned</th><th class="num">Sold</th>
+      <th class="num">Realized net</th><th class="num">Still held</th>
+      <th class="num">Est. net</th><th class="num">Cost</th>
+      <th class="num">Profit</th><th class="flags"></th></tr></thead>
+  {% for a in alchemy %}
+  {% set manual = a.manual if a.manual is defined else 0 %}
+  {% set costed = a.costed_units if a.costed_units is defined else a.units %}
+  {% set held_est = a.live and a.remaining %}
+  <tr>
+    <td>{{ a.name }}</td>
+    <td class="num" data-sort="{{ a.units }}" title="{% if a.plan_figure %}the plan's figure: the ESI job record does not cover this run's whole buying window, so what was installed for sale is not on file{% else %}composite units from the for-sale jobs ESI shows installed inside this run's buying window, after the reprocess{% endif %} — Planned = Sold + By hand + Still held">{{ a.units|qty }}</td>
+    <td class="num" data-sort="{{ a.sold }}" title="{{ a.sold|qty }} sold on the market or by contract{% if manual %}; {{ manual|qty }} marked sold by hand — {{ a.manual_priced|qty }} with a price (revenue as entered), {{ a.manual_unpriced|qty }} without (neither revenue nor cost){% endif %}">{{ a.sold|qty }}{% if manual %}<span class="sub">+ {{ manual|qty }} by hand · {{ a.manual_priced|qty }} priced, {{ a.manual_unpriced|qty }} unpriced</span>{% endif %}</td>
+    <td class="num" title="{{ a.realized|isk }} ISK — market and contract sales after sell fees at the venue each unit sold{% if a.manual_priced %}, plus {{ a.manual_priced|qty }} units marked sold by hand at the price entered (no fees deducted){% endif %}{% if a.unpriced_units %}; {{ a.unpriced_units|qty }} units sold in contracts with no attributable price are in Est. net at today's quote{% endif %}">{{ a.realized|isk_short }}</td>
+    <td class="num" data-sort="{{ a.remaining }}" title="{% if a.live %}hidden from the plan's stock {{ a.expiry_words }}{% elif a.remaining %}the hold ended — these units count as ordinary stock again; estimated at nothing here, their route cost kept{% else %}every unit is accounted for{% endif %}">{{ a.remaining|qty }}</td>
+    <td class="num" title="{% if a.estimate is not none %}{{ a.estimate|isk }} ISK — {% if held_est %}{{ a.remaining|qty }} still held × {{ a.net_unit|isk_unit }} net at today's Jita quote{% endif %}{% if a.unpriced_units %}{% if held_est %} + {% endif %}{{ a.unpriced_units|qty }} units sold without an attributable price × the same quote = {{ a.est_unpriced|isk }} ISK{% endif %}{% if a.returned_units %}{% if held_est or a.unpriced_units %}; {% endif %}nothing for the {{ a.returned_units|qty }} returned to stock{% endif %}{% if not held_est and not a.unpriced_units and not a.returned_units %}nothing left to estimate{% endif %}{% else %}no Jita quote cached for this composite — {% if a.no_quote %}the {{ a.remaining|qty }} still held are left out of Est. net and their route cost out of Cost{% else %}the {{ a.unpriced_units|qty }} units sold without an attributable price cannot be valued{% endif %}; hit Refresh{% endif %}">{% if a.estimate is not none %}{{ a.estimate|isk_short }}{% else %}—{% endif %}</td>
+    <td class="num" title="{% if a.cost is not none %}{{ a.cost|isk }} ISK — {{ costed|qty }} × {{ a.route_unit|isk_unit }} route cost per unit{% if a.manual_unpriced %}; {{ a.manual_unpriced|qty }} marked sold without a price left out{% endif %}{% if a.no_quote %}; {{ a.remaining|qty }} still held without a quote left out{% endif %}{% if a.net_unit is none and a.unpriced_units %}; {{ a.unpriced_units|qty }} sold without an attributable price and no quote to value them left out{% endif %}{% else %}no route cost recorded{% endif %}">{% if a.cost is not none %}{{ a.cost|isk_short }}{% else %}—{% endif %}</td>
+    <td class="num {% if a.profit is not none and a.profit < 0 %}bad{% elif a.profit %}good{% endif %}" title="{% if a.profit is not none %}{{ a.profit|isk }} ISK — realized net + est. net − cost{% else %}no route cost recorded{% endif %}">{% if a.profit is not none %}{{ a.profit|isk_short }}{% else %}—{% endif %}</td>
+    <td class="flags">{% if a.no_quote %}<span class="badge warn" title="no Jita quote cached — the {{ a.remaining|qty }} still held are left out of Est. net and their route cost out of Cost; hit Refresh">no quote</span>{% endif %}{% if a.unpriced_units %}<span class="badge warn" title="{{ a.unpriced_units|qty }} units sold in contracts with no attributable price (bundled or swap) — {% if a.net_unit is none %}no quote cached: not valued, their route cost left out{% else %}estimated at today's quote{% endif %}">{{ a.unpriced_units|qty }} unpriced</span>{% endif %}{% if a.returned_units %}<span class="badge" title="the hold ended when run {{ a.expires_after }} was marked executed — the {{ a.returned_units|qty }} unsold count as ordinary stock, valued at nothing here with their route cost kept">returned to stock</span>{% endif %}{% if a.plan_figure %}<span class="badge warn" title="the ESI job record does not cover this run's whole buying window — Planned is the plan's figure, not what was installed">plan figure</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+</details>
+{% endif %}
 {% endif %}
 {% endblock %}

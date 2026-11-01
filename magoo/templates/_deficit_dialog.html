@@ -175,13 +175,20 @@ function openDeficit(btn) {
   const unmetNote = (d.kind !== "final" && parts.length && shortfall > 0)
     ? " " + qty(shortfall) + " unmet: out of slots, and the market holds no more."
     : "";
+  // User rulings 2026-10-31 (review #65): on hand and in jobs are the
+  // plan's figures NET of a live for-sale hold's units, so the hangar
+  // count is not what the equation shows — say what it left out.
+  const held = Number(d.held || 0);
+  const heldNote = held > 0
+    ? " " + qty(held) + " more held for sale (alchemy run for profit — in the hangar or in unrefined jobs), not counted."
+    : "";
   document.getElementById("deficit-answer").textContent =
-    d.kind === "final"
+    (d.kind === "final"
       ? finalAnswer(d, target, deficit)
       : Number(d.deficit) > 0
         ? (parts.length ? "The plan " + parts.join(" and ") + "." + unmetNote
                         : "Unmet — no market to buy from and no slots to build in.")
-        : "No deficit — covered by stock and jobs.";
+        : "No deficit — covered by stock and jobs.") + heldNote;
   document.getElementById("deficit-chain").href =
     "{{ url_for('run_detail', index_run_id=run.index_run_id, view='chain') }}#item-" + d.type;
   document.getElementById("deficit").showModal();

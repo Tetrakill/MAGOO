@@ -1048,6 +1048,11 @@ def refresh_state(conn, ref) -> dict:
                         "runs": job.get("runs", 0),
                         "units": units,
                         "status": status,
+                        # The timer end and the delivery to the hangar
+                        # (schema 14): the for-sale hold reads when a
+                        # job's output could first be sold.
+                        "end_date": job.get("end_date"),
+                        "completed_date": job.get("completed_date"),
                     }
                 )
 

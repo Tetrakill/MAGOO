@@ -70,6 +70,7 @@
         data-covered="{{ (i.compressed_covered_qty or 0) if i.compressed_covered_qty is defined else 0 }}"
         data-alchemy="{{ (i.alchemy_output_qty or 0) if i.alchemy_output_qty is defined else 0 }}"
         data-installed="{{ (i.installed_qty or 0) if i.installed_qty is defined else 0 }}"
+        data-held="{{ (i.held_for_sale_qty or 0) if i.held_for_sale_qty is defined else 0 }}"
         data-requested="{{ i.requested_qty if (i.requested_qty is defined and i.requested_qty is not none) else '' }}"
         data-wave="{{ i.wave_qty if (i.wave_qty is defined and i.wave_qty is not none) else '' }}"
         onclick="openDeficit(this)">{{ i.name }}</button>

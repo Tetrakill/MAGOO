@@ -1,11 +1,17 @@
 {# Whole-cycle roll-up strip: expects `totals` (costing.CycleTotals) and
    `cards`. Abbreviated ISK with the full figure on hover. #}
-{% if cards %}
+{# User rulings 2026-10-31 (D7): alchemy run FOR SALE is inside Profit, Cost
+   and Net proceeds (costing.cycle_totals), named beneath each; its
+   unpriced composites are badged apart from the hull count. #}
+{% set alch = totals.alchemy_units if totals.alchemy_units is defined else 0 %}
+{% set alch_unpriced = totals.alchemy_unpriced if totals.alchemy_unpriced is defined else 0 %}
+{% set alch_returned = totals.alchemy_returned_units if totals.alchemy_returned_units is defined else 0 %}
+{% if cards or alch %}
 <div class="totals">
   <div class="stat">
     <span class="label">Profit / cycle</span>
     <span class="value {% if totals.profit < 0 %}bad{% elif totals.profit > 0 %}good{% endif %}"
-          title="{{ totals.profit|isk }} ISK">{{ totals.profit|isk_short }}</span>
+          title="{{ totals.profit|isk }} ISK{% if alch %} — incl. {{ totals.alchemy_profit|isk }} ISK from {{ alch|qty }} units of alchemy run for sale (realized where sold, today's quote for units still held or sold without an attributable price, nothing for units returned to stock, less the route's cost){% if alch_returned %}; {{ alch_returned|qty }} of them returned to stock{% endif %}{% endif %}">{{ totals.profit|isk_short }}{% if alch %}<span class="sub">incl. {{ totals.alchemy_profit|isk_short }} alchemy</span>{% endif %}</span>
   </div>
   <div class="stat">
     <span class="label">Margin</span>
@@ -15,11 +21,11 @@
   </div>
   <div class="stat">
     <span class="label">Cost / cycle</span>
-    <span class="value" title="{{ totals.cost|isk }} ISK">{{ totals.cost|isk_short }}</span>
+    <span class="value" title="{{ totals.cost|isk }} ISK{% if alch %} — incl. {{ totals.alchemy_cost|isk }} ISK route cost of the alchemy run for sale (every unit except by-hand marks without a price and, with no quote, the units still held){% endif %}">{{ totals.cost|isk_short }}{% if alch %}<span class="sub">incl. {{ totals.alchemy_cost|isk_short }} alchemy</span>{% endif %}</span>
   </div>
   <div class="stat">
     <span class="label">Net proceeds / cycle</span>
-    <span class="value" title="{{ totals.proceeds|isk }} ISK">{{ totals.proceeds|isk_short }}</span>
+    <span class="value" title="{{ totals.proceeds|isk }} ISK{% if alch %} — incl. {{ totals.alchemy_proceeds|isk }} ISK from alchemy run for sale (realized where sold, today's quote for units still held or sold without an attributable price, nothing for units returned to stock){% endif %}">{{ totals.proceeds|isk_short }}{% if alch %}<span class="sub">incl. {{ totals.alchemy_proceeds|isk_short }} alchemy</span>{% endif %}</span>
   </div>
   <div class="stat">
     <span class="label">Units / cycle</span>
@@ -37,6 +43,12 @@
     <span class="badge warn" title="These pipelines' finals have no sell
     quote, so they are left out of every figure here — hit Refresh">
     {{ totals.unpriced }} unquoted</span>
+  </div>
+  {% endif %}
+  {% if alch_unpriced %}
+  <div class="stat">
+    <span class="label">&nbsp;</span>
+    <span class="badge warn" title="{{ alch_unpriced }} alchemy composite{{ 's' if alch_unpriced != 1 }} with units sold without an attributable price (estimated at today's quote where one is cached, else left out with their route cost) or still held with no quote (left out, their route cost too) — the alchemy line is an estimate short of them">{{ alch_unpriced }} alchemy unpriced</span>
   </div>
   {% endif %}
 </div>
