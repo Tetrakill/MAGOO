@@ -4835,7 +4835,7 @@ Alchemy sales and Still held tables, and the Index Runs list's revenue
 and profit estimate (with an "alchemy failed" badge) show the hold.
 
 Schema 14 (one-way: v1.30.0 refuses a migrated database; the pre-upgrade
-backup lands as `magoo-pre-1.30.0-s13.sqlite` — the snapshot now carries
+backup lands as `magoo-pre-1.31.0-s13.sqlite` — the snapshot now carries
 the source schema, so an unstamped second migration under one version
 gets its own rollback point). No new ESI scopes. 1354 tests (178 new:
 `test_alchemy_profit.py`, `test_alchemy_profit_web.py`,
