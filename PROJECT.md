@@ -204,7 +204,24 @@ anywhere, iterates quickly, and owns its own data pipeline.
     throttles it; it runs in the slots of direct jobs stock cannot start
     this cycle, by the original savings ranking, and never replaces bought
     units this cycle's consumers draw (§7 Phase 6.5; v1.27.1, user rulings
-    2026-09-09, 2026-09-11, 2026-09-12).
+    2026-09-09, 2026-09-11, 2026-09-12). **Alchemy blacklist and alchemy
+    for profit (schema 14, 2026-10-30):** a per-route "Never run" grid on
+    the Settings page stops a route's jobs of either kind; with Alchemy for
+    Profit on, the reaction slots the savings moves leave fill with
+    unrefined reactions whose composite SELLS in Jita (hub quote net of
+    sales tax, broker fee, SCC and freight-out) for more than the route
+    costs, most profitable per slot first — added for sale, never credited
+    to a deficit or purchase, under the same per-type cap; the Industry
+    Jobs tab lists what to sell. **The for-sale hold (user rulings
+    2026-10-31, rebuilt after the review of the same day):** the planner
+    remembers the sale pile through a hold per (run, composite) anchored
+    to the jobs ESI shows installed — it hides the pile from the
+    composite's stock (less whatever is already on the market or in a
+    contract), lives while the jobs run and for one full run after they
+    deliver, and is released by the observed sales of a delivered pile or
+    by a Mark sold with an optional price; the Ledger's Alchemy sales
+    section and the executed run's Profit tab book what it earned (§7
+    Phase 6.5).
 
 11. **Production blacklist (v1.3)** — Per-category checkboxes plus a per-item
     "buy, don't build" list; blacklisted sub-chains are pruned at expansion.
@@ -416,7 +433,10 @@ anywhere, iterates quickly, and owns its own data pipeline.
     Since v1.29 the same pull also keeps the BUY side — wallet buys and
     the item exchanges the pool accepted, in their own tables — for the
     Buy tab (feature 20), under a sibling **Count buys** toggle and with
-    no new scope; the Ledger's own tables and queries are unchanged. An
+    no new scope; the Ledger's own tables and queries are unchanged (the
+    alchemy for-sale hold's settlement reads them too, after the pull —
+    feature 10 — and the Ledger renders its matches in a section of its
+    own, apart from the finals' figures). An
     owner with Count sales off but Count buys on still has its wallet and
     contracts read, so a gap there is noted as purchases possibly missing
     from the Buy tab, not sales (review 2026-09-28).
@@ -1447,13 +1467,15 @@ Reference tables are described in §4. Application state follows.
 **Schema version and the pre-upgrade snapshot.** `store.SCHEMA_VERSION` is
 stamped into `PRAGMA user_version` after a successful migration, and a build
 refuses a database a NEWER build wrote. Before its first migration an
-existing database is snapshotted to `backups/magoo-pre-<version>.sqlite`,
-named after `magoo.__version__` and never overwritten — so a
-schema-changing release must **stamp the version before the build is ever
-run against `data/magoo.sqlite`**. Run it unstamped and the snapshot the
-previous release already wrote under that name suppresses a fresh one, and
-the migrated database cannot be opened by the installed build it was
-migrated from (no rollback point). The same applies to the `magoo` /
+existing database is snapshotted to
+`backups/magoo-pre-<version>-s<schema>.sqlite`, named after
+`magoo.__version__` and the schema it came from (since 2026-10-31; the
+pruner keeps only names of that shape, so a hand-named snapshot survives)
+and never overwritten — so a second migration from the SAME schema under
+one version string writes no fresh snapshot: a schema-changing release
+should still **stamp the version before the build is run against
+`data/magoo.sqlite`**, and the migrated database cannot be opened by the
+installed build it was migrated from. The same applies to the `magoo` /
 `magoo-dev` launch entries, which use the real data dir — preview a
 schema-changing branch against a scratch copy instead.
 
@@ -1505,7 +1527,7 @@ included. Deleted with its run or its pipeline.
 | `character_id` | PK |
 | `character_name` | |
 | `include_assets` | Count this character's wallet toward buying power (stock is corp-scope since 2026-08-20) |
-| `include_job_slots` | Count this character's PERSONAL jobs toward slot occupancy (2026-08-25: corp-feed jobs count under the corp's `count_jobs` toggle instead — the corp feed runs first and claims corp jobs in the dedup). Since v1.29 revision 6 (2026-09-28) planning never subtracts running jobs from the pools, so the toggle is planning-inert: it gates only the ESI update's active-job count (the flash and the dashboard). Kept, and relabelled **Count active jobs** on the ESI tab (the corp column reads **Count jobs**) |
+| `include_job_slots` | Count this character's PERSONAL jobs toward slot occupancy (2026-08-25: corp-feed jobs count under the corp's `count_jobs` toggle instead — the corp feed runs first and claims corp jobs in the dedup). Since v1.29 revision 6 (2026-09-28) planning never subtracts running jobs from the pools (amended 2026-10-31, ruling (a): the alchemy profit tail alone nets this cycle's still-running reaction jobs out of its capacity), so the toggle is planning-inert: it gates only the ESI update's active-job count (the flash and the dashboard). Kept, and relabelled **Count active jobs** on the ESI tab (the corp column reads **Count jobs**) |
 | `count_assets` | 2026-08-25: opt this character's PERSONAL hangars into stock on hand (default 0) |
 | `count_sales` | v1.27.0: pull this character's sell orders, sale transactions and contracts for the Ledger and count them (default 1; honoured at read time — a character switched off also stops carrying its corporation's wallet sales that only its own feed reports) |
 | `count_buys` | v1.29 (2026-09-28): count this character's wallet buys and accepted item exchanges as purchases on the Buy tab (default 1). Honoured at READ time only (`store.buys_enabled_owners`, in `buying.assign_purchases`): the wallet and contract feeds are read while `count_sales` OR `count_buys` is on, and buys are always stored, because the transactions cursor is shared — skipping the write would move it past buys no later toggle could recover |
@@ -1560,7 +1582,8 @@ Tools blacklisted.
 | `input_purchase_margin` | 0.05 — extra raw materials bought vs. allocated-job consumption |
 | `alchemy_enabled` | 0 (v1.4) |
 | `alchemy_reprocess_yield` | 0.55 — scrapmetal cap; user-asserted, fold reprocessing tax in |
-| `max_alchemy_jobs_per_type` | 4 — per unrefined formula per cycle; 0 disables |
+| `max_alchemy_jobs_per_type` | 4 — per unrefined formula per plan, savings and for-sale jobs together (schema 14); the profit tail also counts the formula's jobs installed this cycle toward it (the savings moves are deficit-bounded and need no such count); 0 disables |
+| `alchemy_for_profit` | 0 (schema 14, 2026-10-30) — with alchemy on, Phase 6.5 ends by filling the reaction slots still free with unrefined reactions whose composite sells in Jita at a profit (§7 Phase 6.5); the routes ticked in `alchemy_blacklist` never run |
 | `skill_accounting` / `skill_broker_relations` | 5 / 5 — sell-side fees (v1.5) |
 | `standing_broker_faction` / `standing_broker_corp` | 0.0 — NPC broker fee |
 | `freight_in_isk_per_m3` / `freight_out_isk_per_m3` | 0.0 — flat courier rates: "Courier Highsec Market → Industry Hub" (bought materials in) and "Courier Industry Hub → High Sec Market" (finished products out); freight-in is the Jita leg since v1.10 |
@@ -1585,6 +1608,45 @@ Tools blacklisted.
 (v1.3): category keys (mapped to product groups in
 `config.BLACKLIST_CATEGORIES`) and individual type IDs the user has marked
 *buy, don't build*.
+
+**`alchemy_blacklist`** (schema 14, 2026-10-30) — `composite_type_id`, the
+key of `refdata.alchemy_routes`: routes the alchemy pass never installs
+jobs for, savings or for-sale. Unrefined stock already on hand still
+credits its composite (it is stock, not a job). Saved from the Settings
+form's "Never run" grid; the hidden `alchemy_blacklist_present` marker says
+the grid was rendered, so a form served before the game data was
+downloaded never clears the list.
+
+**`alchemy_hold`** / **`alchemy_hold_release`** (schema 14, user rulings
+2026-10-31; rebuilt after the review of the same day) — one row per
+(run, composite) a plan proposed for-sale alchemy jobs on, storing
+ANCHORS only: `planned_qty` (the plan's proposal in composite units at
+the last write before installs — a display and fallback figure),
+`route_unit_cost` (with `cost_from_fills`: 1 when it came from a plan that
+priced an input at a fill, so a later plan that buys nothing of the
+route keeps it), `anchored_at` (the plan's snapshot time at the row's
+first write — a formula job started at or before it is the chain's
+whatever the record shows later, a late install of the previous run
+included; one started after it belongs to this plan and FREEZES the
+row), `baseline_units` (the pre-anchor installed units at the last
+write; display — the reader re-derives them), `chain_units` (baseline +
+the plan's savings jobs' units: of the jobs started after the anchor the
+first `chain_units − baseline_units` units are the chain's, the rest the
+hold's for-sale jobs) and `yield_`.
+What the hold hides, whether its jobs delivered and whether it is live
+are DERIVED at read time by `magoo/holds.py` from `industry_job`,
+`index_run` and the release rows — nothing stored can go stale. Written
+only by the plan's persist (`holds.write_plan_holds`: the row follows the
+plan while the window shows no job started after its anchor, is frozen
+once one does, is never deleted by a plan); `ON DELETE CASCADE` with the run,
+and `web.run_delete` refuses a run whose rows show installs or releases.
+A release is `qty`, `source` 'market' / 'contract' / 'manual', the sale's
+`ref_id`, `unit_price` (a by-hand release's entered price, NULL for
+none), `location_id`, `released_at` and `unit_cost` (the hold's route
+cost at match time, so the Ledger never re-costs history); one (sale,
+hold) pair is one row (partial UNIQUE index `alchemy_hold_release_sale`,
+created by the migrations after a dedupe); `alchemy_releases` feeds the
+Ledger's alchemy section (§7 Phase 6.5).
 
 **`blueprint_setting`** — per-blueprint assumptions. **Explicit values always
 take priority over the global intermediate ME/TE defaults**
@@ -1696,8 +1758,11 @@ The core output table.
 | `unit_chain_cost` | 2026-08-23: the vertically-integrated chain cost per unit behind `build_savings_per_unit` (savings = landed buy price − this); NULL on older rows, which the run page recovers as price − savings |
 | `alchemy_for_type_id` | v1.4, unrefined rows: the composite this route feeds |
 | `direct_unit_cost` / `alchemy_unit_cost` | v1.4, composite rows: the route comparison |
-| `alchemy_output_qty` | v1.4: composite units expected from this cycle's alchemy jobs |
+| `alchemy_output_qty` | v1.4: composite units expected from this cycle's alchemy jobs — the savings moves' output only; for-sale jobs never count here |
 | `alchemy_credit_qty` | v1.4: units credited from unrefined stock/jobs at the yield |
+| `alchemy_profit_jobs` | schema 14, unrefined rows: of the row's jobs, how many were added FOR SALE by the profit tail (0 on every other row) |
+| `alchemy_sale_net_unit` / `alchemy_route_unit_cost` | schema 14, unrefined rows with for-sale jobs: the net Jita proceeds per composite unit they were judged against (hub quote less sales tax, broker fee, SCC and freight-out) and the route's cost per composite unit as the profit tail priced it — stamped on the unrefined row because the composite need not be a plan row at all |
+| `held_for_sale_qty` / `held_from_credit_qty` | schema 14 (user rulings 2026-10-31), composite rows: the units of this composite's stock the live for-sale holds hid from the plan — the formula's unrefined pool first (on hand + in flight at the Settings yield; only the credited part comes off In jobs), then the hangar — and the part of that figure that came out of the credit (the Stockpile tab annotates In jobs with it and On hand with the rest); NULL where no hold applied or before the columns |
 | `compressed_outputs` | v1.25, compressed buy rows: json `[[material_id, units out at the yield, units used to cover demand], ...]` — what the purchase is for |
 | `compressed_ladder_units`, `compressed_fill_orders` | v1.25, compressed buy rows: units on the chosen venue's ladder at plan time and orders the fill walked (the badge tooltip) |
 | `compressed_wanted_qty` | 2026-09-05 review (R6), compressed buy rows: the quantity the LP wanted before the whole-batch re-fill. Since v1.26.1 the re-solve keeps it equal to `recommended_buy_qty` unless the pass cap was hit (a deliberate round-down of a partly wanted batch records the buy); rows planned before may exceed the buy; the compressed badge's tooltip states the figure whenever the two differ (no badge). NULL on pre-column rows |
@@ -1923,7 +1988,10 @@ write time so a window test is a plain text compare against
 `index_run.completed_at`), `runs`, `units` (`runs × portion`, as the
 in_progress credit and `job_starts` count them), `status` (as ESI last
 reported it — active / paused / ready / delivered / cancelled /
-reverted) and `seen_at` (the update that last reported it).
+reverted), `seen_at` (the update that last reported it) and, since the
+2026-10-31 rulings (schema 14), `end_date` (the job's timer end) and
+`completed_date` (its delivery to the hangar), both ESI's and normalised
+the same way, NULL on rows recorded before the columns.
 `esi.refresh_state` upserts it (`store.save_industry_jobs`) through the
 same tracked-system filter and corp-first `job_id` dedup as
 `job_starts`, every status included (so a job an earlier update saw
@@ -1934,7 +2002,11 @@ good. Readers: `store.installed_units` (units of a type whose jobs
 started in `(lo, hi]` with a status in `store.JOB_STATUSES_INSTALLED`)
 and `store.jobs_covered` (do the logged pulls cover the window — see
 `industry_job_pull` below), both for `costing.hull_cost`'s Units on an
-executed run (feature 19). No run FK:
+executed run (feature 19); `store.jobs_in_window` (the formula's jobs,
+every status, with their dates — `magoo/holds.py` reads the for-sale
+hold's installs and delivery from them), `running_jobs_started_after`
+(the profit tail's capacity) and `installed_jobs_started_after` (its
+cap). No run FK:
 the buying window decides which run a job belongs to, as it does for
 purchases; `run_delete` leaves it alone. Index `industry_job_type_start`
 on (`type_id`, `start_date`). Fresh databases and the 12 → 13 upgrade
@@ -2640,6 +2712,239 @@ demand, e.g. Cadmium, are added as raw plan items). The plan's Alchemy
 section lists the installs plus the manual step: "Reprocess N Unrefined X →
 ~M X (+R goo back)".
 
+**Alchemy blacklist (schema 14, 2026-10-30).** A route whose composite is
+in `alchemy_blacklist` (the Settings page's "Never run" grid) is skipped
+before the candidate loop — no savings move, no for-sale job, no
+comparison stamped on its composite, and `_add_alchemy_ids` prices nothing
+of its own. Unrefined stock on hand still credits the composite in
+`_apply_targets`: that is stock the user holds, not a job the plan asks
+for.
+
+**Alchemy for profit (schema 14, user request 2026-10-30).** With
+`alchemy_for_profit` on (and alchemy enabled), the pass ends with a profit
+tail over the `spare` the savings moves left: every unblocked route whose
+unrefined product is no plan row and whose composite is a saturating
+reaction (the same guards as above) is costed for SALE —
+
+```
+net_unit   = net_proceeds_per_hull(Jita hub quote of the composite)
+             — the Profit tab's / Ledger's sell reference (user ruling
+             2026-10-30: the hub quote at the configured basis, not the
+             best buy order), less sales tax, broker fee, the SCC
+             surcharge and freight-out on packaged m³; the structure
+             venue's price never stands in; no quote → not a candidate
+route_unit = (Σ inputs @ landed + install − Σ recovered × yield × value)
+             / (base_composite_output × yield)
+             value = landed buy price where the chain BUYS that goo (a
+             plan row with merged_min_qty > 0 — it offsets a purchase),
+             else its own net Jita proceeds (it would have to be sold)
+```
+
+Candidates with `net_unit > route_unit` are ranked by **profit per slot**
+(`(net_unit − route_unit) × out_per_job`, one slot per job) and placed
+greedily: the best route takes `min(cap − its jobs so far, spare_tail, the
+jobs the fuel block left in stock can start)` — the per-type cap is the
+one `max_alchemy_jobs_per_type`, shared with the savings jobs of the same
+formula AND with the formula's jobs already started this cycle (the
+`industry_job` record after the cycle cut: an installed for-sale job is
+never listed again), and the fuel test is the savings moves' (`fuel_need`
+/ `fed`, route-only goo bought just in time). **Capacity (ruling (a),
+2026-10-31):** `spare_tail = spare − the reaction jobs started this cycle
+that still hold a line` (active / paused / ready, started after the cut;
+no cut yet → every running job counts). For-sale jobs have no deficit to
+drop out through once installed, so R2's configured pools — right for
+every deficit-bounded consumer — would list them into busy lines on each
+mid-cycle re-plan; the savings moves keep `spare` as R2 gives it. The
+guards: the alchemy blacklist, the overwrite guard, the non-saturating
+groups, any pipeline's final, active or not (sold as a final, never
+twice — the Ledger's finals set; the settle likewise never releases a
+hold on a final) and
+**the Production Blacklist (ruling (h))** — a route whose unrefined
+product or composite the per-item list or a blacklisted category rejects
+gets no for-sale job. The jobs land on the same unrefined row as any
+savings jobs of that formula, counted in `alchemy_profit_jobs` (NEW jobs
+to run now) with `alchemy_sale_net_unit` / `alchemy_route_unit_cost`
+stamped; the composite row — where the chain has one — is **never
+touched**: no `alchemy_output_qty`, no purchase shrunk, no direct job
+displaced, no low-stock effect. The output is the user's to sell. Phase 7
+buys the for-sale jobs' goo just in time like any alchemy input. A route
+with an input the plan would have to BUY unpriced is skipped (a cost
+that counted it at 0 would invent a profit; an input the chain builds,
+a fuel block with a build row, is exempt and counts 0 unquoted as it
+always has) until a price refresh prices it — the settings
+save says so when Alchemy for Profit is switched on or a route leaves
+Never run — and the price set keeps every composite a hold still values
+(live, or with units released without an attributable price) whatever
+the flags say, so "today's quote" is today's.
+**Ruling (f):** once Phase 7.5 has fill-priced the purchases,
+`engine._restamp_route_costs` re-stamps each for-sale row's
+`alchemy_route_unit_cost` with every input the plan BUYS outright priced
+at its row's fill-priced landed average (what the plan pays — a row the
+compressed ore covers exactly counts as bought at its effective cost; a
+built fuel block keeps its Phase 1 landed quote), recovered goo credited
+the same way where the chain buys it — the choice and ranking stood at
+the Phase 1 quote; the hold keeps a fill-priced cost across a later
+re-plan that buys nothing of the route (the goods already landed), so
+the buy → update → install turn freezes what was paid. **Ruling (g):** the install check rations an alchemy row's
+for-sale runs in a third pass over what the chain's consumers left, and
+the pool-overflow trim cuts for-sale jobs first (lowest profit per slot
+first), so a cut always hits the for-sale share. The feedback loop's
+extra-runs adder skips a row whose jobs are all for sale (its output is
+sold, not stocked). `_add_alchemy_ids` prices every unblocked route's
+composite, unrefined product, inputs and recovered outputs when the flag
+is on, so an off-chain composite has a Jita quote to be judged by. The
+Industry Jobs tab badges the rows `for sale`, folds the expected profit
+into the Savings column ("Savings / profit"), lists the sell share in the
+reprocess checklist, adds a **Sell in Jita** panel (per composite: Sell
+qty — the hold's installed figure plus the row's new jobs' output after
+the reprocess and the install cut — Released, Held, Expected profit, a
+status, and Mark sold; net / unit and route / unit on hover, user wording
+2026-10-30) and a **For sale** stat.
+
+**The for-sale hold (user rulings 2026-10-31; rebuilt after the review of
+the same day).** The plan has no other memory that those units are for
+sale: ESI shows the unrefined jobs in flight and, once reprocessed, the
+composite in the hangar, and both count as stock. The hold
+(`alchemy_hold`, §6) is **anchored to the job record, never to the
+plan's proposal**: a row stores `planned_qty` (the proposal, a display
+and fallback figure), `route_unit_cost` (kept across a re-plan that buys
+nothing of the route once a plan priced it at a fill — `cost_from_fills`),
+and the anchors — `anchored_at` (the plan's snapshot time at the row's
+first write), `baseline_units` (the pre-anchor installed units then),
+`chain_units` (baseline + the plan's savings jobs' units) and `yield_`.
+`magoo/holds.py` derives everything else at read time from
+`industry_job` (every job's status as last seen, its `end_date` and
+`completed_date`): of the window's installed units (active / paused /
+ready / delivered — a cancelled job simply leaves the hold; a running
+job the latest pull no longer reports, past its timer end, counts as
+delivered at that end) those started at or before the anchor are the
+chain's (a late install of the previous run), and of those started
+after it the FIRST `chain_units − baseline_units` are the chain's, the
+rest are the hold's for-sale jobs (`alchemy_sale_split`'s "savings
+first"); `for_sale_qty` = their units ×
+composite_qty × yield is the composite units ESI vouches for, so an open
+run's hold is **0 until its jobs are installed** — it never hides a
+proposal and never feeds back into its own re-plan — and exactly its
+in-flight output after; `delivered_at` once no for-sale job is in flight
+(`completed_date`, the hangar delivery; `end_date` for records pulled
+before the column); `remaining = for_sale_qty − releases`. The plan's
+persist (`holds.write_plan_holds`, the only writer) follows the plan
+(proposal, savings share, route cost, yield) while the window shows no
+job started after the anchor and FREEZES the row once one does — the plan the
+user installed from is the last one written before the installs
+appeared, which holds inside one ESI update too (the pull writes the
+jobs, then the re-plan runs); a composite the plan drops keeps its row
+with `planned_qty 0`; rows go only with their run. An executed run whose
+window the pull log does not cover yet (`store.jobs_covered`; the usual
+state between Mark executed and the next update) is read from the
+record where that already shows for-sale jobs of the window — a job
+installed after the last pull is missing until the next update, a
+transient that update's re-plan clears — and falls back to
+`planned_qty`, badged "plan figure", only while the record shows none
+AND no pull reaches into the window at all (a pull inside it that
+covers it up to the latest pull speaks: nothing was installed before
+it, as the next update would show, so the usual Update → Mark executed
+→ Plan turn never hides a declined proposal): evidence beats the proposal,
+where hulls' Units wait for a covering pull because their plan figure is
+complete by construction (verification 2026-10-31, a refinement of the
+plan's D1). An open run never falls back: uncovered or not installed,
+it holds nothing.
+
+Planning (`_apply_targets`, after the unrefined credits) hides per
+composite `Σ remaining over the LIVE holds − listed`, where `listed` =
+the composite's units on Count-sales owners' open sell orders and in
+outstanding item-exchange or courier contracts we issued
+(`ledger.listed_lots`: units that have left ESI assets), each lot
+attributed by its ISSUE date to the delivered holds whose life — first
+delivery to expiry — contains it, oldest first, up to their delivered
+unreleased units: an expired pile listed while it lived keeps its own
+listing, so it does not shrink a live pile's hide, and a lot issued
+after that hold ended is the live pile's (or chain surplus, when no life
+contains it). The
+pile cannot be told from the chain's own units, so the hide comes first
+out of the formula's **unrefined pool** (on hand + in flight at the
+Settings yield — the credit's own conversion; only the CREDITED part
+reduces the row, so with alchemy off the unrefined pile bites nothing
+that is counted) and then out of the **hangar**; never the recovered goo,
+which does go to the chain; never more than is there. The hidden figure
+is stamped `held_for_sale_qty` (and `held_from_credit_qty` for the part
+out of the credit) and the Stockpile tab marks the row. Known limit:
+listed chain surplus of a held composite is read as the pile while a pile
+is in the hangar.
+
+A hold **lives while its for-sale jobs are in flight and for one full
+run after they deliver** (ruling (b): the user's cadence lands a run's
+pile 2–4 days before the next run is marked executed, so a run-number
+rule expired it as the pile reached the hangar): once `delivered_at` is
+set, live while at most ONE executed run completed at or after it — a
+count over `index_run`, so a delivery between runs needs no special case
+and Reopen of the ending run revives the hold; `expires_after` names the
+run whose Mark executed ends it; a hold the record shows nothing
+installed for holds nothing and is never live — except an executed run's
+plan-figure stand-in (a window no pull reaches into), which lives by the
+old own-run-plus-next bound and hides its `planned_qty` until a covering
+update. A
+superseded run's hold is expired, which is why Reopen now refuses while a
+newer planned run exists ("discard run N+1 first").
+
+It **shrinks as sales are observed** (ruling (e): delivered holds only):
+`ledger.settle_alchemy_holds` (BEGIN IMMEDIATE; run after the ESI
+update's sales pull, before a plan, before Mark executed and before Mark
+sold — the pages themselves never write) matches wallet sells and
+finished item-exchange contracts of the composite — the Ledger's own
+rules: Count-sales owners, no internal buyer, a price above 0 (a 0-ISK
+hand-over is marked sold by hand), courier never — to the holds whose
+for-sale jobs have delivered, live OR expired (an expired hold while the
+run after the one that ended it is the newest executed; once a further
+run is executed its history is closed and the scan of the composite's
+sales stops growing; a hold on any pipeline's final never — its sales
+are the finals' Ledger's), the sales taken in the order the units LEFT
+the hangar (a contract by its issue date, a wallet sell by its fill) so
+a contract issued early never finds its only eligible hold filled by a
+later sale, oldest run first, each
+hold taking only sales dated from its first delivery to its expiry (a
+contract by `date_issued`: the items leave the hangar at issue) and only
+up to its delivered, not-yet-observed room; units beyond that stay
+unassigned — ordinary chain-stock sales. Each match is one
+`alchemy_hold_release` row per (sale, hold) with the sale's id, price,
+location and the hold's `unit_cost`; a second application of the same
+sale to the same hold adds to its row; a contract is attributed over
+every held composite and the finals at their quotes; an observed sale
+REPLACES a by-hand mark of the same units (the hold's manual rows shrink
+by the overshoot) rather than spilling onto the next run. **Mark sold**
+(ruling (d)) applies its quantity oldest-first over the composite's
+delivered live holds whichever run's page posted it, with an optional
+price (ISK per unit received): priced, the units book realized revenue
+with no fee or freight term; blank, they leave the hold with neither
+revenue nor cost; each by-hand row has an undo.
+
+The Ledger gains an **Alchemy sales** section (matched sales with net by
+venue — a priced by-hand row at its entered price — cost at the
+release's `unit_cost`, profit; cost only on rows that add net, so Net −
+Route cost = Net income; the holds still held with their status and
+expiry; apart from the finals' totals, charts and Top 10s); an executed
+run's Profit tab an **Alchemy for sale** table per hold — Planned
+(`for_sale_qty`), Sold (observed), by hand (priced / unpriced), Still
+held, Realized net, Est. net (units sold in contracts with no
+attributable price at today's quote, plus the live remainder at today's
+quote; **ruling (c):** an expired remainder earns 0, keeps its route
+cost and is badged "returned to stock"), Cost = (planned − by-hand
+unpriced) × route cost with a live no-quote remainder's cost left out
+and badged, Profit = Realized + Est − Cost — whose line
+`costing.cycle_totals(cards, alchemy)` folds into the cycle's Profit /
+Cost / Net proceeds ("incl. X alchemy" beneath, an "N alchemy unpriced"
+badge apart from the hulls' unquoted count) and so into the Index Runs
+list's Revenue / Profit; the open run's estimate adds its own hold at
+today's quote, independent of the hull what-if. Planning → Profit's
+what-if stays hulls-only. The hold's end is worded in three states:
+"until run M+1 is marked executed" once delivered, "until the run after
+the one its jobs deliver in is marked executed — jobs end <date>" in
+flight, "not installed yet" before. Mark executed and Reopen say which
+holds they end or revive; a hold standing at the plan's figure is worded
+apart ("plan-figure hold ended" / "withdrawn" for the reopened run's
+own stand-in: "count as stock again", never "unsold"), since nothing of
+it was a pile.
+
 ### Phase 7 — Finalize recommendations and flags
 
 ```
@@ -2940,7 +3245,8 @@ draw exceeds its availability is **short** (`install_draw_qty`,
    its runs at a fixed per-job split) and subtracts its draw.
    `install_priority` records the rank and `install_return` the figure,
    so the page restates exactly what the order was built on.
-2. **Intermediates in proportion** (alchemy installs included).
+2. **Intermediates in proportion** (alchemy SAVINGS installs included; an
+   alchemy row's for-sale runs wait for step 3 — ruling (g), 2026-10-31).
    Progressive filling: one fraction of planned runs rises for every
    still-active consumer together until some input runs out
    (`room / active draw` is smallest); that input's consumers freeze at
@@ -2952,6 +3258,14 @@ draw exceeds its availability is **short** (`install_draw_qty`,
    and one run trimmed from the largest drawer wherever an input still
    overshoots, then runs are handed back (most-cut consumer first) while
    they still fit, so the figure is maximal as well as safe.
+3. **For-sale alchemy runs last** (ruling (g), 2026-10-31): the same
+   progressive filling over the for-sale runs alone, against what the
+   chain's consumers left — they are optional, so a short input cuts
+   them before any chain job. A row's chain part and for-sale part add up
+   on the row (`install_per_job` stays the formula's runs per job), and
+   `alchemy_sale_split` reads any cut as the for-sale share first. The
+   pool-overflow trim below cuts for-sale jobs first too, lowest profit
+   per slot first.
 
 `install_runs` / `install_jobs` / `install_per_job` — packed the way
 Phase 7 sizes that item (user ruling 2026-09-09): an INTERMEDIATE
@@ -4864,7 +5178,7 @@ user's Windows machine against the live database.
 | Price snapshot venue (2026-08-20) | Jita 4-4 station only (location 60003760), not region-wide min sell — the HUB leg; the structure leg (v1.10) ~~deliberately takes its best order plus a depth flag, see "Structure depth rule (2026-08-22)"~~ walks its sell ladder with Jita's since v1.25 (see "Split buys across venues (2026-09-05)") | A 1-unit scam/stale order in a backwater Forge station must not set cost basis or MILP savings |
 | Stock scope (2026-08-20) | on_hand counts **corporation assets only** (tracked systems); personal hangars excluded. Amended 2026-08-25: both ends became toggles on the ESI tab — per-character `count_assets` opts personal hangars IN (default off), per-corp `esi_corp.count_assets` / `count_wallet` / `count_jobs` opt a corp's hangars / ISK / jobs OUT (defaults on; off skips that pull) | Corp hangars are the production stock; personal assets (parked ships, fittings, cargo) are noise — but the user wants the exception to be theirs to make |
 | In-progress scope (2026-08-20) | Corp AND personal jobs still credit in-progress output | Personal job output is delivered into corp hangars |
-| Multi-cycle slot netting (2026-08-20) | Active jobs whose end date lies beyond the next index run are netted from the slot pool; single-cycle jobs stay un-netted per v1.1. Amended 2026-08-25: the corp feed runs first and claims corp jobs — they count toward slots under the corp's `count_jobs` toggle; `include_job_slots` gates only the character's remaining personal jobs **Superseded 2026-09-28 (v1.29 revision 6, user ruling):** planning never subtracts running jobs — see "Slot pools are always the configured pools"; `include_job_slots` now gates only the active-job count | The v1.1 "pools as entered" premise assumes all jobs deliver before planning; multi-cycle capital jobs violate it. Corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs |
+| Multi-cycle slot netting (2026-08-20) | Active jobs whose end date lies beyond the next index run are netted from the slot pool; single-cycle jobs stay un-netted per v1.1. Amended 2026-08-25: the corp feed runs first and claims corp jobs — they count toward slots under the corp's `count_jobs` toggle; `include_job_slots` gates only the character's remaining personal jobs **Superseded 2026-09-28 (v1.29 revision 6, user ruling):** planning never subtracts running jobs — see "Slot pools are always the configured pools"; `include_job_slots` now gates only the active-job count. **Amended 2026-10-31 (ruling (a)):** the one exception is the alchemy profit tail, which nets this cycle's still-running reaction jobs out of its capacity (§7 Phase 6.5) | The v1.1 "pools as entered" premise assumes all jobs deliver before planning; multi-cycle capital jobs violate it. Corp ESI carries installer + end date, so corp auth alone covers corp-hangar jobs |
 | Finals never overbuild (2026-08-20) | Uniform round-up is skipped for pipeline finals incl. EXACT_QTY groups — the last job runs short | Finals ignore stock, so overbuild never nets off; also keeps batch/BPC-rounded totals exact (batch multiple is a hard contract) |
 | ~~Component run caps (2026-08-20)~~ | ~~maxProductionLimit caps manufacturing runs/job~~ Superseded 2026-08-21: maxProductionLimit is the max licensed runs per blueprint COPY and does not cap manufacturing | In-client verification showed the game accepts far more runs |
 | Per-job run ceiling (2026-08-21) | ONE rule for manufacturing AND reactions: runs keep being added while the job's total **modified** time is under 30 days, so the last run may overhang — `ceil(30d / time_per_run)`; a single run over 30 days installs as 1 run. ~~Reaction formulas' maxProductionLimit kept as an extra ceiling where lower (unverified)~~ removed 2026-09-05 (ruling R2: client-verified, the client accepts more runs than the formula's maxProductionLimit). The earlier verified reaction caps (544, alchemy 272) were this same rule at the user's Tatara (543 runs = 29d 23:21:59, the 544th allowed) | User-verified in client 2026-08-21; supersedes the flat-544/base-time-scaled reaction machinery and the (misread) maxProductionLimit manufacturing cap |
@@ -5006,7 +5320,7 @@ user's Windows machine against the live database.
 | The slot-pool clause blames overhang only downward (review 2026-09-10) | The run strip explains a pool below the configured setting as multi-cycle overhang; a pool ABOVE it reads "the pool this run was planned against; Settings now reads N" **Superseded 2026-09-28 (revision 6):** with no overhang, a persisted pool differing from Settings reads "the pool this run was planned against; Settings now reads N" in both directions | Overhang can only reduce the pool, so comparing the run's persisted pool with today's setting rendered "500 of the 20 configured slots" after any settings change |
 | The cap never overwrites a row's binding input (review 2026-09-10) | Phase 7.6 stamps `_LIMITED_BY_SLOTS` only where `install_limited_by` is still NULL; a row cut by BOTH a short input and the pool keeps the input, and the page's `short` badge keeps naming what to buy | The sentinel destroyed the one actionable fact on the row and blamed the pool for a cut stock had already made |
 | The run page states what runs, not what caused it (review 2026-09-10) | The short-on-stock headline reads "N of the M planned jobs run this cycle"; the slot stats read "N run this cycle, what stock on hand, in-flight jobs, this cycle's buys and the pool together allow"; the row tooltips say "no more can run this cycle" beside the binding input | The install check rations in two steps and only the second survives on the row, so every figure the page reads is post-cap while the prose said "stock feeds N" — on a capped run that understated what stock fed (650 against 774) and pointed at a panel that could not explain the gap. Stating the outcome needs no second persisted figure |
-| Alchemy is trimmed before direct jobs when a pool overflows (user ruling 2026-09-10) | The cap's order is backfilled jobs, then unpriced (every alchemy install), then priced by savings, finals last | Confirmed by the user when the review questioned it: alchemy is the opportunistic route, so it yields its slot first |
+| Alchemy is trimmed before direct jobs when a pool overflows (user ruling 2026-09-10) | The cap's order is backfilled jobs, then unpriced (every alchemy install), then priced by savings, finals last **Amended 2026-10-31 (ruling (g)):** for-sale alchemy jobs go first of all, lowest profit per slot first, before the classes above | Confirmed by the user when the review questioned it: alchemy is the opportunistic route, so it yields its slot first; a for-sale job is the most optional of all |
 | One refresh control on the dashboard (user ruling 2026-09-11) | The dashboard's ⟳ Refresh prices button is removed; ⟳ Update from ESI is the only refresh there, and it already pulls prices as its third step. `POST /prices/refresh` and the Planning profit view's button stay | Two near-identical refresh controls side by side made the user choose between them for no gain. Prices-only belongs on the screen whose numbers move with quotes. Cost: the first-run flow needs a second (slower) ESI update after adding pipelines, since the first one ran before there was anything to price — README step 5 says so |
 | Alchemy competes with the BUY price (user ruling 2026-09-11) | A routed composite the plan means to BUY is now an alchemy candidate, judged against its LANDED market price instead of a direct build it already lost; savings feed the same ranking. It frees no slot of its own, so its jobs cost their full count; its residual is the whole purchase, so it may take a partial bite where the per-type cap or the spare slots bind (a direct swap stays all-or-nothing). `alchemy_buy_qty` keeps the purchase credit apart from the build-shortfall credit so the same output is never counted twice | The 2026-09-07 audit found buy verdicts ignoring the cheaper alchemy route and no fix was made. On the author's line Ferrofluid was bought at 29,950 landed while its route costs 17,353 |
 | Alchemy's free slots never depend on the pool being full on paper (user ruling 2026-09-12) | `spare = slots − startable direct jobs` always; the startability test for the alchemy jobs (fuel on hand) and "drop an unstartable direct job first" apply to every pool | The v1.27.1 rule branched on `allocated ≥ slots`: run 19 planned 523 of 540 with 79 unstartable, counted 17 spare, and left 79 reaction slots idle. Where every direct job can start the two counts agree; the one change there is that an alchemy job must be startable (fuel on hand or bought), as a direct reaction must |
@@ -5058,7 +5372,21 @@ user's Windows machine against the live database.
 | A new run's planned_start is the snapshot it read, too (pre-release review 2026-09-30) | `engine._insert_run_row` stamps `planned_start` with the replace's expression — the Snapshot's `fetched_at`, or `datetime('now')` when there is none or it reads later than now — and `opened_at` with `datetime('now')`. A new run's `planned_start` can therefore precede its `opened_at` and the previous run's `completed_at` | The usual cycle turn (⟳ Update → Mark executed → buy → ▶ Plan) creates the run from the pre-execution snapshot; stamping now classed purchases made after Mark executed as stock the plan had netted, and an immediate second ▶ Plan moved the cut backwards. The buying windows read `opened_at`, so the first window still opens at the click |
 | A stale plan from before v1.29 blames no skipped re-plan (pre-release review 2026-09-30) | When the open run is older than the newest ESI snapshot and its `opened_at` is NULL (no v1.29 build has planned or re-planned it), the Buy tab's caption, Remaining title and Multibuy All text say the plan was made before Magoo re-planned the open run on every ESI update (or that update could not re-plan it) and point at ▶ Re-plan or ⟳ Update; with `opened_at` set the skipped / failed wording stands | Every open run carried over from v1.28 is older than updates that never re-planned anything, so the first view after the upgrade named a skipped re-plan and a flash that never existed |
 | Executed-run Profit tab counts the hulls ESI shows installed (user ruling 2026-10-24 — "I want the profit tab on index runs to reflect the jobs that were actually installed"; installs beyond the plan's figure count too) | `costing.hull_cost`: `hulls_per_cycle` = this pipeline's share of the final units whose jobs the durable `industry_job` record (schema 13, §6) shows STARTED inside the run's buying window `(lo, hi]` (`buying.run_window` — the window its purchases are filed under), statuses active / paused / ready / delivered, never cancelled / reverted; pro rata to the cycle demand where another pipeline consumes the final, rounded up, NOT capped at the plan (`share_installed`); `hulls_planned` keeps the plan's count (`runs_allocated × portion + installed_qty`, capped as before); `HullCost.hulls_from_esi` says which figure Units are. Where `store.jobs_covered(lo, hi)` is false — the logged ESI pulls (`industry_job_pull`, each reaching 90 days back) do not chain over the whole window: a run executed before the record existed whose cycle the first pull's history did not reach in full, an idle gap longer than the history, a run executed after the last pull, a legacy inverted window — the old started figure (`install_runs` else `runs_allocated`, × portion, + `installed_qty`) stands and the tab says so. The ESI-sourced figure is "as of the last ESI update" (`store.last_job_pull`, shown in the note): installs after it and before Mark executed count once the next update records them (the same review). `esi.refresh_state` upserts every manufacturing / reaction job it sees (every status, so an earlier-active job stops counting once cancelled) through the `job_starts` filter and dedup; `installed_qty` / `job_starts` keep their planning role. The Profit tab: `short` badge + the plan's count on hover where fewer were installed, the plan's count on hover alone where more, and the "How this is computed" note names the figure's source. Resolves the two 2026-09-29 Profit-tab limits (a late install counting on both runs; the relisted rest of a slot-limited final counting as started). `SCHEMA_VERSION` 13 | The started figure was the install check's, which counts the plan's own buys as available, so a job the Industry Jobs tab listed counted as started whether or not it was installed — a real material shortfall never lowered Units — and a re-plan after a partial install relisted the rest as startable, bringing the count back to the plan's. The user's installs are an ESI fact (the plan is advisory; ESI is the ledger), and the same window rule that files purchases files jobs, so no hull counts twice. A durable record rather than the snapshot's `job_starts` because ESI forgets a job 90 days after it completes and the snapshot keeps five pulls; rather than re-stamping `installed_qty` at Mark executed because that would lose every job installed after the last update. Uncapped because a hull built is a hull built, at this per-hull cost; the Ledger sells what exists |
-| Index Runs list: opening Buy total, revenue and profit per run (user ruling 2026-10-24 — "add to the index header page a revenue and profit total for each index run. I want the buy total to reflect how much needs to be purchased when the index was first made") | `index_run.opening_buy_total_isk` / `opening_buys_unpriced` (ALTERs under the unreleased schema 13) are the opening plan's `Σ recommended_buy_qty × price_snapshot` and unpriced count, stamped by `engine.plan_index_run`'s INSERT path only and never by the in-place replace; `/runs` shows them as Buy total (the live sum, badged `latest`, on runs opened before the columns) while the run's own pages and the wallet check keep the live figure. Two new columns, Revenue and Profit per cycle: an executed run's from its Profit tab's cards (`web._profit_cards`, factored out of `_run_profit_context`) through `costing.cycle_totals` — net proceeds at today's quotes and profit — with `N unquoted` where finals lack a quote; the open run's from Planning → Profit's what-if (`web._whatif_cards`, factored out of `planning()`), badged `est.`; a superseded plan's a dash, an executed run with nothing attributable a dash, a row whose costing raised a dash (logged — the list never fails as a whole); the realized tooltips say whether the units are the ESI job record's or the plan's started figure (`hulls_from_esi`), and name the Profit tab's stat, since the Ledger's "Revenue" is gross. Live on every load (0.4 s per executed run at 43 pipelines) | The list's Buy total was the live sum of the current plan, which the v1.29 in-place re-plans shrink as bought stock lands (run 2 read 2.56B beside run 1's 335.6B), so it no longer answered "what did this cycle ask me to buy"; the opening figure is not recoverable after the fact, hence a stamp at the INSERT. Revenue and profit reuse the two existing profit computations rather than a third definition, so the list, the Profit tab and Planning → Profit agree to the ISK; the estimate for the open run because every row should carry a number and the what-if already exists |
+| Index Runs list: opening Buy total, revenue and profit per run (user ruling 2026-10-24 — "add to the index header page a revenue and profit total for each index run. I want the buy total to reflect how much needs to be purchased when the index was first made") | `index_run.opening_buy_total_isk` / `opening_buys_unpriced` (ALTERs under the unreleased schema 13) are the opening plan's `Σ recommended_buy_qty × price_snapshot` and unpriced count, stamped by `engine.plan_index_run`'s INSERT path only and never by the in-place replace; `/runs` shows them as Buy total (the live sum, badged `latest`, on runs opened before the columns) while the run's own pages and the wallet check keep the live figure. Two new columns, Revenue and Profit per cycle: an executed run's from its Profit tab's cards (`web._profit_cards`, factored out of `_run_profit_context`) through `costing.cycle_totals` — net proceeds at today's quotes and profit — with `N unquoted` where finals lack a quote; the open run's from Planning → Profit's what-if (`web._whatif_cards`, factored out of `planning()`), badged `est.`; a superseded plan's a dash, an executed run with nothing attributable a dash, a row whose costing raised a dash (logged — the list never fails as a whole); the realized tooltips say whether the units are the ESI job record's or the plan's started figure (`hulls_from_esi`), and name the Profit tab's stat, since the Ledger's "Revenue" is gross. Live on every load (0.4 s per executed run at 43 pipelines) | The list's Buy total was the live sum of the current plan, which the v1.29 in-place re-plans shrink as bought stock lands (run 2 read 2.56B beside run 1's 335.6B), so it no longer answered "what did this cycle ask me to buy"; the opening figure is not recoverable after the fact, hence a stamp at the INSERT. Revenue and profit reuse the two existing profit computations rather than a third definition, so the list, the Profit tab and Planning → Profit agree to the ISK (since 2026-10-31 the open run's row also carries its own for-sale hold at today's quote, which Planning → Profit — hulls only, no run to read — does not); the estimate for the open run because every row should carry a number and the what-if already exists |
+| Alchemy blacklist (user request 2026-10-30 — "a blacklist for alchemy types so they will not be run", checkboxes under the alchemy settings) | `alchemy_blacklist (composite_type_id)`, keyed like `refdata.alchemy_routes`; a "Never run" grid of the 17 routes, each labelled by its unrefined product ("Unrefined Ferrofluid" — user wording 2026-10-30, no sub-label), inside the Settings form, saved with it behind a hidden `alchemy_blacklist_present` marker so a form served without game data never clears it. `_alchemy_pass` skips a blocked route before the candidate loop (no savings move, no for-sale job, no comparison stamped); `_add_alchemy_ids` prices nothing of its own; unrefined stock on hand still credits the composite | Keyed by the composite because that is the routes' key and survives SDE drift; stock credits kept because an item in the hangar is stock whatever the user thinks of the route; the marker because unchecked boxes never post |
+| Alchemy for profit (user request 2026-10-30 — "fill any empty slots with alchemy runs ranked via profit selling the intermediates in jita", after the normal chooser and the alchemy steps) | A profit tail at the end of `_alchemy_pass` over the `spare` the savings moves left: every unblocked route is costed for SALE — net Jita proceeds per composite unit (`costing.net_proceeds_per_hull` over the HUB quote at the configured basis; user ruling 2026-10-30, the Profit tab's convention, over the best buy order) against the route's landed cost with recovered goo credited landed where the chain buys it, else at its own net proceeds — ranked by profit per slot and placed greedily under the ONE `max_alchemy_jobs_per_type` (user ruling 2026-10-30, over a second cap or none) and the savings moves' fuel test. Jobs are added for sale on the formula's unrefined row (`alchemy_profit_jobs`, `alchemy_sale_net_unit`, `alchemy_route_unit_cost`); the composite row is never credited. Needs Enable Alchemy. Industry Jobs tab: `for sale` badge, Savings / profit column, the sell share in the reprocess checklist, a Sell in Jita panel and a For sale stat. `SCHEMA_VERSION` 14 (settings flag + the run-item columns `alchemy_profit_jobs` / `alchemy_sale_net_unit` / `alchemy_route_unit_cost` / `held_for_sale_qty` / `held_from_credit_qty`, the tables `alchemy_blacklist`, `alchemy_hold` and `alchemy_hold_release` with its three indexes, and `industry_job.end_date` / `completed_date`) | The user asked for idle reaction slots to earn: the savings pass only ever converts coverage, so a pool with no cheaper route left stood idle. Additive and uncredited because the output is sold, not stocked — crediting it would shrink purchases this cycle's consumers draw and double-count against the deficit; the hub quote because it is what the Profit tab and Ledger already call revenue; one cap because the user already tunes it and the jobs are one formula's installs either way; recovered goo at net sale where the chain never draws it because a landed credit would price goo the user has to sell at what they would have paid to buy it **Amended 2026-10-31 (rulings (a), (h) below):** the tail's capacity nets this cycle's still-running reaction jobs out of `spare`, the Production Blacklist stops a for-sale route, a route with an unpriced bought input is skipped, and the stored route cost is kept across a re-plan that buys nothing of the route |
+| For-sale hold (user ruling 2026-10-31 — "does the app know … that the sell in jita quantities need to not be included"; "it should only last for the index run it was built on plus one more") | `alchemy_hold` per (run, composite), written by every persisted plan from `engine._planned_holds` (replace, never add); `_apply_targets` hides each live hold's remaining units from the composite's unrefined credit in flight first and, for an executed run's hold only, then its hangar stock — an open run's jobs have not delivered, so its hold never eats existing chain stock — never the recovered goo, never more than is there (`held_for_sale_qty`); live = runs with `run_number ≥ MAX executed run_number` (`store.live_alchemy_holds`), so marking N+1 executed drops N's; reopen revives it; superseded / discarded runs never count **Superseded 2026-10-31 (review of the same day, rulings (a)-(h) below):** the hold is anchored to the job record (`holds.py`), the life is delivery-based, the bite is pool-then-hangar for live holds alike — see the rows below | Without it the planner read the sale pile as chain stock and under-built the composite for a cycle, then ran short once the pile sold. A hard two-run life bounds the opposite failure (a stale hold hiding real stock and over-building forever); on the user's numbers the 720 h jobs land near the end of run N and sell during N+1, so "plus one" is the natural bound. Replace-on-re-plan because the open run is re-planned on every ESI update. **The review showed every one of those premises failing on the real cadence**: the hold followed the plan's proposal (re-plans inflated it 34×, a quote swing deleted it with its sale history), the open run's own hold fed back into its re-plan (two plans alternating on every update), and the pile left the hangar for the market before any sale was observed |
+| Hold released by observed sales, persisted per sale (2026-10-31) | `ledger.settle_alchemy_holds`: wallet sells and finished item-exchange contracts we issued (the Ledger's rules — Count-sales owners, no internal buyer, courier never; `attribute_contract` for the contract's price) dated after the oldest live hold's run opened, matched oldest run first and written to `alchemy_hold_release` with the sale's id, price and location (a sale over two holds = two rows); idempotent; run after the ESI update's sales pull, before a plan, and by the pages that read holds. A **Mark sold** form adds a 'manual' release — stock freed, no revenue **Amended 2026-10-31 (rulings (d), (e) below):** delivered holds only, a per-hold sale window, (sale, hold, composite) idempotency, by-hand marks replaced by the observed sale, an optional price on Mark sold; the pages never write | Read-time matching over the live holds alone double-counted: a sale that released run N's hold would re-release N+1's once N expired. Persisting the match makes every sale count once, keeps an expired hold's history for the Ledger, and needs no state beyond the sale ids the Ledger already stores. Chosen over a hold-level "sold" flag because partial sales are the norm |
+| Ledger and Profit tab show alchemy for sale; the headline totals include it (2026-10-31) | Ledger: an **Alchemy sales** section from the release rows (net by venue, cost at the hold's route cost, profit; the units still held at today's quote) — in none of the finals' totals, charts or Top 10s. Profit tab (executed run): an **Alchemy for sale** table per composite (planned, sold + realized net, still held at today's net quote as an estimate, cost = planned × route cost, profit); `costing.cycle_totals(cards, alchemy)` folds its cost / proceeds / profit into the cycle figures and keeps `alchemy_*` apart for the "incl. X alchemy" sub-text; the Index Runs list's Revenue / Profit therefore include it (the open run's estimate adds its own hold at today's quote); Planning → Profit's what-if stays hulls-only **Amended 2026-10-31 (ruling (c) and the review):** Planned is the ESI-anchored `for_sale_qty` (the proposal only as a badged fallback), an expired remainder earns 0 and keeps its cost ("returned to stock"), units sold without an attributable price are valued at today's quote and badged, a live no-quote remainder's cost is left out, cost excludes by-hand unpriced units, releases are costed at their own `unit_cost`, and Planned = Sold + By hand + Still held on every surface | The user asked that the Ledger and Profit tab reflect alchemy for profit. Folded into the headline so "profit per cycle" is the cycle's whole profit, and named beneath so the per-hull figures stay legible; the what-if has no run and no hold to read. Cost of goods is the plan's route cost per unit (the figure the sale was judged by) rather than a lagged chain cost, since an alchemy route is a single stage priced landed at plan time. The 2026-10-24 ruling ("the Profit tab reflects the jobs actually installed") applies to the alchemy line as it does to hulls: the plan is advisory, ESI is the ledger |
+| (a) The profit tail's capacity is the free lines (user ruling 2026-10-31, after the review) | `spare_tail = spare − reaction jobs started this cycle still active / paused / ready` (`store.running_jobs_started_after` over `industry_job`, the cycle cut as for installs; no cut yet → every running job); the formula's jobs started this cycle count toward the shared cap (`installed_jobs_started_after`). R2 (configured pools) is unchanged for every deficit-bounded consumer | R2's premise — installed jobs drop out through stock — is false for for-sale jobs, which have no deficit: on the production copy one post-install re-plan listed 582 for-sale jobs into a full pool and rewrote the hold to 6.36 M units (review #0, #49) |
+| (b) A hold lives through delivery plus one full run (user ruling 2026-10-31) | `holds.py`: live while any for-sale job of the hold is in flight, then while at most ONE executed run completed at or after `delivered_at` (ESI's `completed_date`, `end_date` for older records); `expires_after` = the first such run + 1; Reopen of that run revives it; a superseded run's hold is expired, so Reopen refuses while a newer planned run exists | On the user's cadence (reactions installed the day before Mark executed, 720 h jobs, ~33-day cycles) a run's pile lands 2–4 days before the next run is marked executed, exactly when the run-number rule dropped it (review #121); a count over `index_run` needs no special case for delivery between runs |
+| (c) An expired hold's remainder returns to stock (user ruling 2026-10-31) | Profit tab / Index Runs: estimate 0 for the unsold remainder once the hold expired, route cost kept, row badged "returned to stock" | The jobs ran and the chain got the units — the next run's smaller buy list shows the benefit; valuing them at today's quote forever double-counted (review #10) |
+| (d) Mark sold takes an optional price (user ruling 2026-10-31) | `alchemy_hold_sold`: settle first, then spread the quantity oldest-first over the composite's delivered live holds whichever page posted it, one 'manual' row per hold with `unit_price` = the entered ISK per unit (realized revenue, no fee or freight term) or NULL (neither revenue nor cost); each row has an undo; a confirm names the target run; an observed sale of the same units later shrinks the manual rows instead of spilling | A by-hand mark without a price turned a recorded sale into a loss (review #31); the user works on the open run's page while the previous run's pile is what sells (review #101, #33) |
+| (e) Observed sales release delivered holds only (user ruling 2026-10-31) | A sale counts against a hold iff the hold's for-sale jobs have delivered (`delivered_units > 0`), dated from the first delivery to the hold's expiry (a contract by `date_issued`), up to the delivered room not yet observed; units beyond stay unassigned as ordinary chain-stock sales; live or expired holds alike, oldest run first; one row per (sale, hold) with an upsert for a hold whose room grows | Chain-surplus sales were releasing the open run's hold before its pile existed, so the real pile later counted as chain stock (review #116, #9, #59, #63); a pile cannot be sold before it is delivered |
+| (f) The route cost is re-stamped after fill pricing (user ruling 2026-10-31) | `engine._restamp_route_costs` after Phase 7.5: each for-sale row's inputs the plan BUYS outright at their rows' fill-priced landed average (`costing.ladder_landed_unit`), built rows at the Phase 1 landed quote, recovered goo the same way; ranking and candidate selection stay at the Phase 1 quote; the hold's `route_unit_cost` is frozen with its anchors once installs exist | On production the ladder premium was 3.9 % of the expected for-sale profit (review #120): a cost of goods that disagrees with the Buy tab is not what the plan pays |
+| (g) For-sale jobs are cut first (user ruling 2026-10-31) | `_ration`: an alchemy row's for-sale runs are a third pass over what the chain's consumers left; the pool-overflow trim cuts for-sale jobs first, lowest profit per slot first; `alchemy_sale_split` already reads a cut as the for-sale share | A short goo ladder was cutting chain reactions in proportion to make room for optional for-sale jobs (review #20, #50, #87) |
+| (h) The Production Blacklist stops for-sale routes too (user ruling 2026-10-31) | The profit tail skips a route whose unrefined product or composite `_blacklist_checker` rejects (per-item list or category); the Settings help says so | A type the user marked "buy, don't build" was still getting reaction jobs for sale (review #88) |
+| Reopen and Discard respect the hold (review 2026-10-31) | `run_reopen` refuses while a newer PLANNED run exists ("discard run N+1 first"); `run_delete` refuses a run whose holds show a job installed after the row's anchor (a frozen row) or any release | A reopened run that is not the newest has no buying window, so its hold could neither be read from ESI nor expire; discarding a run with installs cascaded its sale history away and handed its installs to the next run's baseline as chain stock (review #113, #56) |
 
 ---
 
@@ -5153,12 +5481,51 @@ user's Windows machine against the live database.
   Multibuy until it lands; the only mitigation is copy and an
   `in transit?` badge. The user must accept the regression or ask for a
   transit model.
+- **Known limits of the alchemy for-sale hold** (review and rulings
+  2026-10-31, §7 Phase 6.5): (1) installs of a formula after the first
+  install session are read savings-first against the frozen
+  `chain_units` — a savings top-up installed after the for-sale batch, or
+  for-sale jobs installed after a partial savings install and a plan
+  change, are misread by that many jobs (the one-session install flow is
+  unaffected); (2) listed chain surplus of a held composite counts as the
+  pile while a pile is in the hangar; (3) the profit tail's fuel gate
+  still treats a priced built fuel block as unlimited — an over-drawn
+  block shows as unsourced units on the Buy tab and the install check
+  trims the for-sale jobs, never the chain's; (4) recovered goo of an
+  off-chain route's unrefined pile in flight is not credited (review #51),
+  and the for-sale goo's deeper rungs stay inside the chain row's blended
+  price (#93, the one-blended-price ruling); (5) Count-sales and
+  internal-buyer rules apply at match time, not at read time (#29); (6)
+  `ledger.listed_units` counts the units in outstanding courier contracts
+  only once their items are on file, and the sales pull fetches items for
+  item exchanges alone — so a pile hauled by courier bites the hangar
+  until it is listed; fetching courier items is a pull-side change;
+  (7) a contract bundling a pipeline final with held composites is
+  "mixed" for the finals' Ledger (the final's share books as units
+  only, as any bundle with a non-final always did) while the
+  composites' shares settle pro rata by quote — the finals' view does
+  not treat held composites as attributable (test audit 2026-10-31);
+  (8) on an executed run whose window the pull log does not cover, a
+  for-sale job installed after the last pull is missing from the hold
+  until the next update — the record is read where it shows any
+  for-sale job of the window and the plan's figure stands in only
+  while it shows none (§7 Phase 6.5); (9) a hold on a composite that
+  is any pipeline's final (installed before the pipeline existed — the
+  tail never lists one) is never released by observed sales, which
+  belong to the finals' Ledger: Mark sold frees it; (10) a want-to-buy
+  contract we ACCEPT (the buyer issued it; `buy_contract`) is not a
+  Ledger sale and releases no hold — Mark sold; (11) the pile sold as
+  the UNREFINED product (never reprocessed) matches no composite sale,
+  so the hold keeps hiding composite units until Mark sold or expiry.
 - **Busy lines after the installs — confirm with the user** (review of
   v1.29 revision 7, 2026-09-29): slot pools are the configured pools
   (ruling R2, 2026-09-28), so once the cycle's installs fill every line a
   re-plan still lists a slot-limited final's or reaction's rest as jobs
   to run now (Hulk ×8 on 6 manufacturing slots, all 6 installed: 2 more
   listed) and its inputs replace the fallback purchases on the Buy tab.
+  Since 2026-10-31 (ruling (a)) the alchemy profit tail alone nets this
+  cycle's still-running reaction jobs out of its capacity — for-sale jobs
+  have no deficit to drop out through; R2 stands for every other consumer.
   ~~`costing.hull_cost` counts the listed rest as started on the executed
   run (8 hulls, 6 started)~~ — resolved 2026-10-24: the Profit tab counts
   what ESI shows installed (6), the plan's figure only where the job

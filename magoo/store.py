@@ -8,6 +8,7 @@ class_setting row per item class.
 
 import logging
 import math
+import re
 import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields
@@ -24,7 +25,7 @@ log = logging.getLogger(__name__)
 # _MIGRATIONS grows, so an older build meets a clear refusal rather than
 # a 'no such column' traceback. Databases written before v1.21 carry 0,
 # which reads as 'older' — exactly right, since they predate the stamp.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipeline (
@@ -220,6 +221,80 @@ CREATE TABLE IF NOT EXISTS blacklist_category (
 CREATE TABLE IF NOT EXISTS blacklist_item (
     type_id INTEGER PRIMARY KEY
 );
+-- Alchemy blacklist (schema 14): routes the alchemy pass never runs jobs
+-- for, keyed by the composite the route feeds (refdata.alchemy_routes'
+-- key). Unrefined stock already on hand still credits the composite.
+CREATE TABLE IF NOT EXISTS alchemy_blacklist (
+    composite_type_id INTEGER PRIMARY KEY
+);
+-- Alchemy for-sale holds (schema 14, user rulings 2026-10-31): one row
+-- per (run, composite) the run's plan proposed for-sale alchemy jobs on.
+-- The row stores ANCHORS only; what the hold hides, whether its jobs have
+-- delivered and whether it is live are derived at read time from the job
+-- record (magoo/holds.py), so no stored figure can go stale:
+--   planned_qty     the plan's for-sale proposal in composite units at the
+--                   last write before installs — a display / fallback figure
+--   route_unit_cost the route's cost per composite unit (cost of goods)
+--   anchored_at     when the row was first written — the plan the user may
+--                   install from. A formula job started at or before it is
+--                   the chain's whatever the record shows later (a late
+--                   install of the previous run); one started after it
+--                   belongs to this plan — the first savings-share units
+--                   the chain's, the rest the hold's for-sale jobs — and
+--                   FREEZES the row. NULL only on legacy rows, which are
+--                   read by the stored baseline instead.
+--   baseline_units  the pre-anchor installed units the record showed at
+--                   the last write (display; the reader re-derives them)
+--   chain_units     baseline + the plan's savings jobs' unrefined units;
+--                   chain_units − baseline_units is the savings share the
+--                   reader applies to the jobs started after the anchor
+--   yield_          the reprocess yield the hold was written at
+--   cost_from_fills 1 when route_unit_cost came from a plan that priced an
+--                   input at a fill (bought this cycle); a later plan that
+--                   buys nothing of the route keeps it (ruling (f))
+-- Rows are never deleted by a plan (a dropped composite keeps its row with
+-- planned_qty 0); they go only with their run (ON DELETE CASCADE), and
+-- web.run_delete refuses a run whose rows show installs or releases.
+CREATE TABLE IF NOT EXISTS alchemy_hold (
+    index_run_id        INTEGER NOT NULL REFERENCES index_run ON DELETE CASCADE,
+    composite_type_id   INTEGER NOT NULL,
+    planned_qty         INTEGER NOT NULL DEFAULT 0,
+    route_unit_cost     REAL,
+    baseline_units      INTEGER,
+    chain_units         INTEGER,
+    yield_              REAL,
+    anchored_at         TEXT,
+    cost_from_fills     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (index_run_id, composite_type_id)
+);
+-- A release: units of a hold accounted for by an observed sale (a wallet
+-- sell transaction or a finished item-exchange contract — ref_id is its
+-- id; unit_price / location_id are the sale's, for the Ledger) or marked
+-- sold by hand (source 'manual', no ref; unit_price = the price entered,
+-- NULL for none). unit_cost is the hold's route cost at match time, so
+-- the Ledger never re-costs history. One sale may release two holds,
+-- oldest run first, as two rows; one (sale, hold) pair is one row (the
+-- partial UNIQUE index alchemy_hold_release_sale, created by the
+-- migrations after a dedupe, so a database stamped 14 before it exists
+-- cannot fail ensure_schema).
+CREATE TABLE IF NOT EXISTS alchemy_hold_release (
+    release_id          INTEGER PRIMARY KEY,
+    index_run_id        INTEGER NOT NULL,
+    composite_type_id   INTEGER NOT NULL,
+    qty                 INTEGER NOT NULL,
+    source              TEXT NOT NULL CHECK (source IN ('market', 'contract', 'manual')),
+    ref_id              INTEGER,
+    unit_price          REAL,
+    location_id         INTEGER,
+    released_at         TEXT NOT NULL,
+    unit_cost           REAL,
+    FOREIGN KEY (index_run_id, composite_type_id)
+        REFERENCES alchemy_hold ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS alchemy_hold_release_ref
+    ON alchemy_hold_release (source, ref_id);
+CREATE INDEX IF NOT EXISTS alchemy_hold_release_hold
+    ON alchemy_hold_release (index_run_id, composite_type_id);
 
 -- ESI OAuth tokens (PROJECT.md §8).
 CREATE TABLE IF NOT EXISTS esi_token (
@@ -587,16 +662,22 @@ CREATE TABLE IF NOT EXISTS run_purchase_refine (
 -- start_date is UTC 'YYYY-MM-DD HH:MM:SS' (ESI's ISO text normalised at
 -- write time, store.utc_text) so a window test is a plain text compare
 -- against index_run.completed_at. units = runs x portion, as the
--- planner's in_progress credit and job_starts count them.
+-- planner's in_progress credit and job_starts count them. end_date is
+-- the job's timer end and completed_date its delivery to the hangar
+-- (both ESI's, normalised the same way; NULL on rows recorded before the
+-- columns) — the alchemy for-sale hold reads delivery from them
+-- (schema 14, user ruling 2026-10-31).
 CREATE TABLE IF NOT EXISTS industry_job (
-    job_id      INTEGER PRIMARY KEY,
-    type_id     INTEGER NOT NULL,
-    activity_id INTEGER NOT NULL,
-    start_date  TEXT NOT NULL,
-    runs        INTEGER NOT NULL,
-    units       INTEGER NOT NULL,
-    status      TEXT NOT NULL,
-    seen_at     TEXT NOT NULL
+    job_id         INTEGER PRIMARY KEY,
+    type_id        INTEGER NOT NULL,
+    activity_id    INTEGER NOT NULL,
+    start_date     TEXT NOT NULL,
+    runs           INTEGER NOT NULL,
+    units          INTEGER NOT NULL,
+    status         TEXT NOT NULL,
+    seen_at        TEXT NOT NULL,
+    end_date       TEXT,
+    completed_date TEXT
 );
 CREATE INDEX IF NOT EXISTS industry_job_type_start
     ON industry_job (type_id, start_date);
@@ -612,6 +693,8 @@ CREATE TABLE IF NOT EXISTS industry_job_pull (
     pull_id   INTEGER PRIMARY KEY,
     pulled_at TEXT NOT NULL
 );
+-- jobs_covered walks the log in order once per window read.
+CREATE INDEX IF NOT EXISTS industry_job_pull_at ON industry_job_pull (pulled_at);
 """
 
 # Columns added after the original schema; applied idempotently.
@@ -1143,6 +1226,57 @@ _MIGRATIONS = (
     # last plan's live sum and says so.
     "ALTER TABLE index_run ADD COLUMN opening_buy_total_isk REAL",
     "ALTER TABLE index_run ADD COLUMN opening_buys_unpriced INTEGER",
+    # Schema 14 (2026-10-30): alchemy for profit. With the flag on, the
+    # alchemy pass ends by filling the reaction slots still free with
+    # unrefined reactions whose composite SELLS in Jita for more than the
+    # route costs, most profitable per slot first. Those jobs are added
+    # for sale, never credited to any deficit or purchase.
+    "ALTER TABLE settings ADD COLUMN alchemy_for_profit INTEGER NOT NULL DEFAULT 0",
+    # On unrefined plan rows: how many of the row's jobs were added for
+    # sale, the net Jita proceeds per composite unit they were judged
+    # against (hub quote less sales tax, broker fee, SCC and freight-out)
+    # and the route's cost per composite unit as the profit pass priced
+    # it — the composite may not be a plan row at all.
+    "ALTER TABLE index_run_item ADD COLUMN alchemy_profit_jobs INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE index_run_item ADD COLUMN alchemy_sale_net_unit REAL",
+    "ALTER TABLE index_run_item ADD COLUMN alchemy_route_unit_cost REAL",
+    # Under the unreleased schema 14 (no bump; user ruling 2026-10-31):
+    # on a composite row, the units of its stock a live for-sale hold hid
+    # from this plan (the formula's unrefined pool first — on hand + in
+    # flight at the Settings yield, only the credited part off In jobs —
+    # then the hangar) and the part of that figure that came out of the credit.
+    # NULL on rows planned before the columns and where no hold applied.
+    "ALTER TABLE index_run_item ADD COLUMN held_for_sale_qty INTEGER",
+    "ALTER TABLE index_run_item ADD COLUMN held_from_credit_qty INTEGER",
+    # The hold's anchors and the release's cost of goods (review
+    # 2026-10-31, rulings the same day): see the DDL comments. For a
+    # database stamped 14 before these columns existed (a dev copy; the
+    # installed app is still at 13) the ALTERs add them, the backfills
+    # give legacy rows a yield and a unit cost so nothing divides by NULL
+    # (a legacy row keeps NULL anchors: an executed run's reads as a plan
+    # figure, an open run's is anchored at its next plan — holds.py), a
+    # dedupe clears any double-applied sale the old settle could write
+    # under concurrency, and only then the partial UNIQUE index goes on.
+    "ALTER TABLE alchemy_hold ADD COLUMN baseline_units INTEGER",
+    "ALTER TABLE alchemy_hold ADD COLUMN chain_units INTEGER",
+    "ALTER TABLE alchemy_hold ADD COLUMN yield_ REAL",
+    "ALTER TABLE alchemy_hold ADD COLUMN anchored_at TEXT",
+    "ALTER TABLE alchemy_hold ADD COLUMN cost_from_fills INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS industry_job_pull_at ON industry_job_pull (pulled_at)",
+    "ALTER TABLE alchemy_hold_release ADD COLUMN unit_cost REAL",
+    "ALTER TABLE industry_job ADD COLUMN end_date TEXT",
+    "ALTER TABLE industry_job ADD COLUMN completed_date TEXT",
+    "UPDATE alchemy_hold SET yield_ = (SELECT alchemy_reprocess_yield FROM settings "
+    "WHERE id = 1) WHERE yield_ IS NULL",
+    "UPDATE alchemy_hold_release SET unit_cost = (SELECT h.route_unit_cost FROM alchemy_hold h "
+    "WHERE h.index_run_id = alchemy_hold_release.index_run_id "
+    "AND h.composite_type_id = alchemy_hold_release.composite_type_id) WHERE unit_cost IS NULL",
+    "DELETE FROM alchemy_hold_release WHERE ref_id IS NOT NULL AND release_id NOT IN "
+    "(SELECT MIN(release_id) FROM alchemy_hold_release WHERE ref_id IS NOT NULL "
+    "GROUP BY source, ref_id, index_run_id, composite_type_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS alchemy_hold_release_sale "
+    "ON alchemy_hold_release (source, ref_id, index_run_id, composite_type_id) "
+    "WHERE ref_id IS NOT NULL",
 )
 
 # Persisted ESI state so planning is decoupled from the (slow) ESI pull.
@@ -1414,7 +1548,11 @@ def _backup_before_migrating(conn: sqlite3.Connection) -> None:
     if exists is None:
         return  # brand-new database: nothing to lose
     dest_dir = config.DATA_DIR / "backups"
-    dest = dest_dir / f"magoo-pre-{__version__}.sqlite"
+    # Named by the build AND the schema it found (review 2026-10-31): a
+    # second one-way migration under one version string — a dev build
+    # before the stamp — still gets its own snapshot instead of finding
+    # "its" file already there and writing none.
+    dest = dest_dir / f"magoo-pre-{__version__}-s{_user_version(conn)}.sqlite"
     if dest.exists():
         return  # already snapshotted for this version; never overwrite
     try:
@@ -1436,10 +1574,17 @@ def _backup_before_migrating(conn: sqlite3.Connection) -> None:
         )
 
 
+# Only the snapshots this module writes itself are ever pruned: a version
+# number, optionally the schema suffix added 2026-10-31. A hand-named
+# file in the same folder (magoo-pre-cleanup-2026-09-30.sqlite) is the
+# user's and stays (review 2026-10-31).
+_AUTO_BACKUP = re.compile(r"^magoo-pre-\d+\.\d+\.\d+(-s\d+)?\.sqlite$")
+
+
 def _prune_backups(dest_dir, keep: int = 3) -> None:
     try:
         found = sorted(
-            dest_dir.glob("magoo-pre-*.sqlite"),
+            (f for f in dest_dir.glob("magoo-pre-*.sqlite") if _AUTO_BACKUP.match(f.name)),
             key=lambda f: f.stat().st_mtime,
             reverse=True,
         )
@@ -1776,6 +1921,9 @@ class Settings:
     alchemy_enabled: bool = False
     alchemy_reprocess_yield: float = 0.55  # scrapmetal cap; user-asserted
     max_alchemy_jobs_per_type: int = 4  # per unrefined type per cycle
+    # Schema 14: fill the reaction slots the savings alchemy leaves with
+    # routes whose composite sells in Jita at a profit (shares the cap).
+    alchemy_for_profit: bool = False
     # v1.5 profit page: sell-side fees and hauling (costing.py)
     skill_accounting: int = 5
     skill_broker_relations: int = 5
@@ -1974,6 +2122,7 @@ def get_settings(conn: sqlite3.Connection) -> Settings:
     kwargs = {k: row[k] for k in row.keys() if k in names}
     for flag in (
         "alchemy_enabled",
+        "alchemy_for_profit",
         "count_fitted_stock",
         "structure_buy_enabled",
         "compressed_minerals_enabled",
@@ -2646,6 +2795,195 @@ def set_blacklist_categories(conn: sqlite3.Connection, keys: set[str]) -> None:
     conn.commit()
 
 
+def alchemy_blacklist(conn: sqlite3.Connection) -> set[int]:
+    """The composites whose alchemy route never runs jobs (schema 14),
+    keyed like refdata.alchemy_routes."""
+    return {
+        row["composite_type_id"]
+        for row in conn.execute("SELECT composite_type_id FROM alchemy_blacklist")
+    }
+
+
+def set_alchemy_blacklist(conn: sqlite3.Connection, composite_ids: set[int]) -> None:
+    """Replace the alchemy blacklist. No commit: the settings save calls
+    it inside its own transaction."""
+    conn.execute("DELETE FROM alchemy_blacklist")
+    conn.executemany(
+        "INSERT INTO alchemy_blacklist VALUES (?)",
+        [(int(t),) for t in composite_ids],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Alchemy for-sale holds (schema 14, user ruling 2026-10-31)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Alchemy for-sale holds (schema 14): raw rows only. The derived figures —
+# what a hold hides, whether its jobs delivered, whether it is live — are
+# read from the job record at load time by magoo/holds.py, never stored.
+
+HOLD_FIELDS = (
+    "planned_qty", "route_unit_cost", "baseline_units", "chain_units", "yield_",
+    "anchored_at", "cost_from_fills",
+)
+
+
+def hold_rows(conn: sqlite3.Connection, index_run_id: int | None = None) -> list[sqlite3.Row]:
+    """Every hold row with its run's number, status, opening and
+    completion (one run's when `index_run_id` is given), oldest run first.
+    A discarded run took its rows with it (ON DELETE CASCADE)."""
+    sql = (
+        "SELECT h.index_run_id, h.composite_type_id, h.planned_qty, h.route_unit_cost, "
+        "h.baseline_units, h.chain_units, h.yield_, h.anchored_at, h.cost_from_fills, "
+        "r.run_number, r.status AS run_status, "
+        "COALESCE(r.opened_at, r.planned_start) AS opened_at, r.completed_at "
+        "FROM alchemy_hold h JOIN index_run r USING (index_run_id) "
+    )
+    params: tuple = ()
+    if index_run_id is not None:
+        sql += "WHERE h.index_run_id = ? "
+        params = (int(index_run_id),)
+    sql += "ORDER BY r.run_number, r.index_run_id, h.composite_type_id"
+    return conn.execute(sql, params).fetchall()
+
+
+def release_rows(conn: sqlite3.Connection, index_run_id: int | None = None) -> list[sqlite3.Row]:
+    """Every release row (one run's when given), oldest first."""
+    sql = "SELECT * FROM alchemy_hold_release "
+    params: tuple = ()
+    if index_run_id is not None:
+        sql += "WHERE index_run_id = ? "
+        params = (int(index_run_id),)
+    sql += "ORDER BY index_run_id, composite_type_id, release_id"
+    return conn.execute(sql, params).fetchall()
+
+
+def upsert_hold(
+    conn: sqlite3.Connection, index_run_id: int, composite_type_id: int, **fields
+) -> None:
+    """Insert one hold row, or update just the given columns (HOLD_FIELDS)
+    of the existing one — the plan's persist path (holds.write_plan_holds)
+    decides which columns a write may touch. No commit: called inside the
+    plan's write transaction."""
+    unknown = set(fields) - set(HOLD_FIELDS)
+    if unknown:
+        raise ValueError(f"not hold columns: {sorted(unknown)}")
+    insert = {"index_run_id": int(index_run_id), "composite_type_id": int(composite_type_id)}
+    insert.update(fields)
+    insert.setdefault("planned_qty", 0)
+    cols = list(insert)
+    sql = (
+        f"INSERT INTO alchemy_hold ({', '.join(cols)}) "
+        f"VALUES ({', '.join('?' * len(cols))}) "
+        "ON CONFLICT (index_run_id, composite_type_id) DO "
+    )
+    if fields:
+        sql += "UPDATE SET " + ", ".join(f"{f} = excluded.{f}" for f in fields)
+    else:
+        sql += "NOTHING"
+    conn.execute(sql, tuple(insert[c] for c in cols))
+
+
+def add_alchemy_release(
+    conn: sqlite3.Connection,
+    index_run_id: int,
+    composite_type_id: int,
+    qty: int,
+    source: str,
+    ref_id: int | None = None,
+    unit_price: float | None = None,
+    location_id: int | None = None,
+    released_at: str | None = None,
+    unit_cost: float | None = None,
+) -> None:
+    """Record units of a hold accounted for. A second application of the
+    same sale to the same hold (a hold whose room grew after a partial
+    match) adds to the existing row rather than failing the partial
+    UNIQUE index; a by-hand release (ref_id None) is always a new row. No
+    commit."""
+    conn.execute(
+        "INSERT INTO alchemy_hold_release (index_run_id, composite_type_id, qty, "
+        "source, ref_id, unit_price, location_id, released_at, unit_cost) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), ?) "
+        "ON CONFLICT (source, ref_id, index_run_id, composite_type_id) WHERE ref_id IS NOT NULL "
+        "DO UPDATE SET qty = qty + excluded.qty",
+        (index_run_id, int(composite_type_id), int(qty), source, ref_id,
+         unit_price, location_id, released_at, unit_cost),
+    )
+
+
+def alchemy_released_qty(
+    conn: sqlite3.Connection, source: str, ref_id: int, composite_type_id: int | None = None
+) -> int:
+    """Units of one sale already applied to holds (any run; one
+    composite's when given — a contract can sell two held composites) —
+    the settlement's idempotency test."""
+    sql = "SELECT COALESCE(SUM(qty), 0) FROM alchemy_hold_release WHERE source = ? AND ref_id = ?"
+    params: list = [source, ref_id]
+    if composite_type_id is not None:
+        sql += " AND composite_type_id = ?"
+        params.append(int(composite_type_id))
+    row = conn.execute(sql, params).fetchone()
+    return int(row[0] or 0)
+
+
+def shrink_manual_releases(
+    conn: sqlite3.Connection, index_run_id: int, composite_type_id: int, units: int
+) -> int:
+    """Take `units` off the hold's by-hand releases, newest first (a row
+    shrinks, or goes at 0) — an observed sale replacing a hand mark.
+    Returns the units taken. No commit."""
+    left = int(units)
+    for row in conn.execute(
+        "SELECT release_id, qty FROM alchemy_hold_release WHERE index_run_id = ? "
+        "AND composite_type_id = ? AND source = 'manual' ORDER BY release_id DESC",
+        (int(index_run_id), int(composite_type_id)),
+    ).fetchall():
+        if left <= 0:
+            break
+        take = min(int(row["qty"]), left)
+        if take >= int(row["qty"]):
+            conn.execute("DELETE FROM alchemy_hold_release WHERE release_id = ?", (row["release_id"],))
+        else:
+            conn.execute(
+                "UPDATE alchemy_hold_release SET qty = qty - ? WHERE release_id = ?",
+                (take, row["release_id"]),
+            )
+        left -= take
+    return int(units) - left
+
+
+def delete_release(conn: sqlite3.Connection, release_id: int) -> sqlite3.Row | None:
+    """Remove one release row (the Mark sold undo) and return it, None
+    when there was none. No commit."""
+    row = conn.execute(
+        "SELECT * FROM alchemy_hold_release WHERE release_id = ?", (int(release_id),)
+    ).fetchone()
+    if row is not None:
+        conn.execute("DELETE FROM alchemy_hold_release WHERE release_id = ?", (int(release_id),))
+    return row
+
+
+def alchemy_releases(conn: sqlite3.Connection, since_ts: str | None = None) -> list[sqlite3.Row]:
+    """Release rows joined to their hold's route cost, their run number
+    and the sale location's solar system, newest first — the Ledger's
+    alchemy sales section."""
+    clause = " WHERE x.released_at >= ?" if since_ts else ""
+    return conn.execute(
+        "SELECT x.*, h.route_unit_cost, r.run_number, ls.solar_system_id "
+        "FROM alchemy_hold_release x "
+        "JOIN alchemy_hold h ON h.index_run_id = x.index_run_id "
+        "  AND h.composite_type_id = x.composite_type_id "
+        "JOIN index_run r ON r.index_run_id = x.index_run_id "
+        "LEFT JOIN location_system ls ON ls.location_id = x.location_id"
+        + clause
+        + " ORDER BY x.released_at DESC, x.release_id DESC",
+        (since_ts,) if since_ts else (),
+    ).fetchall()
+
+
 # ---------------------------------------------------------------------------
 # Persisted ESI snapshots (planning is decoupled from the ESI pull)
 # ---------------------------------------------------------------------------
@@ -2784,13 +3122,15 @@ def save_industry_jobs(
             continue
         conn.execute(
             "INSERT INTO industry_job (job_id, type_id, activity_id, start_date, "
-            "runs, units, status, seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+            "runs, units, status, seen_at, end_date, completed_date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?) "
             "ON CONFLICT(job_id) DO UPDATE SET "
             "type_id = excluded.type_id, activity_id = excluded.activity_id, "
             "start_date = excluded.start_date, runs = excluded.runs, "
             "units = excluded.units, status = excluded.status, "
-            "seen_at = excluded.seen_at",
+            "seen_at = excluded.seen_at, "
+            "end_date = COALESCE(excluded.end_date, end_date), "
+            "completed_date = COALESCE(excluded.completed_date, completed_date)",
             (
                 int(job_id),
                 int(row["type_id"]),
@@ -2799,6 +3139,8 @@ def save_industry_jobs(
                 int(row.get("runs") or 0),
                 int(row.get("units") or 0),
                 str(row.get("status") or ""),
+                utc_text(row.get("end_date")),
+                utc_text(row.get("completed_date")),
             ),
         )
         written += 1
@@ -2824,6 +3166,66 @@ def installed_units(conn: sqlite3.Connection, type_id: int, lo, hi) -> int:
         (int(type_id), lo_text, hi_text, *sorted(JOB_STATUSES_INSTALLED)),
     ).fetchone()
     return int(row[0] or 0)
+
+
+# A job in one of these statuses holds a line: its slot is busy and its
+# output is still to come (ready = finished, not yet delivered).
+JOB_STATUSES_RUNNING = frozenset({"active", "paused", "ready"})
+
+
+def jobs_in_window(conn: sqlite3.Connection, type_id: int, lo, hi=None) -> list[sqlite3.Row]:
+    """The recorded jobs of `type_id` that STARTED inside (lo, hi] — every
+    status, oldest start first — with their units, status, timer end and
+    delivery (end_date / completed_date, NULL on rows recorded before the
+    columns). `hi` None puts no upper bound (the open run, read up to the
+    latest pull by the caller's choice of hi). A bound that does not
+    parse makes the window empty."""
+    lo_text = utc_text(lo)
+    if lo_text is None:
+        return []
+    sql = (
+        "SELECT job_id, start_date, runs, units, status, end_date, completed_date, seen_at "
+        "FROM industry_job WHERE type_id = ? AND start_date > ?"
+    )
+    params: list = [int(type_id), lo_text]
+    if hi is not None:
+        hi_text = utc_text(hi)
+        if hi_text is None:
+            return []
+        sql += " AND start_date <= ?"
+        params.append(hi_text)
+    sql += " ORDER BY start_date, job_id"
+    return conn.execute(sql, params).fetchall()
+
+
+def running_jobs_started_after(conn: sqlite3.Connection, activity_id: int, cut) -> int:
+    """How many recorded jobs of `activity_id` still hold a line (active /
+    paused / ready) and started after `cut` — this cycle's installs, the
+    lines a mid-cycle re-plan cannot use (ruling (a), 2026-10-31). `cut`
+    None or unparseable: every running job on record (the first cycle has
+    no previous cycle to exclude — the conservative side)."""
+    cut_text = utc_text(cut) if cut is not None else None
+    marks = ",".join("?" * len(JOB_STATUSES_RUNNING))
+    sql = f"SELECT COUNT(*) FROM industry_job WHERE activity_id = ? AND status IN ({marks})"
+    params: list = [int(activity_id), *sorted(JOB_STATUSES_RUNNING)]
+    if cut_text is not None:
+        sql += " AND start_date > ?"
+        params.append(cut_text)
+    return int(conn.execute(sql, params).fetchone()[0] or 0)
+
+
+def installed_jobs_started_after(conn: sqlite3.Connection, type_id: int, cut) -> int:
+    """How many recorded jobs of `type_id` in an installed status started
+    after `cut` — the formula's jobs this cycle already holds against the
+    shared alchemy cap. `cut` None or unparseable counts every one."""
+    cut_text = utc_text(cut) if cut is not None else None
+    marks = ",".join("?" * len(JOB_STATUSES_INSTALLED))
+    sql = f"SELECT COUNT(*) FROM industry_job WHERE type_id = ? AND status IN ({marks})"
+    params: list = [int(type_id), *sorted(JOB_STATUSES_INSTALLED)]
+    if cut_text is not None:
+        sql += " AND start_date > ?"
+        params.append(cut_text)
+    return int(conn.execute(sql, params).fetchone()[0] or 0)
 
 
 def jobs_covered(conn: sqlite3.Connection, lo, hi) -> bool:

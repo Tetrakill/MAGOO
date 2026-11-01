@@ -98,6 +98,27 @@
     composite the plan would otherwise purchase — never units your jobs
     need this cycle, because reprocessed output arrives at the end of
     it.</p>
+    <p>With <b>Alchemy for Profit</b> on, the reaction slots still free
+    once those routes are placed — free slots only: the pool less the
+    reaction jobs ESI shows started this cycle, the direct jobs your
+    stock can start and the savings alchemy — fill with unrefined
+    reactions whose composite sells in Jita for more than the route
+    costs: the Jita quote at your hub pricing basis, less sales tax,
+    broker fee, the SCC surcharge and outbound freight, against the
+    route's cost: inputs landed plus the job fee, less what the reprocess
+    gives back (goo the chain buys at its landed price, the rest at its
+    net Jita sale). The most profitable route per slot fills first; a
+    route whose unrefined product or composite is on the Production
+    Blacklist is never run for profit. That output is yours to sell: the
+    plan does not count it toward a stockpile or a purchase while it is
+    held for sale (an unsold remainder returns to stock when the hold
+    ends), and the Industry Jobs tab lists what to sell. The units a run's for-sale jobs
+    make stay <b>held for sale</b> — hidden from the plan's stock — while
+    the jobs run and for one full run after they deliver (the second
+    Mark executed after delivery ends the hold), unless the ESI update
+    sees them sold on the market or in a contract or you mark them sold;
+    the Ledger and the run's Profit tab show what they earned. A route
+    ticked under <b>Never run</b> gets no jobs of either kind.</p>
   </details>
   <div class="fields">
     <label for="alchemy_enabled">Enable Alchemy <small>Use unrefined reactions when reaction slots would otherwise sit idle.</small></label>
@@ -106,10 +127,33 @@
       <small>Share recovered when you reprocess an unrefined item. Scrap-metal rules: at most 55%, rigs do not help. Lower it to allow for a refinery tax.</small></label>
     <span class="withunit"><input id="alchemy_yield_pct" name="alchemy_yield_pct" type="number" step="0.5" min="0" max="100"
            value="{{ settings.alchemy_reprocess_yield|pct }}">%</span>
-    <label for="max_alchemy_jobs">Max Alchemy Jobs per Type <small>Most alchemy jobs for any one formula per cycle. 0 switches alchemy off.</small></label>
+    <label for="max_alchemy_jobs">Max Alchemy Jobs per Type <small>Most alchemy jobs for any one formula per plan, savings and for-profit jobs together; the for-profit tail also counts the formula's jobs installed this cycle toward it. 0 switches alchemy off.</small></label>
     <input id="max_alchemy_jobs" name="max_alchemy_jobs" type="number" min="0"
            value="{{ settings.max_alchemy_jobs_per_type }}">
+    <label for="alchemy_for_profit">Alchemy for Profit
+      <small>After the direct reactions and the savings alchemy are placed, fill the reaction slots still free with unrefined reactions whose composite sells in Jita for more than the route costs, most profitable per slot first. Needs Enable Alchemy. Refresh prices after switching it on or un-ticking a route: a route whose inputs or composite have no cached price is skipped until then.</small></label>
+    <input id="alchemy_for_profit" name="alchemy_for_profit" type="checkbox" {{ 'checked' if settings.alchemy_for_profit }}>
   </div>
+  {# Review #69 (2026-10-31): a fieldset/legend ties each box to the group
+     it blocks, so assistive tech does not announce a bare item name. #}
+  <fieldset style="border:0; padding:0; margin:0; min-width:0">
+  <legend style="padding:0"><h3 class="subhead" style="margin:1.1rem 0 .3rem">Never run</h3></legend>
+  <p class="muted" id="never-run-help" style="margin:.2rem 0 .6rem">A ticked route is never
+  installed — not for savings, not for profit. Unrefined items already in
+  your hangars still count toward their composite.</p>
+  {% if alchemy_routes %}
+  <input type="hidden" name="alchemy_blacklist_present" value="1">
+  <div class="checks" aria-describedby="never-run-help">
+    {% for composite_id, unrefined_name in alchemy_routes %}
+    <label><input type="checkbox" name="alchemy_block_{{ composite_id }}"
+             {{ 'checked' if composite_id in alchemy_blocked }}> {{ unrefined_name }}</label>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="muted">Download the game data from the Dashboard to list the
+  routes.</p>
+  {% endif %}
+  </fieldset>
 </div>
 
 <div class="panel" id="compressed">
@@ -457,8 +501,9 @@
 </div>
 
 <div class="savebar">
-  <span class="muted">Saves everything above except the blacklist and tracked
-    systems, which have their own buttons.</span>
+  <span class="muted">Saves everything above, the alchemy Never run list
+    included, except the Production Blacklist and tracked systems, which
+    have their own buttons.</span>
   <button class="primary" form="settings-form">Save settings</button>
 </div>
 </div>

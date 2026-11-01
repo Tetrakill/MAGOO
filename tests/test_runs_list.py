@@ -100,8 +100,11 @@ def test_an_in_place_replan_keeps_the_opening_figure_while_the_live_sum_falls(co
     assert after["opening_buys_unpriced"] == before["opening_buys_unpriced"]
 
 
-def test_the_columns_are_migrations_under_the_unreleased_schema_13(conn):
-    assert store.SCHEMA_VERSION == 13
+def test_the_opening_columns_are_migrations_under_the_current_schema(conn):
+    """The two columns arrived under an unreleased stamp (13, 2026-10-24),
+    so they are ALTERs in the migration list, never CREATE TABLE columns;
+    a fresh database still ends at the current stamp with both."""
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     for col in ("opening_buy_total_isk", "opening_buys_unpriced"):
         assert col not in store.STATE_SCHEMA
         assert any(col in m for m in store._MIGRATIONS)

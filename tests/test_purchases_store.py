@@ -45,13 +45,13 @@ def _seed_run(conn, run_number=1) -> int:
 # ---------------------------------------------------------------------------
 
 
-def test_fresh_database_reaches_schema_13(tmp_path, monkeypatch):
-    """Schema 12 shipped with v1.29.0 (2026-09-30); 13 adds the durable
-    industry_job record (user ruling 2026-10-24) and the v1.29 tables
-    and columns are still there."""
+def test_fresh_database_reaches_the_current_schema(tmp_path, monkeypatch):
+    """Schema 12 shipped with v1.29.0 (2026-09-30); 13 added the durable
+    industry_job record (user ruling 2026-10-24); a fresh database carries
+    the current stamp (pinned once, in test_alchemy_profit_web) and the
+    v1.29 tables and columns are still there."""
     conn = _db(tmp_path, monkeypatch)
-    assert store.SCHEMA_VERSION == 13
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     tables = {
         r["name"]
         for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -107,7 +107,7 @@ def test_schema_11_database_gains_the_table_and_columns(tmp_path, monkeypatch):
     store.ensure_schema(conn)
 
     assert list((tmp_path / "backups").glob("magoo-pre-*.sqlite"))  # landed HERE
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 13
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(index_run_item)")}
     assert {
         "compressed_alloc",
@@ -511,8 +511,7 @@ def test_fresh_database_has_the_buy_side_tables(tmp_path, monkeypatch):
     are CREATE IF NOT EXISTS (no migration entry of their own), and the
     retired choice table is gone. The stamp is the current version."""
     conn = _db(tmp_path, monkeypatch)
-    assert store.SCHEMA_VERSION == 13
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     tables = _tables(conn)
     assert {"buy_transaction", "buy_contract", "buy_contract_item"} <= tables
     assert "run_buy_choice" not in tables

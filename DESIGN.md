@@ -602,7 +602,9 @@ the pipeline delete.
 `details.section` (2026-09-01): every h2 section and h3 category group on
 the data tabs — Planning, Index Runs (Industry Jobs / Buy / Stockpile),
 Invention, Ledger (v1.27.0: products, open orders, sales ledger, order
-history) — is a native `<details>`, **open by default** — except a
+history; since schema 14 an Alchemy sales section between the sales
+ledger and the history, with its own totals strip inside it) — is a
+native `<details>`, **open by default** — except a
 section marked `data-default="closed"` (the Buy tab's groups nested
 under Input Materials, v1.29), which starts closed; the stored state is
 "open" or "closed", and on load only a value that differs from the
@@ -615,8 +617,9 @@ run-id-normalised path + the `?view=` tab in localStorage), so closing
 Chain views, which reuse keys, remember separately. Opening re-measures
 `table.aligned`, which `layoutAligned()` skips while hidden. Pagehead,
 totals strip, alert panels, checklist panels, dialogs, and the methodology
-disclosures are never sections; the Profit views have no headed sections,
-and the Dashboard, Pipelines, Settings and ESI tabs are deliberately not
+disclosures are never sections; an executed run's Profit view has one
+headed section, "Alchemy for sale" (schema 14), under the hull cards; the
+Dashboard, Pipelines, Settings and ESI tabs are deliberately not
 collapsible.
 
 ### Save Bar

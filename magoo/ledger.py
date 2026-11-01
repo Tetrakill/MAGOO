@@ -40,6 +40,14 @@ to Count sales on does not recover the sells of the id range read in
 between. This module never imports buying (the web route calls it after
 the price step, contract review C1).
 
+Alchemy side (schema 14, user rulings 2026-10-31): settle_alchemy_holds
+matches the observed sales of held composites to the for-sale holds
+(magoo/holds.py) and is the module's one writer outside the pull — the
+same lock rule, one BEGIN IMMEDIATE transaction with no network call
+inside it, ended on every path; listed_units (what a pile already on the
+market or in a contract has left of ESI assets) and alchemy_sales_view
+(the Ledger's alchemy section) only read.
+
 Direct SQL on the state tables (the engine.py precedent; the DDL lives in
 store.py). No Flask, no SDE file shapes.
 """
@@ -2443,10 +2451,392 @@ def _default_qty(v) -> str:
     return f"{v:,.0f}"
 
 
+# --- Alchemy for-sale holds (schema 14, user rulings 2026-10-31) ------------
+
+# index_run.status of an executed run — buying.RUN_EXECUTED, which this
+# module never imports (contract review C1).
+_RUN_EXECUTED = "complete"
+
+
+def listed_lots(conn, type_ids) -> dict[int, list[tuple]]:
+    """Per type, the lots that have left ESI assets without being sold yet
+    (plan D3, 2026-10-31), each as (issue date text, units): OPEN sell
+    orders (volume_remain, `issued`), and the included items of outstanding
+    / in-progress item-exchange and courier contracts we issued (a hauled
+    pile in transit; `date_issued`) — Count-sales owners only, like every
+    Ledger read. holds.bites attributes each lot by its issue date to the
+    hold whose life contains it. Every requested id is a key."""
+    ids = sorted({int(t) for t in type_ids})
+    out: dict[int, list[tuple]] = {t: [] for t in ids}
+    if not ids:
+        return out
+    enabled = enabled_owners(conn)
+    ph = _placeholders(ids)
+    for o in conn.execute(
+        f"SELECT owner_kind, owner_id, type_id, volume_remain, issued FROM sale_order "
+        f"WHERE state = 'open' AND type_id IN ({ph})",
+        ids,
+    ):
+        units = int(o["volume_remain"] or 0)
+        if units > 0 and (o["owner_kind"], o["owner_id"]) in enabled:
+            out[o["type_id"]].append((o["issued"], units))
+    for c in conn.execute(
+        f"SELECT c.owner_kind, c.owner_id, c.date_issued, i.type_id, i.quantity "
+        f"FROM sale_contract c JOIN sale_contract_item i ON i.contract_id = c.contract_id "
+        f"WHERE c.type IN ('item_exchange', 'courier') "
+        f"AND c.status IN ({_placeholders(OPEN_CONTRACT_STATUSES)}) AND c.items_status = 'ok' "
+        f"AND i.is_included = 1 AND i.type_id IN ({ph})",
+        [*OPEN_CONTRACT_STATUSES, *ids],
+    ):
+        units = int(c["quantity"] or 0)
+        if units > 0 and (c["owner_kind"], c["owner_id"]) in enabled:
+            out[c["type_id"]].append((c["date_issued"], units))
+    return out
+
+
+def listed_units(conn, type_ids) -> dict[int, int]:
+    """The listed lots' units summed per type (listed_lots); 0 when nothing
+    is listed."""
+    return {t: sum(units for _issued, units in lots) for t, lots in listed_lots(conn, type_ids).items()}
+
+
+def _hold_sale_events(conn, type_id: int, since: str, enabled, internal, quotes, final_ids) -> list[tuple]:
+    """One composite's observed sales dated from `since` (ESI text), oldest
+    first by (when, source, ref_id), as (when, source, ref_id, qty,
+    unit_price, location_id, released_at, dated): `released_at` is the
+    release row's date (a contract's completion), `dated` the datetime the
+    hold-window test reads — a contract's date_issued, because its items
+    leave the hangar at issue, not at acceptance."""
+    events: list[tuple] = []
+    for t in conn.execute(
+        "SELECT * FROM sale_transaction WHERE type_id = ? AND date >= ? "
+        "ORDER BY date, transaction_id",
+        (type_id, since),
+    ):
+        if (t["owner_kind"], t["owner_id"]) not in enabled:
+            continue
+        if t["client_id"] is not None and t["client_id"] in internal:
+            continue
+        when = _parse_ts(t["date"])
+        events.append((when, "market", t["transaction_id"], int(t["quantity"]),
+                       t["unit_price"], t["location_id"], t["date"], when))
+    for c in conn.execute(
+        f"SELECT * FROM sale_contract c WHERE c.type = 'item_exchange' "
+        f"AND c.status IN ({_placeholders(SOLD_CONTRACT_STATUSES)}) AND c.items_status = 'ok' "
+        "AND c.date_issued >= ? AND EXISTS (SELECT 1 FROM sale_contract_item i "
+        "WHERE i.contract_id = c.contract_id AND i.is_included = 1 AND i.type_id = ?) "
+        "ORDER BY c.date_issued, c.contract_id",
+        (*SOLD_CONTRACT_STATUSES, since, type_id),
+    ):
+        if (c["owner_kind"], c["owner_id"]) not in enabled:
+            continue
+        if c["acceptor_id"] is not None and c["acceptor_id"] in internal:
+            continue
+        # The Ledger's revenue rule, kept for the hold ON PURPOSE (review
+        # 2026-10-31 #60, ruled): a 0-ISK hand-over is marked sold by hand.
+        if not c["price"] or c["price"] <= 0:
+            continue
+        items = [dict(i) for i in conn.execute(
+            "SELECT * FROM sale_contract_item WHERE contract_id = ?", (c["contract_id"],)
+        )]
+        attribution = attribute_contract(c["price"], items, quotes, final_ids)
+        qty, unit_price = attribution.per_final.get(type_id, (0, None))
+        if qty <= 0:
+            continue
+        if "estimated split" in attribution.flags and len(attribution.per_final) > 1:
+            # An item of the contract has no quote: the equal-per-unit
+            # split the finals accept between two hulls is a guess beside
+            # a composite (one sixth of a hull's price per unit), so the
+            # composite's units are released unpriced and valued at
+            # today's quote where one exists (D7 est_unpriced). A
+            # contract of one type needs no quote: price / units is exact.
+            unit_price = None
+        released_at = c["date_completed"] or c["date_accepted"] or c["date_issued"]
+        events.append((_parse_ts(released_at), "contract", c["contract_id"], int(qty),
+                       unit_price, c["start_location_id"], released_at,
+                       _parse_ts(c["date_issued"])))
+    # In the order the units LEFT the hangar (a contract by its issue, a
+    # wallet sell by its fill), which is the order the holds' windows
+    # are tested in — so a contract issued early never finds its only
+    # eligible hold filled by a later sale (review 2026-10-31).
+    events.sort(key=lambda e: (e[7], e[1], e[2]))
+    return events
+
+
+def settle_alchemy_holds(conn, ref, settings) -> int:
+    """Match the observed sales of held composites to the holds whose
+    for-sale jobs ESI shows DELIVERED (user ruling (e), plan D4,
+    2026-10-31), oldest run first; returns the units newly matched.
+
+    Candidates are the loader's holds (holds.load) with delivered units,
+    live OR expired — an expired hold still takes the sales dated inside
+    its life. A sale counts by the Ledger's own rules: a wallet sell of an
+    owner with Count sales on whose buyer is not us, or a finished
+    item-exchange contract we issued (sale_contract is issuer-side) with
+    the composite included, an outside acceptor and a price — courier
+    contracts never. A sale is eligible for a hold when it is dated inside
+    the hold's window, first_delivered <= date <= expired_at (open-ended
+    while the hold lives); a contract is dated by date_issued for that
+    test (its items leave the hangar at issue) while its release row keeps
+    the completion date. Each hold takes at most its room — the delivered
+    pile less the observed releases it already holds (by-hand marks never
+    block an observed sale) — and the rest of the sale moves to the next
+    eligible hold; units no hold has room for stay unassigned (ordinary
+    chain-stock sales) and are looked at again by every later settle, so a
+    hold whose room grows (a second batch delivered) takes the rest of a
+    partly applied sale onto the same release row (store.add_alchemy_release
+    upserts on (source, ref_id, run, composite)). A contract selling two
+    held composites, or a held composite with a pipeline final, is priced
+    pro rata over all of them (attribute_contract with final_ids = the held
+    composites and the finals, one quotes map per call). Each release
+    stores the hold's route cost, so the Ledger never re-costs history.
+    When a hold's observed releases and by-hand marks together exceed its
+    for_sale_qty, the hand marks shrink by the overshoot, newest first: the
+    observed sale replaces the hand mark instead of spilling onto the next
+    run.
+
+    Idempotent — a second call matches nothing new. One BEGIN IMMEDIATE
+    transaction (ledger._begin): the reads and the writes run under the
+    write lock, committed when anything was written, rolled back
+    otherwise, rolled back and re-raised on any failure, so two
+    overlapping settles cannot apply a sale twice (review 2026-10-31 #8);
+    never call it inside a caller's open transaction. Known limit (#29):
+    Count sales and the internal-buyer rule are applied at match time — a
+    later toggle does not un-release."""
+    from . import holds  # local: holds -> buying -> ledger
+
+    _begin(conn)
+    matched = 0
+    written = False
+    try:
+        every = holds.load(conn, ref, settings)
+        pipeline_finals = set(finals(conn))
+        # Executed RUNS, hold rows or not (test writers 2026-10-31): a run
+        # planned with the tail off, or whose tail proposed nothing, has
+        # no hold row and still closes an older hold's history.
+        max_executed = int(conn.execute(
+            "SELECT COALESCE(MAX(run_number), 0) FROM index_run WHERE status = ?",
+            (_RUN_EXECUTED,),
+        ).fetchone()[0])
+        candidates = [
+            h for h in every
+            if h.delivered_units > 0 and h.first_delivered is not None
+            # A pipeline's final (active or not) is sold as a final: its
+            # sales belong to the finals' Ledger, never to a hold (review
+            # 2026-10-31 #123) — such a hold releases by hand alone.
+            and h.composite_type_id not in pipeline_finals
+            # An expired hold keeps taking late-pulled sales dated inside
+            # its life while the run after the one that ended it is the
+            # newest executed; once a further run is executed its history
+            # is closed and the scan of the composite's sales stops
+            # growing (review 2026-10-31 #30; §7 Phase 6.5).
+            and (
+                h.live
+                or h.expires_after is None
+                or h.expires_after >= max_executed - 1
+            )
+        ]
+        by_type: dict[int, list] = {}
+        for hold in candidates:  # loader order: oldest run first
+            by_type.setdefault(hold.composite_type_id, []).append(hold)
+        if any(h.room_observed > 0 for h in candidates):
+            # One quotes map for every id a contract may be split over
+            # (review 2026-10-31 #7): a contract bundling a final or a
+            # second held composite is priced pro rata, not read as mixed.
+            # Every held composite — in flight, plan figure or expired
+            # holds included — so a bundle of two held composites is
+            # never read as mixed because one has not delivered yet.
+            final_ids = {h.composite_type_id for h in every} | set(finals(conn))
+            quotes = {t: final_quote(conn, ref, settings, t)[0] for t in final_ids}
+            enabled = enabled_owners(conn)
+            internal = internal_ids(conn)
+            # By-hand units per hold, kept current within this call so a
+            # shrink is seen by the next sale against the same hold.
+            manual = {
+                (h.index_run_id, h.composite_type_id): h.manual_priced_qty + h.manual_unpriced_qty
+                for h in candidates
+            }
+            for type_id, type_holds in by_type.items():
+                if not any(h.room_observed > 0 for h in type_holds):
+                    continue
+                since = _iso(min(h.first_delivered for h in type_holds))
+                for _when, source, ref_id, qty, unit_price, location_id, released_at, dated in (
+                    _hold_sale_events(conn, type_id, since, enabled, internal, quotes, final_ids)
+                ):
+                    left = qty - store.alchemy_released_qty(conn, source, ref_id, type_id)
+                    if left <= 0:
+                        continue
+                    for hold in type_holds:
+                        if left <= 0:
+                            break
+                        if dated < hold.first_delivered or (
+                            hold.expired_at is not None and dated > hold.expired_at
+                        ):
+                            continue
+                        take = min(hold.room_observed, left)
+                        if take <= 0:
+                            continue
+                        store.add_alchemy_release(
+                            conn, hold.index_run_id, type_id, take, source, ref_id,
+                            unit_price, location_id, released_at,
+                            unit_cost=hold.route_unit_cost,
+                        )
+                        hold.observed_qty += take  # room_observed follows
+                        left -= take
+                        matched += take
+                        written = True
+                        key = (hold.index_run_id, type_id)
+                        over = hold.observed_qty + manual[key] - hold.for_sale_qty
+                        if over > 0 and manual[key] > 0:
+                            manual[key] -= store.shrink_manual_releases(
+                                conn, hold.index_run_id, type_id, min(over, manual[key])
+                            )
+        if written:
+            conn.commit()
+        else:
+            conn.rollback()
+        return matched
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def alchemy_sales_view(conn, ref, settings, window: Window) -> dict:
+    """The Ledger's alchemy section (user rulings (c) and (d), plan D7,
+    2026-10-31). `sales`: the release rows released_at inside the window,
+    newest first — an observed sale's net is by where it sold
+    (costing.net_proceeds_at_venue), a by-hand row WITH a price is revenue
+    as entered (ISK received per unit, no fee or freight term) and a
+    by-hand row without one is neither revenue nor cost; every row is
+    costed at its own release unit_cost (the hold's route cost at match
+    time; the hold's current route cost for a row written before the
+    column), and cost is added only for rows that add net, so Net − Route
+    cost = Net income with the unpriced units shown beside the badge;
+    `totals.sales` counts sales, not rows (a sale split over two holds is
+    two rows; an unpriced hand mark is no sale). `held`: every hold with installs (or an uncovered executed run's plan
+    figure), oldest run first, with today's hub quote net and the expected
+    profit of a LIVE hold's remainder — an expired remainder is returned to
+    stock and estimates nothing (ruling c); `planned_only`: the open run's
+    proposals with nothing installed yet; `held_totals` counts live holds
+    only. Reads only — the settle is a separate call."""
+    from . import holds  # local: holds -> buying -> ledger
+
+    sales = []
+    tot = {"units": 0, "gross": 0.0, "net": 0.0, "cost": 0.0, "profit": 0.0,
+           "unpriced": 0, "unpriced_units": 0, "manual_units": 0,
+           "manual_priced_units": 0, "sales": 0}
+    seen: set[tuple] = set()  # the heading counts sales, not rows (a sale split over two holds is two rows)
+    unpriced_seen: set[tuple] = set()  # likewise for the unpriced badge
+    for x in store.alchemy_releases(conn, window.since_ts):
+        type_id = x["composite_type_id"]
+        qty = int(x["qty"])
+        manual = x["source"] == "manual"
+        priced = x["unit_price"] is not None
+        gross = x["unit_price"] * qty if priced else None
+        if not priced:
+            net = None
+        elif manual:
+            net = gross  # ruling (d): as entered, no fee or freight term
+        else:
+            net = _net_for(ref, settings, type_id, x["unit_price"], qty, x["location_id"])
+        unit_cost = x["unit_cost"] if x["unit_cost"] is not None else x["route_unit_cost"]
+        cost = qty * unit_cost if (net is not None and unit_cost is not None) else None
+        profit = net - cost if cost is not None else None
+        venue = costing.sale_venue(x["location_id"])
+        sales.append({
+            "when": x["released_at"], "type_id": type_id,
+            "name": _type_name(ref, type_id), "quantity": qty,
+            "source": x["source"], "manual": manual, "priced": priced,
+            "ref_id": x["ref_id"], "unit_price": x["unit_price"],
+            "gross": gross, "net": net, "unit_cost": unit_cost, "cost": cost,
+            "profit": profit, "run_number": x["run_number"],
+            "venue": venue, "venue_label": venue_label(venue, settings),
+            "system_name": _system_name(ref, x["solar_system_id"]),
+        })
+        if manual:
+            if priced:
+                tot["sales"] += 1  # a trade the ESI feeds cannot see, priced by hand
+        elif (x["source"], x["ref_id"]) not in seen:
+            seen.add((x["source"], x["ref_id"]))
+            tot["sales"] += 1
+        if manual and not priced:
+            # Ruling (d): no revenue, no cost, no sale — and not an
+            # "unpriced" sale either: that word is the contract whose
+            # price could not be attributed (review 2026-10-31 #100).
+            tot["manual_units"] += qty
+            continue
+        tot["units"] += qty
+        if manual:
+            tot["manual_priced_units"] += qty
+        if net is None:
+            if (x["source"], x["ref_id"]) not in unpriced_seen:
+                unpriced_seen.add((x["source"], x["ref_id"]))
+                tot["unpriced"] += 1
+            tot["unpriced_units"] += qty
+            continue
+        tot["gross"] += gross
+        tot["net"] += net
+        if cost is not None:
+            tot["cost"] += cost
+            tot["profit"] += profit
+    held = []
+    planned_only = []
+    held_tot = {"units": 0, "value": 0.0, "unquoted": 0}
+    net_quotes: dict[int, float | None] = {}
+    for hold in holds.load(conn, ref, settings):
+        if hold.superseded:
+            continue
+        type_id = hold.composite_type_id
+        if not (hold.installed or hold.plan_figure):
+            if (
+                hold.status == "not installed" and hold.planned_qty > 0
+                and hold.run_status != _RUN_EXECUTED
+            ):
+                planned_only.append({
+                    "type_id": type_id, "name": _type_name(ref, type_id),
+                    "run_number": hold.run_number, "planned_qty": hold.planned_qty,
+                })
+            continue
+        if type_id not in net_quotes:
+            net_quotes[type_id] = final_quote(conn, ref, settings, type_id)[1]
+        net_unit = net_quotes[type_id]
+        expected = (
+            (net_unit - hold.route_unit_cost) * hold.remaining
+            if hold.live and net_unit is not None and hold.route_unit_cost is not None
+            else None
+        )
+        held.append({
+            "type_id": type_id, "name": _type_name(ref, type_id),
+            "run_number": hold.run_number, "status": hold.status,
+            "planned": hold.for_sale_qty, "released": hold.released_qty,
+            "remaining": hold.remaining, "net_unit": net_unit,
+            "route_unit": hold.route_unit_cost, "expected_profit": expected,
+            "expires_after": hold.expires_after, "expiry_words": holds.expiry_words(hold),
+            "jobs_end": hold.jobs_end, "delivered_at": hold.delivered_at,
+            "plan_figure": hold.plan_figure, "live": hold.live,
+        })
+        if hold.live:
+            held_tot["units"] += hold.remaining
+            if expected is not None:
+                held_tot["value"] += expected
+            elif hold.remaining > 0 and net_unit is None:
+                held_tot["unquoted"] += 1
+    return {
+        "sales": sales,
+        "totals": tot,
+        "held": held,
+        "planned_only": planned_only,
+        "held_totals": held_tot,
+        "any": bool(sales or held or planned_only),
+    }
+
+
 def build_view(conn, ref, settings, window, now: datetime | None = None,
                fmt_isk=None, fmt_qty=None, show_all_rows: bool = False) -> dict:
     """Everything ledger.html needs, recomputed on every load; nothing
-    here writes."""
+    here writes (the alchemy settle is a separate call the write routes
+    make — the ESI update, a plan, Mark executed, Mark sold — so the page
+    shows the hold state as of the last one)."""
     now = now or datetime.now(timezone.utc)
     fmt_isk = fmt_isk or _default_isk
     fmt_qty = fmt_qty or _default_qty
@@ -2522,4 +2912,7 @@ def build_view(conn, ref, settings, window, now: datetime | None = None,
         "hub_at": hub_at,
         "structure_at": structure_at,
         "counted_sales": len(counted),
+        # User ruling 2026-10-31: alchemy run for sale, listed apart from
+        # the finals (its figures are in none of the totals above).
+        "alchemy": alchemy_sales_view(conn, ref, settings, win),
     }

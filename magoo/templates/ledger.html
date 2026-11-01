@@ -311,7 +311,8 @@ version need a re-login for the new scopes.</p>
   </tr></thead>
   {% for s in view.sales %}
   <tr class="{% if not s.counted %}superseded{% elif s.profit is not none and s.profit < 0 %}neg{% endif %}">
-    <td class="muted">{{ s.when[:16].replace('T', ' ') }}</td>
+    {# Review #66: sortBy() parses the cell text as a number, so a date needs its digits as the key. #}
+    <td class="muted" data-sort="{{ s.when[:19]|replace('-', '')|replace(':', '')|replace('T', '')|replace(' ', '') }}">{{ s.when[:16].replace('T', ' ') }}</td>
     <td>{{ s.name }}</td>
     <td class="num">{{ s.quantity|qty }}</td>
     <td class="num" title="{% if s.unit_price is not none %}{{ s.unit_price|isk }} ISK{% else %}not attributable{% endif %}">{{ s.unit_price|isk_short }}</td>
@@ -333,6 +334,9 @@ version need a re-login for the new scopes.</p>
 {% else %}<p class="muted">No sale events in this window.</p>{% endif %}
 </details>
 
+{# User rulings 2026-10-31 (D7): alchemy run FOR SALE — the composites the
+   plan made to sell, matched to the for-sale holds (ledger.alchemy_sales_view).
+   Apart from the finals: in none of the totals, charts or Top 10s above. #}
 <details class="section" data-key="history" open>
 <summary><h2>Order history <span class="muted">— {{ view.history|length }}</span></h2></summary>
 {% if view.history %}
@@ -353,6 +357,94 @@ version need a re-login for the new scopes.</p>
 </table>
 </div>
 {% else %}<p class="muted">No closed orders for pipeline finals in this window.</p>{% endif %}
+</details>
+{% endif %}
+{% endif %}
+
+{# The Alchemy sales section stands on holds and releases, not on
+   pipelines: it renders whatever the finals' gate above says (review
+   2026-10-31). #}
+{% if view %}
+{% set alch = view.alchemy %}
+{% if alch and alch.any %}
+<details class="section" data-key="alchemy" open>
+<summary><h2>Alchemy sales <span class="muted">— {{ alch.totals.units|qty }} units sold in this window{% if alch.totals.manual_priced_units %} ({{ alch.totals.manual_priced_units|qty }} of them marked by hand at a price){% endif %}{% if alch.totals.manual_units %} (+ {{ alch.totals.manual_units|qty }} marked by hand without a price){% endif %}{% if alch.held_totals.units %} · {{ alch.held_totals.units|qty }} units still held{% endif %}</span></h2></summary>
+<p class="muted">Composites your for-profit alchemy jobs made to sell. A
+  sale is matched to the run whose for-sale jobs had delivered (oldest
+  first) when the ESI update sees it on the market or in a finished
+  item-exchange contract; net is after the fees and freight of where it
+  sold, cost is that run's route cost per unit when the sale was matched
+  (inputs landed plus the job fee, less what the reprocess gave back).
+  Units marked sold by hand with a price count that price as revenue, no
+  fees deducted; without one they free the stock and count neither revenue
+  nor cost. Units still held are valued at today's Jita quote net of fees,
+  less their route cost.</p>
+<div class="totals">
+  <div class="stat"><span class="label">Units sold</span>
+    <span class="value" title="market and contract sales matched to the holds{% if alch.totals.manual_priced_units %}, plus {{ alch.totals.manual_priced_units|qty }} marked by hand at a price (the Profit tab counts those apart from Sold){% endif %}{% if alch.totals.unpriced_units %}; {{ alch.totals.unpriced_units|qty }} of them sold by contract without an attributable price{% endif %}">{{ alch.totals.units|qty }}{% if alch.totals.manual_units %}<span class="sub">+ {{ alch.totals.manual_units|qty }} by hand, no price</span>{% endif %}</span></div>
+  <div class="stat"><span class="label">Net (est.)</span>
+    <span class="value" title="{{ alch.totals.net|isk }} ISK after sell fees and freight where each sold; by-hand prices as entered">{{ alch.totals.net|isk_short }}</span></div>
+  <div class="stat"><span class="label">Route cost</span>
+    <span class="value" title="{{ alch.totals.cost|isk }} ISK — the route cost of the units with a net figure, so Net − Route cost = Net income{% if alch.totals.unpriced %}; the {{ alch.totals.unpriced_units|qty }} units sold without an attributable price are left out{% endif %}">{{ alch.totals.cost|isk_short }}</span></div>
+  <div class="stat"><span class="label">Net income (est.)</span>
+    <span class="value {% if alch.totals.profit < 0 %}bad{% elif alch.totals.profit > 0 %}good{% endif %}" title="{{ alch.totals.profit|isk }} ISK — net less route cost">{{ alch.totals.profit|isk_short }}</span></div>
+  <div class="stat"><span class="label">Still held</span>
+    <span class="value" title="{% if alch.held_totals.units %}{{ alch.held_totals.value|isk }} ISK expected: units of live holds not yet sold, at today's Jita quote net of fees, less their route cost{% if alch.held_totals.unquoted %} ({{ alch.held_totals.unquoted }} composite(s) without a quote count 0){% endif %}{% else %}nothing held — every delivered unit is sold or its hold has ended{% endif %}">{{ alch.held_totals.units|qty }}{% if alch.held_totals.units %}<span class="sub">· ~{{ alch.held_totals.value|isk_short }}</span>{% endif %}</span></div>
+  {% if alch.totals.unpriced %}
+  <div class="stat"><span class="label">&nbsp;</span>
+    <span class="badge warn" title="{{ alch.totals.unpriced }} contract sale{{ 's' if alch.totals.unpriced != 1 }} whose price could not be attributed to the composite (bundled or swap contracts) — {{ alch.totals.unpriced_units|qty }} units counted, no net and no route cost">{{ alch.totals.unpriced }} unpriced · {{ alch.totals.unpriced_units|qty }} units</span></div>
+  {% endif %}
+</div>
+{% if alch.sales %}
+<div class="tablewrap">
+<table class="sortable">
+  <thead><tr>
+    <th>Date</th><th>Composite</th><th class="num">Qty</th>
+    <th class="num">Unit price</th><th class="num">Net (est.)</th>
+    <th class="num">Cost / unit</th><th class="num">Net income (est.)</th>
+    <th>Where</th><th class="num">Run</th><th>Source</th>
+  </tr></thead>
+  {% for s in alch.sales %}
+  <tr class="{% if s.manual and not s.priced %}superseded{% elif s.profit is not none and s.profit < 0 %}neg{% endif %}">
+    <td class="muted" data-sort="{{ s.when[:19]|replace('-', '')|replace(':', '')|replace('T', '')|replace(' ', '') }}">{{ s.when[:16].replace('T', ' ') }}</td>
+    <td>{{ s.name }}</td>
+    <td class="num">{{ s.quantity|qty }}</td>
+    <td class="num" title="{% if s.unit_price is not none %}{{ s.unit_price|isk_unit }} ISK{% if s.manual %} — as entered — ISK received per unit, no fees deducted{% endif %}{% elif s.manual %}marked sold by hand — no price{% else %}not attributable (bundled or swap contract){% endif %}">{% if s.unit_price is not none %}{{ s.unit_price|isk_short }}{% else %}—{% endif %}</td>
+    <td class="num" title="{% if s.net is not none %}{{ s.net|isk }} ISK{% if s.manual %} — the price entered × qty, no fees deducted{% else %} after the estimated sell fees at {{ s.venue_label }}{% endif %}{% else %}—{% endif %}">{% if s.net is not none %}{{ s.net|isk_short }}{% else %}—{% endif %}</td>
+    <td class="num" title="{% if s.unit_cost is not none %}{{ s.unit_cost|isk_unit }} ISK — run {{ s.run_number }}'s route cost per unit when the sale was matched{% else %}no route cost recorded{% endif %}">{% if s.unit_cost is not none %}{{ s.unit_cost|isk_short }}{% else %}—{% endif %}</td>
+    <td class="num {% if s.profit is not none and s.profit < 0 %}bad{% elif s.profit %}good{% endif %}" title="{% if s.profit is not none %}{{ s.profit|isk }} ISK — net − qty × route cost{% elif s.manual %}no price entered — neither revenue nor cost{% else %}no attributable price — left out of the totals{% endif %}">{% if s.profit is not none %}{{ s.profit|isk_short }}{% else %}—{% endif %}</td>
+    <td>{% if s.system_name %}{{ s.system_name }}{% else %}<span class="muted" title="{% if s.manual %}a by-hand mark has no place{% else %}ESI gave no resolved location for this sale{% endif %}">—</span>{% endif %}</td>
+    <td class="num" title="the run whose for-sale hold this sale is matched to">{{ s.run_number }}</td>
+    <td>{% if s.manual %}<span class="badge" title="marked sold by hand on a run's Industry Jobs tab{% if s.priced %} with a price — revenue as entered{% else %} without a price — frees the stock, counts neither revenue nor cost{% endif %}">by hand</span>{% elif s.source == 'contract' %}<span class="badge accent" title="item-exchange contract {{ s.ref_id }}">contract</span>{% else %}<span class="badge" title="market transaction {{ s.ref_id }}">market</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}<p class="muted">No alchemy sales matched in this window.</p>{% endif %}
+{% if alch.held %}
+<h3 class="subhead">Still held for sale</h3>
+<div class="tablewrap">
+<table class="aligned" style="max-width: 64rem">
+  <thead><tr><th>Composite</th><th class="num">Run</th><th>Status</th><th class="num">Planned</th>
+      <th class="num">Released</th><th class="num">Held</th><th class="num">Expected</th><th>Until</th></tr></thead>
+  {% for h in alch.held %}
+  <tr{% if not h.live %} class="superseded"{% endif %}>
+    <td>{{ h.name }}</td>
+    <td class="num">{{ h.run_number }}</td>
+    <td><span class="badge {% if h.status == 'in flight' %}accent{% elif h.status == 'delivered' %}good{% elif h.status == 'returned to stock' %}warn{% endif %}" title="{% if h.status == 'in flight' %}for-sale jobs are running{% if h.jobs_end %} — jobs end {{ h.jobs_end.strftime('%Y-%m-%d %H:%M') }}{% endif %}{% elif h.status == 'delivered' %}every for-sale job has delivered{% if h.delivered_at %} ({{ h.delivered_at.strftime('%Y-%m-%d %H:%M') }}){% endif %}{% elif h.status == 'sold' %}every delivered unit is accounted for{% elif h.status == 'returned to stock' %}the hold ended — the unsold units count as ordinary stock{% elif h.status == 'plan figure' %}the ESI job record does not cover the run's buying window yet — Planned is the plan's figure until the next update{% else %}ESI shows no for-sale job of this route inside the run's buying window{% endif %}">{{ h.status }}</span>{% if h.plan_figure and h.status != 'plan figure' %} <span class="badge warn" title="the ESI job record does not cover the run's buying window — Planned is the plan's figure">plan figure</span>{% endif %}</td>
+    <td class="num" title="{% if h.plan_figure %}the plan's figure — the job record does not cover the run's buying window yet{% else %}composite units from the for-sale jobs ESI shows installed, after the reprocess{% endif %}">{{ h.planned|qty }}</td>
+    <td class="num" title="market and contract sales matched to this hold, plus by-hand marks">{{ h.released|qty }}</td>
+    <td class="num" title="{% if h.live %}hidden from the plan's stock{% else %}the hold ended — counts as ordinary stock{% endif %}">{{ h.remaining|qty }}</td>
+    <td class="num {% if h.expected_profit is not none and h.expected_profit > 0 %}good{% endif %}" title="{% if h.expected_profit is not none %}{{ h.expected_profit|isk }} ISK — {{ h.remaining|qty }} × ({{ h.net_unit|isk_unit }} net at today's Jita quote − {{ h.route_unit|isk_unit }} route cost){% elif not h.live %}the hold ended — its unsold units count as ordinary stock and carry no estimate (ruling c){% else %}no Jita quote cached{% endif %}">{% if h.expected_profit is not none %}{{ h.expected_profit|isk_short }}{% else %}—{% endif %}</td>
+    <td class="muted" title="{% if h.live %}a hold lives while its for-sale jobs run and for one full run after they deliver — the second Mark executed after delivery ends it{% else %}this hold has ended — its releases stay as history{% endif %}">{{ h.expiry_words }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+{% if alch.planned_only %}
+<p class="muted" style="margin:.5rem 0 0">Planned, not installed: {% for pl in alch.planned_only %}{{ pl.name }} (run {{ pl.run_number }}, ~{{ pl.planned_qty|qty }} units){% if not loop.last %} · {% endif %}{% endfor %} — ESI shows no for-sale job of these routes yet; nothing is held or valued.</p>
+{% endif %}
 </details>
 {% endif %}
 {% endif %}
