@@ -3,7 +3,7 @@
 **Standalone industry planning application for EVE Online**
 
 Stack: Python · Flask · SQLite · SciPy · Jinja2
-Status: v1.30.0 built and live (the Profit tab counts the hulls ESI shows installed, and the Index Runs list carries the opening Buy total with revenue and profit per run; the Buy tab — purchases recorded from ESI, realized cost at what was paid, one live run per buying cycle; engine, MILP allocation, sizing feedback
+Status: v1.31.0 built and live (Alchemy for Profit — a per-route Never-run grid, a profit tail over the spare reaction slots, and a for-sale hold anchored to ESI installs and settled by observed sales, booked on the Ledger and the Profit tab; the Profit tab counts the hulls ESI shows installed, and the Index Runs list carries the opening Buy total with revenue and profit per run; the Buy tab — purchases recorded from ESI, realized cost at what was paid, one live run per buying cycle; engine, MILP allocation, sizing feedback
 loop iterated to convergence, alchemy — landed route comparison,
 lag-based costing, capital + structure pricing, Upwell structures /
 rigs / components in scope, two-venue buying (Jita vs C-J6 landed) with
@@ -31,7 +31,7 @@ the installer is still buildable), native WebView2 window,
 shared-client-id PKCE login in the user's own browser, versioned schema
 with pre-migration backups, portable zip self-heals the Mark of the Web
 on first launch)
-Last updated: 2026-10-24
+Last updated: 2026-10-31
 
 ---
 
@@ -3446,7 +3446,7 @@ confirmed open item (2026-08-20).
 | Market prices | Done — public ESI adjusted prices + cached regional orders + the structure market's best prices and sell ladders (`market.py`) |
 | Web UI | **Done** — dashboard, pipelines (bulk Excel paste incl. per-ship ME/TE), settings (globals + per-class build settings + tracked systems), characters (in-app SSO), index runs with buy/build/reaction lists, Multibuy export, wallet-vs-buy-total check, per-run Profit tab (lagged, on executed runs) + current-prices Profit page (v1.5) |
 | ESI guideline compliance | Done — central `esi_request`: descriptive User-Agent, error-limit backoff (X-ESI-Error-Limit / 420 / Retry-After), 5xx retry. Per-endpoint cache-expiry honoring deferred (snapshot volume is one pull per cycle) |
-| Test suite | 1175 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration, the install check — rationing, packing, finals by return, per-job cycle need, the stock-aware slot backfill and the startable-jobs cap, alchemy under contention, per-sale-date cost vintages, schema 10 and 11 migrations, alchemy in stuck jobs' slots, split-row buy moves and the timing guard, built fuel bought just in time, unrealized revenue, the Buy tab — ESI-recorded purchases (wallet buys, accepted item exchanges, contract scaling, unplanned-ore conversion, buying-cycle windows, per-owner Count buys, the default inbound freight venue), realized cost from purchase lines (the blend, the covered-raw re-blend, freight by purchase location, the zero-purchase identity), the live run (re-plan in place, pools always the settings', hangar ore as minerals, this cycle's installed finals), schema 12 migrations and the upgrade replay, the four-column Buy tab, Multibuy All and the per-group lists, the Industry Jobs / Stockpile renames, the ESI job record — recording and status flips, the pull log's coverage, the executed run's installed hulls, the Profit tab's wording — and the Index Runs list — the frozen opening Buy total, revenue and profit per run, the estimate, the dashes and the failure guard) |
+| Test suite | 1354 tests passing (industry, classification, BOM, engine, cost lots, blacklist, job ceilings, JIT purchasing, alchemy, price cache + region-wide fallback, lag + current costing, capital pricing, structure pricing/freight exemption, Thukker rigs, chain-cost savings, consumption feedback, ESI refresh scoping + fitted/deployed stock, structure planning, two-venue buying (venue chooser, ladders, buy quotes, venue persistence, per-venue freight), run-tab template renders, compressed sourcing, buy fill pricing + venue splitting, invention comparison, review regressions, game-data re-import after an update, fill-aware build-vs-buy + pricing basis, compressed re-solve + partly wanted batches, SDE import atomicity, schema/settings integrity, the sales ledger — pull idempotency, the contiguous transactions cursor, owner normalisation, role/scope/token/rate-group degrade, contract attribution, venue-aware net income, unrealized profit, Top 10s, calendar windows, SVG charts, page and ESI-tab renders, the three-step ESI update, schema 9 migration, the install check — rationing, packing, finals by return, per-job cycle need, the stock-aware slot backfill and the startable-jobs cap, alchemy under contention, per-sale-date cost vintages, schema 10 and 11 migrations, alchemy in stuck jobs' slots, split-row buy moves and the timing guard, built fuel bought just in time, unrealized revenue, the Buy tab — ESI-recorded purchases (wallet buys, accepted item exchanges, contract scaling, unplanned-ore conversion, buying-cycle windows, per-owner Count buys, the default inbound freight venue), realized cost from purchase lines (the blend, the covered-raw re-blend, freight by purchase location, the zero-purchase identity), the live run (re-plan in place, pools always the settings', hangar ore as minerals, this cycle's installed finals), schema 12 migrations and the upgrade replay, the four-column Buy tab, Multibuy All and the per-group lists, the Industry Jobs / Stockpile renames, the ESI job record — recording and status flips, the pull log's coverage, the executed run's installed hulls, the Profit tab's wording — and the Index Runs list — the frozen opening Buy total, revenue and profit per run, the estimate, the dashes and the failure guard — and alchemy for profit: the Never-run grid, the profit tail, its shared cap and the running-jobs netting, the route cost at fills and compressed cover, the for-sale hold's anchors, derivation from the job record, life, bites and plan-figure fallback, the settle (issue-date order, room, the closing bound, split contracts), Mark sold / undo under the write lock, the guards on Mark executed, Reopen and Discard, the Sell in Jita panel and the For sale stat, the Stockpile annotations, the Profit tab's and the Ledger's alchemy tables, the Index Runs estimate and its failure badge, the schema 14 migration) |
 
 First live index run (2026-08-15, Hulk ×8 pipeline): 78 items, 68 already
 covered by stock + 129 in-progress corp jobs, 0 builds (all slots occupied —
@@ -4765,6 +4765,87 @@ Tests 555 → 560 (`test_pinned_type_lets_another_ore_cover_the_rest`,
 `test_a_row_the_market_cannot_fill_is_dropped_not_under_costed`,
 `test_a_partly_wanted_batch_is_bought_only_when_it_beats_direct`,
 `test_thin_structure_book_splits_the_multibuy_like_the_venue_cell`).
+
+### v1.31.0 (2026-10-31): Alchemy for Profit — a per-route Never-run grid, a profit tail over the spare reaction slots, and a for-sale hold anchored to ESI installs and settled by observed sales; the Ledger and the Profit tab book what it earned — commit d2e214f
+
+The user asked (2026-10-30) to "fill any empty slots with alchemy runs
+ranked via profit selling the intermediates in jita", and the next day
+ruled how the planner must treat the pile those jobs make: "the sell in
+jita quantities need to not be included" in stock, and the hold "should
+only last for the index run it was built on plus one more" (§10, rulings
+(a)–(h)). Two adversarial review rounds the same day — 133 confirmed
+findings on the first build, after which the hold was REBUILT anchored to
+the ESI job record, then 40 fresh findings on the rebuilt tree, all fixed
+or written down as §11 limits (6)–(11); the 35 the credit limit left
+unverified were re-checked by hand before this stamp (3 small fixes).
+
+**Alchemy for Profit (§2 feature 10, §7 Phase 6.5).** With Enable
+Alchemy on, a tail at the end of the alchemy pass fills the reaction
+slots the direct jobs and the savings moves leave — less this cycle's
+still-running reaction jobs (ruling (a)) — with unrefined reactions
+whose composite sells in Jita (hub quote at the pricing basis, net of
+sales tax, broker fee, SCC and outbound freight) for more than the
+route costs (inputs landed plus the job fee, less the recovered inputs'
+credit), most profitable per slot first, under the shared per-type cap
+(the tail counts the formula's jobs installed this cycle). A route whose
+unrefined product or composite sits on the new **Never run** grid
+(`alchemy_blacklist`) runs for neither savings nor profit; a route with
+an unpriced bought input is skipped until a price refresh. The for-sale
+rows carry the net and route cost they were judged against; the route
+cost is re-stamped at the fill-priced purchases (ruling (f)), a
+compressed-covered input counting as bought, and a fill-priced cost is
+kept across a re-plan that buys nothing of the route. The install check
+rations for-sale runs last, over what the chain leaves, with the
+intermediates' hand-back (ruling (g)); a full pool drops them first.
+
+**The for-sale hold (`magoo/holds.py`).** One `alchemy_hold` row per
+(run, composite) stores ANCHORS only — the plan's proposal, the route
+cost, `anchored_at`, the baseline and chain units, the yield; what is
+installed, delivered, in flight, hidden and live is derived at read time
+from `industry_job` (now with `end_date`, `completed_date`, `seen_at`),
+`index_run` and the release rows. A formula job started at or before the
+anchor is the chain's; one started after it belongs to the plan and
+freezes the row; the first savings-share units are the chain's and the
+rest the hold's for-sale jobs. A hold is live while its for-sale jobs run
+and until the second Mark executed after they deliver (ruling (b)); the
+unsold remainder then returns to stock (ruling (c)). Planning hides a
+live hold's remaining units from the composite's stock — the formula's
+unrefined pool first, then the hangar — less the units already listed on
+the market or in outstanding contracts, attributed by issue date to the
+holds whose life contains it. An executed run whose window no pull
+reaches into stands at the plan's figure, badged, until the next update.
+A running job the latest pull no longer reports, past its timer end,
+counts as delivered at that end.
+
+**Settlement and the pages.** `ledger.settle_alchemy_holds` (one BEGIN
+IMMEDIATE; after the sales pull, before a plan, Mark executed and Mark
+sold) matches wallet sells and finished item-exchange contracts to the
+delivered holds oldest first, in the order the units left the hangar (a
+contract by its issue date), each hold taking at most its room; a split
+contract is priced pro rata; an expired hold keeps taking late-pulled
+sales while the run after the one that ended it is the newest executed.
+Mark sold / undo on the run page, with an optional price (ruling (d)),
+read and write under the same lock. Mark executed refuses an executed or
+non-newest run, Reopen refuses while a newer planned run exists, Discard
+refuses a run whose hold shows installs or releases. The run page's Sell
+in Jita panel, For sale stat and Total, the Stockpile tab's held
+annotations, the Profit tab's Alchemy for sale table (Planned = Sold + By
+hand + Still held; a missing quote never reads as a loss), the Ledger's
+Alchemy sales and Still held tables, and the Index Runs list's revenue
+and profit estimate (with an "alchemy failed" badge) show the hold.
+
+Schema 14 (one-way: v1.30.0 refuses a migrated database; the pre-upgrade
+backup lands as `magoo-pre-1.30.0-s13.sqlite` — the snapshot now carries
+the source schema, so an unstamped second migration under one version
+gets its own rollback point). No new ESI scopes. 1354 tests (178 new:
+`test_alchemy_profit.py`, `test_alchemy_profit_web.py`,
+`test_alchemy_hold.py`, `test_alchemy_hold_ledger.py`,
+`test_alchemy_hold_web.py`). Known limits (§11 (6)–(11)): courier
+contracts' items are never fetched; a contract bundling a final with
+held composites is "mixed" for the finals' Ledger; an uncovered executed
+window misses a for-sale job installed after the last pull until the
+next update; a hold on a pipeline's final, a want-to-buy contract we
+accept, and the pile sold unrefined release only by Mark sold.
 
 ### v1.30.0 (2026-10-24): the Profit tab counts the hulls ESI shows installed; the Index Runs list carries the opening Buy total, revenue and profit per run — commit 5e726d2 (stamped v1.29.1 as 7b3df6e, re-stamped v1.30.0 as dc9a0be: a one-way schema takes a minor bump, as v1.28.0 and v1.29.0 did; then the pre-release fixes commit — the Mark executed flash, a log message, DESIGN.md, a coverage note)
 
